@@ -1,0 +1,13 @@
+{
+  "name": "open-claw-in-openshell-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright tests for OpenClaw-in-OpenShell",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:ui": "npx playwright test --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
+  }
+}

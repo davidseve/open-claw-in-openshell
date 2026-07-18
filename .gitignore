@@ -1,0 +1,46 @@
+# Secrets - NEVER commit real credentials
+secrets/*.env
+secrets/*.yaml
+secrets/.openclaw-gw-token
+!secrets/secrets.template.env
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.jks
+
+# Kubeconfig
+kubeconfig*
+.kube/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+*.tmp
+*.bak
+
+# Rendered templates (generated at deploy time from .tpl files)
+.rendered/
+
+# Helm
+*.tgz
+charts/*/charts/
+
+# Build artifacts
+*.log
+
+# Node / Playwright (scoped under tests/)
+tests/node_modules/
+tests/test-results/
+tests/playwright-report/

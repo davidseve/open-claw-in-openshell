@@ -1,0 +1,24 @@
+# Route for OpenClaw UI protected by oauth2-proxy OIDC authentication.
+#
+# Users are redirected to Keycloak for login. After authentication,
+# oauth2-proxy proxies to the OpenShell service route which relays
+# to the OpenClaw gateway inside the sandbox.
+#
+# TLS: edge termination (OpenShift wildcard cert, no browser warnings).
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: openclaw-ui-auth
+  namespace: openshell
+  annotations:
+    haproxy.router.openshift.io/timeout: 3600s
+spec:
+  host: openclaw-ui.apps.ocp.sandbox315.opentlc.com
+  to:
+    kind: Service
+    name: oauth2-proxy
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

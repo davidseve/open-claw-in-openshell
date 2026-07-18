@@ -1,0 +1,173 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trace-bridge-script
+  namespace: observability
+data:
+  bridge.py: |
+    """Tempo → MLflow trace bridge. Queries Tempo for recent traces and logs them to MLflow."""
+    import json, os, time, urllib.request, urllib.error
+
+    TEMPO_URL = os.environ.get("TEMPO_URL", "http://tempo.observability.svc:3200")
+    MLFLOW_URL = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow.observability.svc:5000")
+    EXPERIMENT_NAME = "openclaw-agent-traces"
+    LOOKBACK_SECONDS = int(os.environ.get("LOOKBACK_SECONDS", "300"))
+
+    def api(url, method="GET", data=None):
+        headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(url, headers=headers, method=method)
+        if data:
+            req.data = json.dumps(data).encode()
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())
+        except (urllib.error.URLError, Exception) as e:
+            print(f"  API error {url}: {e}")
+            return None
+
+    def ensure_experiment():
+        resp = api(f"{MLFLOW_URL}/api/2.0/mlflow/experiments/get-by-name?experiment_name={EXPERIMENT_NAME}")
+        if resp and "experiment" in resp:
+            return resp["experiment"]["experiment_id"]
+        resp = api(f"{MLFLOW_URL}/api/2.0/mlflow/experiments/create", "POST", {"name": EXPERIMENT_NAME})
+        if resp:
+            return resp["experiment_id"]
+        return "0"
+
+    def get_recent_traces():
+        now = int(time.time())
+        start = now - LOOKBACK_SECONDS
+        resp = api(f"{TEMPO_URL}/api/search?limit=20&start={start}&end={now}")
+        if not resp or "traces" not in resp:
+            return []
+        return resp["traces"]
+
+    def get_trace_detail(trace_id):
+        return api(f"{TEMPO_URL}/api/traces/{trace_id}")
+
+    def log_trace_to_mlflow(experiment_id, trace_info, trace_detail):
+        trace_id = trace_info.get("traceID", "unknown")
+        root_name = trace_info.get("rootServiceName", "unknown")
+        duration_ms = int(trace_info.get("durationMs", 0))
+
+        run = api(f"{MLFLOW_URL}/api/2.0/mlflow/runs/create", "POST", {
+            "experiment_id": experiment_id,
+            "run_name": f"{root_name}/{trace_id[:12]}",
+            "tags": [
+                {"key": "trace_id", "value": trace_id},
+                {"key": "service", "value": root_name},
+                {"key": "mlflow.runName", "value": f"{root_name}/{trace_id[:12]}"},
+            ],
+        })
+        if not run or "run" not in run:
+            return False
+
+        run_id = run["run"]["info"]["run_id"]
+
+        api(f"{MLFLOW_URL}/api/2.0/mlflow/runs/log-metric", "POST", {
+            "run_id": run_id, "key": "duration_ms", "value": duration_ms, "timestamp": int(time.time() * 1000),
+        })
+
+        span_count = 0
+        if trace_detail and "batches" in trace_detail:
+            for batch in trace_detail["batches"]:
+                for scope in batch.get("scopeSpans", batch.get("instrumentationLibrarySpans", [])):
+                    for span in scope.get("spans", []):
+                        span_count += 1
+                        span_name = span.get("name", "unknown")
+                        api(f"{MLFLOW_URL}/api/2.0/mlflow/runs/log-metric", "POST", {
+                            "run_id": run_id, "key": f"span.{span_name}.count", "value": 1,
+                            "timestamp": int(time.time() * 1000),
+                        })
+
+        api(f"{MLFLOW_URL}/api/2.0/mlflow/runs/log-metric", "POST", {
+            "run_id": run_id, "key": "span_count", "value": span_count, "timestamp": int(time.time() * 1000),
+        })
+
+        if trace_detail:
+            api(f"{MLFLOW_URL}/api/2.0/mlflow/runs/log-param", "POST", {
+                "run_id": run_id, "key": "trace_json", "value": json.dumps(trace_detail)[:5000],
+            })
+
+        api(f"{MLFLOW_URL}/api/2.0/mlflow/runs/update", "POST", {
+            "run_id": run_id, "status": "FINISHED", "end_time": int(time.time() * 1000),
+        })
+        return True
+
+    def main():
+        print(f"Trace bridge: Tempo={TEMPO_URL} MLflow={MLFLOW_URL}")
+        experiment_id = ensure_experiment()
+        print(f"Experiment: {EXPERIMENT_NAME} (id={experiment_id})")
+
+        traces = get_recent_traces()
+        print(f"Found {len(traces)} recent traces in Tempo")
+
+        existing = api(f"{MLFLOW_URL}/api/2.0/mlflow/runs/search", "POST", {
+            "experiment_ids": [experiment_id], "max_results": 100,
+        })
+        existing_trace_ids = set()
+        if existing and "runs" in existing:
+            for run in existing["runs"]:
+                for tag in run.get("data", {}).get("tags", []):
+                    if tag["key"] == "trace_id":
+                        existing_trace_ids.add(tag["value"])
+
+        new_count = 0
+        for t in traces:
+            tid = t.get("traceID", "")
+            if tid in existing_trace_ids:
+                continue
+            detail = get_trace_detail(tid)
+            if log_trace_to_mlflow(experiment_id, t, detail):
+                new_count += 1
+                print(f"  Logged trace {tid[:12]} ({t.get('rootServiceName', '?')})")
+
+        print(f"Done: {new_count} new traces logged to MLflow")
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trace-bridge
+  namespace: observability
+  labels:
+    app: trace-bridge
+spec:
+  schedule: "*/1 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 60
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: bridge
+              image: docker.io/python:3.12-slim
+              command: ["python3", "/app/bridge.py"]
+              env:
+                - name: TEMPO_URL
+                  value: "http://tempo.observability.svc:3200"
+                - name: MLFLOW_TRACKING_URI
+                  value: "http://mlflow.observability.svc:5000"
+                - name: LOOKBACK_SECONDS
+                  value: "300"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /app
+          volumes:
+            - name: script
+              configMap:
+                name: trace-bridge-script

@@ -1,0 +1,15 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: keycloak
+  namespace: openshell-keycloak
+spec:
+  host: keycloak-openshell-keycloak.apps.ocp.sandbox315.opentlc.com
+  to:
+    kind: Service
+    name: keycloak
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
