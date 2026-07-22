@@ -13,6 +13,7 @@ CRC_MODE="${CRC_MODE:-false}"
 APPS_DOMAIN="${APPS_DOMAIN:-}"
 
 RENDERED_DIR="${PROJECT_DIR}/.rendered"
+CURL_OPTS="${CURL_OPTS:-}"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -45,7 +46,9 @@ detect_environment() {
 
   if [[ "$CRC_MODE" == "true" ]]; then
     info "CRC mode active (single-node local cluster)"
+    CURL_OPTS="-k"
   fi
+  export CURL_OPTS
 }
 
 render_template() {
@@ -74,6 +77,9 @@ render_all_templates() {
       "${PROJECT_DIR}/manifests/oauth2-proxy/configmap.yaml.tpl" \
       "${RENDERED_DIR}/oauth2-proxy/configmap.yaml"
   fi
+  render_template \
+    "${PROJECT_DIR}/manifests/observability/mlflow.yaml.tpl" \
+    "${RENDERED_DIR}/observability/mlflow.yaml"
   info "Templates rendered to ${RENDERED_DIR}/ (APPS_DOMAIN=${APPS_DOMAIN})"
 }
 
@@ -138,6 +144,35 @@ load_secrets() {
 sandbox_run() {
   printf '%s && exit\n' "$1" \
     | timeout 15 openshell sandbox connect "$SANDBOX_NAME" 2>&1 || true
+}
+
+# Refresh OIDC token if expired. Call before any openshell CLI command
+# that requires authentication (provider create, sandbox list, etc.).
+# Uses headless password grant — no browser needed.
+# NOTE: `openshell status` returns 0 even with expired OIDC (uses mTLS),
+# so we test `sandbox list` which requires a valid bearer token.
+ensure_oidc_token() {
+  if openshell sandbox list &>/dev/null; then return 0; fi
+  if [[ -x "${SCRIPT_DIR}/configure-oidc.sh" ]]; then
+    info "OIDC token expired, refreshing..."
+    OPENSHELL_HEADLESS=1 KC_USER="${KC_USER:-admin}" KC_PASS="${KC_PASS:-admin}" \
+      "${SCRIPT_DIR}/configure-oidc.sh" >/dev/null 2>&1 || warn "OIDC refresh failed"
+  fi
+}
+
+# Create the MaaS provider. Idempotent — skips if already exists.
+# Requires a valid OIDC token when gateway has auth enabled.
+create_provider() {
+  if [[ -z "${MAAS_API_KEY:-}" ]]; then load_secrets; fi
+  if openshell provider list 2>/dev/null | grep -q "$PROVIDER_NAME"; then
+    info "Provider '$PROVIDER_NAME' already exists"
+    return 0
+  fi
+  openshell provider create \
+    --name "$PROVIDER_NAME" \
+    --type generic \
+    --credential "LITELLM_API_KEY=${MAAS_API_KEY}"
+  info "Provider '$PROVIDER_NAME' created"
 }
 
 get_apps_domain() {

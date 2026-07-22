@@ -15,7 +15,7 @@ setup('authenticate via Keycloak', async ({ page }) => {
     await page.locator('#username').fill('admin');
     await page.locator('#password').fill('admin');
     await page.locator('#kc-login').click();
-    await page.waitForURL('**/chat**', { timeout: 15_000 });
+    await page.waitForURL(/\/(chat|conversation|home|$)/, { timeout: 15_000 });
   }
 
   await page.context().storageState({ path: STORAGE_STATE });

@@ -24,10 +24,11 @@ network_policies:
         request_body_credential_rewrite: true
     binaries:
       - { path: /usr/bin/node }
+      - { path: /usr/local/bin/node }
       - { path: /usr/bin/curl }
 
   observability:
-    name: otel-collector-traces
+    name: observability-stack
     endpoints:
       - host: "otel-collector.observability.svc"
         port: 4318
@@ -39,6 +40,14 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-write
+    binaries:
+      - { path: /usr/bin/node }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/curl }
+
+  mlflow_direct:
+    name: mlflow-direct-traces
+    endpoints:
       - host: "mlflow.observability.svc"
         port: 5000
         protocol: rest
@@ -46,4 +55,5 @@ network_policies:
         access: read-write
     binaries:
       - { path: /usr/bin/node }
+      - { path: /usr/local/bin/node }
       - { path: /usr/bin/curl }

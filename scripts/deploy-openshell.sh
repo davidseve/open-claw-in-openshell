@@ -25,8 +25,8 @@ helm upgrade --install openshell \
   --create-namespace \
   -f "$VALUES_FILE"
 
-step "Waiting for gateway rollout"
-oc -n "$NAMESPACE" rollout status statefulset/openshell --timeout=180s
+step "Waiting for gateway rollout (up to 600s for initial image pull)"
+oc -n "$NAMESPACE" rollout status statefulset/openshell --timeout=600s
 
 step "Waiting for PKI secrets (created by init job)"
 for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
@@ -78,15 +78,14 @@ openshell gateway remove ocp 2>/dev/null || true
 openshell gateway add "https://${GW_ROUTE}" --local --name ocp
 openshell status
 
-step "Creating MaaS provider"
-if openshell provider list 2>/dev/null | grep -q "$PROVIDER_NAME"; then
-  info "Provider '$PROVIDER_NAME' already exists"
+step "Creating MaaS provider (best-effort)"
+# Provider creation may fail here if OIDC auth is required but not yet
+# configured. In that case crc-lifecycle.sh will create it after
+# configure-oidc.sh obtains the OIDC token (Phase 5b).
+if create_provider 2>/dev/null; then
+  info "Provider ready"
 else
-  openshell provider create \
-    --name "$PROVIDER_NAME" \
-    --type generic \
-    --credential "LITELLM_API_KEY=${MAAS_API_KEY}"
-  info "Provider '$PROVIDER_NAME' created"
+  warn "Provider creation deferred (OIDC not configured yet)"
 fi
 
 step "OpenShell deployment complete"

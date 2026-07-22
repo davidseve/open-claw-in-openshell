@@ -14,6 +14,7 @@ source "$(dirname "$0")/common.sh"
 
 check_prereqs
 detect_environment
+render_all_templates
 OBS_NAMESPACE="observability"
 
 # ── Step 1: Create namespace ──────────────────────────────────────────────────
@@ -43,11 +44,84 @@ oc -n "$OBS_NAMESPACE" rollout status deployment/otel-collector --timeout=120s 2
 # ── Step 4: Deploy MLflow ─────────────────────────────────────────────────────
 
 step "Deploying MLflow Tracking Server"
-oc apply -f "${PROJECT_DIR}/manifests/observability/mlflow.yaml"
+oc apply -f "${RENDERED_DIR}/observability/mlflow.yaml"
 
 oc -n "$OBS_NAMESPACE" rollout status deployment/mlflow --timeout=120s 2>/dev/null \
   && pass "MLflow deployment ready" \
   || fail "MLflow deployment not ready"
+
+# ── Step 4b: Create MLflow experiment for agent traces ────────────────────
+
+step "Creating MLflow experiment for agent traces"
+
+MLFLOW_INTERNAL="http://mlflow.${OBS_NAMESPACE}.svc:5000"
+
+retries=0
+while [[ $retries -lt 10 ]]; do
+  EXP_RESP=$(oc -n "$OBS_NAMESPACE" exec deployment/mlflow -- \
+    python3 -c "
+import urllib.request, urllib.error, json
+try:
+    req = urllib.request.Request('http://localhost:5000/api/2.0/mlflow/experiments/get-by-name?experiment_name=openclaw-agent-traces')
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read())
+        print('EXISTS:' + data['experiment']['experiment_id'])
+except urllib.error.HTTPError:
+    req = urllib.request.Request('http://localhost:5000/api/2.0/mlflow/experiments/create',
+        data=json.dumps({'name': 'openclaw-agent-traces'}).encode(),
+        headers={'Content-Type': 'application/json'}, method='POST')
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read())
+        print('CREATED:' + data['experiment_id'])
+except Exception as e:
+    print('ERROR:' + str(e))
+" 2>/dev/null || echo "ERROR:exec-failed")
+
+  if echo "$EXP_RESP" | grep -qE "EXISTS:|CREATED:"; then
+    EXP_ID=$(echo "$EXP_RESP" | grep -oE "(EXISTS|CREATED):[0-9]+" | cut -d: -f2)
+    pass "MLflow experiment 'openclaw-agent-traces' ready (id=${EXP_ID})"
+    break
+  fi
+  sleep 3
+  retries=$((retries + 1))
+done
+
+if [[ $retries -ge 10 ]]; then
+  warn "Could not create MLflow experiment, using default (id=0)"
+  EXP_ID="0"
+fi
+
+# ── Step 4b2: Fix artifact URI scheme (constraint #12) ───────────────────────
+# MLflow's JS client (@mlflow/core) requires mlflow-artifacts:// URIs to upload
+# trace data (span hierarchy, tool calls). Without --serve-artifacts and the
+# correct URI scheme, traces appear in the UI with only raw JSON input/output
+# and no span timeline. See docs/constraints.md #12.
+
+step "Ensuring MLflow artifact URI scheme (mlflow-artifacts:/)"
+oc -n "$OBS_NAMESPACE" exec deployment/mlflow -- python3 -c "
+import sqlite3
+conn = sqlite3.connect('/mlflow/mlflow.db')
+c = conn.cursor()
+c.execute(\"\"\"UPDATE experiments SET artifact_location = 'mlflow-artifacts:/' || experiment_id
+              WHERE artifact_location LIKE '/mlflow/artifacts/%'\"\"\")
+exp_fixed = c.rowcount
+c.execute(\"\"\"UPDATE trace_tags
+              SET value = REPLACE(value, '/mlflow/artifacts/', 'mlflow-artifacts:/')
+              WHERE key = 'mlflow.artifactLocation' AND value LIKE '/mlflow/artifacts/%'\"\"\")
+tag_fixed = c.rowcount
+conn.commit()
+conn.close()
+print(f'experiments={exp_fixed} traces={tag_fixed}')
+" 2>/dev/null && pass "Artifact URI scheme verified" \
+  || warn "Could not verify artifact URI scheme (non-blocking)"
+
+# ── Step 4c: Seed system prompts into MLflow Prompt Registry ─────────────────
+
+step "Seeding system prompts into MLflow Prompt Registry"
+MLFLOW_ROUTE=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+MLFLOW_URL="https://${MLFLOW_ROUTE}" "${PROJECT_DIR}/scripts/seed-mlflow-prompts.sh" \
+  && pass "System prompts seeded into MLflow" \
+  || warn "Could not seed prompts (MLflow may not be fully ready; run scripts/seed-mlflow-prompts.sh manually)"
 
 # ── Step 5: Update sandbox network policy ─────────────────────────────────────
 

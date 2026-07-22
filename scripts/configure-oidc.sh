@@ -105,9 +105,20 @@ EOF
 fi
 
 step "Verifying authenticated connection"
-openshell status \
-  && pass "Gateway connected (OIDC authenticated)" \
-  || fail "Gateway connection failed"
+# After helm upgrade + rollout, the OCP router needs time to re-establish
+# TLS passthrough to the new pod. Retry a few times before failing.
+retries=0
+while ! openshell status &>/dev/null; do
+  retries=$((retries + 1))
+  if [[ $retries -ge 10 ]]; then
+    fail "Gateway connection failed after 10 retries"
+    break
+  fi
+  sleep 5
+done
+if [[ $retries -lt 10 ]]; then
+  pass "Gateway connected (OIDC authenticated)"
+fi
 
 openshell sandbox list &>/dev/null \
   && pass "Sandbox list accessible with OIDC token" \

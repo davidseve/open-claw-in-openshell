@@ -40,8 +40,8 @@ spec:
             - --artifacts-destination=/mlflow/artifacts
             - --serve-artifacts
             - --workers=1
-            - --allowed-hosts=mlflow.observability.svc,mlflow.observability.svc:*,mlflow.observability.svc.cluster.local,mlflow.observability.svc.cluster.local:*,*.apps-crc.testing,*.apps.*.opentlc.com,localhost:*
-            - --cors-allowed-origins=https://mlflow-observability.apps-crc.testing
+            - --allowed-hosts=mlflow.observability.svc,mlflow.observability.svc:*,mlflow.observability.svc.cluster.local,mlflow.observability.svc.cluster.local:*,mlflow-observability.__APPS_DOMAIN__,localhost:*
+            - --cors-allowed-origins=https://mlflow-observability.__APPS_DOMAIN__
           ports:
             - containerPort: 5000
               name: http

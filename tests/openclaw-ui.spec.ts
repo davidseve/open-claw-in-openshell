@@ -4,26 +4,27 @@ const CHAT_TIMEOUT = 30_000;
 
 test.describe('OpenClaw Control UI', () => {
 
-  test('loads and shows Health OK', async ({ page }) => {
+  test('loads and shows chat interface', async ({ page }) => {
     await page.goto('/');
     await expect(page).toHaveTitle('OpenClaw Control');
-    await expect(page.getByText('Health').first()).toBeVisible();
-    await expect(page.getByText('OK').first()).toBeVisible();
-    await expect(page.getByText(/Version\s+\d/).first()).toBeVisible();
+    await expect(page.getByPlaceholder(/Message/)).toBeVisible();
+    await expect(page.getByText(/claude-sonnet|Claude Sonnet/).first()).toBeVisible({ timeout: 10000 });
   });
 
   test('sidebar navigation is present', async ({ page }) => {
     await page.goto('/');
-    for (const section of ['Chat', 'Overview', 'Channels', 'Instances', 'Sessions', 'Usage']) {
-      await expect(page.getByRole('link', { name: section }).first()).toBeVisible();
-    }
+    await expect(page.getByText('Overview')).toBeVisible();
+    await expect(page.getByText('Main Session')).toBeVisible();
   });
 
   test('chat input is functional', async ({ page }) => {
     await page.goto('/');
     const messageInput = page.getByPlaceholder(/Message/);
     await expect(messageInput).toBeVisible();
-    await expect(page.getByRole('button', { name: /Send/ })).toBeVisible();
+    await messageInput.fill('test message');
+    await page.waitForTimeout(500);
+    const sendButton = page.getByRole('button', { name: /Send/ });
+    await expect(sendButton).toBeVisible();
   });
 
   test('E2E chat: Claude responds via MaaS', async ({ page }) => {

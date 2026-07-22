@@ -29,6 +29,33 @@
     "deny": ["gateway", "cron", "openclaw"],
     "fs": { "workspaceOnly": true }
   },
+  "diagnostics": {
+    "enabled": true,
+    "otel": {
+      "enabled": true,
+      "endpoint": "http://otel-collector.observability.svc:4318",
+      "protocol": "http/protobuf",
+      "serviceName": "openclaw-agent",
+      "traces": false,
+      "metrics": true,
+      "logs": true,
+      "sampleRate": 1.0
+    }
+  },
+  "plugins": {
+    "entries": {
+      "diagnostics-otel": {
+        "enabled": true
+      },
+      "mlflow-openclaw": {
+        "enabled": true,
+        "config": {
+          "trackingUri": "http://mlflow.observability.svc:5000",
+          "experimentId": "0"
+        }
+      }
+    }
+  },
   "gateway": {
     "mode": "local",
     "bind": "loopback",
@@ -36,15 +63,17 @@
     "auth": {
       "mode": "trusted-proxy",
       "trustedProxy": {
-        "userHeader": "x-forwarded-user"
+        "userHeader": "x-forwarded-email",
+        "requiredHeaders": ["x-forwarded-proto", "x-forwarded-host"]
       }
     },
-    "trustedProxies": ["127.0.0.1", "::1"],
+    "trustedProxies": ["127.0.0.1", "::1", "10.217.0.0/22", "10.217.4.0/23", "192.168.0.0/16"],
     "controlUi": {
       "allowedOrigins": [
         "https://openclaw-ui.apps-crc.testing",
         "https://openclaw-gw--openclaw-ui.apps-crc.testing"
-      ]
+      ],
+      "dangerouslyDisableDeviceAuth": true
     },
     "http": {
       "endpoints": {

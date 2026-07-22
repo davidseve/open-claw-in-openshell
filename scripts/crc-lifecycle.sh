@@ -27,12 +27,16 @@ source "${SCRIPT_DIR}/common.sh"
 
 WITH_OIDC=false
 WITH_OBS=false
+MINIMAL=false
+FRESH=false
 
 parse_flags() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with-oidc) WITH_OIDC=true; shift ;;
       --with-obs)  WITH_OBS=true; shift ;;
+      --minimal)   MINIMAL=true; shift ;;
+      --fresh)     FRESH=true; shift ;;
       *) break ;;
     esac
   done
@@ -54,7 +58,7 @@ crc_login() {
   local password
   password=$(echo "$creds" | grep kubeadmin | grep -oP '(?<=-p )\S+(?= )' || true)
   local api_url
-  api_url=$(echo "$creds" | grep kubeadmin | grep -oP 'https://api\S+' || true)
+  api_url=$(echo "$creds" | grep kubeadmin | grep -oP 'https://api[^\s'\'']+' || true)
 
   if [[ -z "$password" || -z "$api_url" ]]; then
     error "Could not extract kubeadmin credentials from crc console --credentials"
@@ -109,39 +113,63 @@ cmd_start() {
 }
 
 cmd_deploy() {
-  step "Deploying full stack on CRC"
+  # Deploy order is critical — see docs/constraints.md #10:
+  #   1. bootstrap  2. keycloak  3. observability  4. openshell (install)
+  #   5. configure-oidc (helm upgrade + token)  6. provider (needs token)
+  #   7. oauth2-proxy  8. launch-openclaw
+  #
+  # configure-oidc MUST run AFTER deploy-openshell (needs existing helm release).
+  # Provider creation MUST run AFTER configure-oidc (needs OIDC token).
+  # oauth2-proxy MUST run AFTER keycloak + openshell (needs both).
+
+  step "Deploying full stack"
   detect_environment
   render_all_templates
-
-  export WITH_OIDC
+  export WITH_OIDC WITH_OBS
 
   step "Phase 1: Bootstrap OCP prerequisites"
   "${SCRIPT_DIR}/bootstrap-ocp.sh"
 
-  step "Phase 2: Deploy OpenShell"
-  "${SCRIPT_DIR}/deploy-openshell.sh"
-
-  step "Phase 3: Launch OpenClaw in sandbox"
-  "${SCRIPT_DIR}/launch-openclaw.sh"
-
   if [[ "$WITH_OIDC" == "true" ]]; then
-    step "Phase 7: Deploying Keycloak OIDC"
-    if [[ -x "${SCRIPT_DIR}/deploy-keycloak.sh" ]]; then
-      "${SCRIPT_DIR}/deploy-keycloak.sh"
-      "${SCRIPT_DIR}/configure-oidc.sh"
-    else
-      warn "Keycloak scripts not found, skipping OIDC deployment"
-    fi
+    step "Phase 2: Deploying Keycloak OIDC"
+    "${SCRIPT_DIR}/deploy-keycloak.sh"
   fi
 
   if [[ "$WITH_OBS" == "true" ]]; then
-    step "Phase 8: Deploying observability stack"
-    if [[ -x "${SCRIPT_DIR}/deploy-observability.sh" ]]; then
-      "${SCRIPT_DIR}/deploy-observability.sh"
-    else
-      warn "Observability script not found, skipping"
-    fi
+    step "Phase 3: Deploying observability stack (Tempo, OTel, MLflow, prompts)"
+    "${SCRIPT_DIR}/deploy-observability.sh"
   fi
+
+  # Phase 4: Install OpenShell WITHOUT OIDC. The pod needs the oidc-ca
+  # ConfigMap which doesn't exist yet. configure-oidc.sh (Phase 5) will
+  # create it and helm upgrade to enable OIDC.
+  step "Phase 4: Deploy OpenShell (install without OIDC)"
+  WITH_OIDC=false "${SCRIPT_DIR}/deploy-openshell.sh"
+
+  if [[ "$WITH_OIDC" == "true" ]]; then
+    step "Phase 5: Configure OIDC (create CA ConfigMap + helm upgrade + obtain token)"
+    OPENSHELL_HEADLESS=1 KC_USER="${KC_USER:-admin}" KC_PASS="${KC_PASS:-admin}" \
+      "${SCRIPT_DIR}/configure-oidc.sh"
+
+    step "Phase 5b: Create MaaS provider (needs OIDC token)"
+    # Gateway may still be stabilizing after helm upgrade; retry up to 30s
+    retries=0
+    while ! create_provider 2>/dev/null; do
+      retries=$((retries + 1))
+      if [[ $retries -ge 6 ]]; then
+        create_provider  # final attempt — let it fail loudly
+        break
+      fi
+      info "Waiting for gateway to accept requests (attempt $retries/6)..."
+      sleep 5
+    done
+
+    step "Phase 6: Deploy oauth2-proxy (OIDC UI auth)"
+    "${SCRIPT_DIR}/deploy-oauth2-proxy.sh"
+  fi
+
+  step "Phase 7: Launch OpenClaw in sandbox"
+  "${SCRIPT_DIR}/launch-openclaw.sh"
 
   step "Deployment complete"
 }
@@ -175,14 +203,34 @@ cmd_delete() {
 }
 
 cmd_full() {
+  # full deploys everything by default; use --minimal to skip OIDC+obs
+  if [[ "$MINIMAL" != "true" ]]; then
+    WITH_OIDC=true
+    WITH_OBS=true
+  fi
+
+  if [[ "$FRESH" == "true" ]]; then
+    require_crc_bin
+    step "Fresh mode: deleting existing CRC VM"
+    "$CRC_BIN" delete --force 2>/dev/null || true
+    info "Previous VM destroyed"
+  fi
+
   cmd_setup
-  cmd_deploy
+  cmd_deploy   # includes all phases: keycloak, obs, openshell, oidc, provider, oauth2-proxy, openclaw
+
+  if [[ -x "${SCRIPT_DIR}/smoke-test-e2e.sh" ]]; then
+    step "Running smoke test"
+    "${SCRIPT_DIR}/smoke-test-e2e.sh" || warn "Smoke test had warnings (non-fatal)"
+  fi
+
   cmd_verify
 
   echo ""
   step "Full lifecycle complete"
   info "CRC is running with OpenClaw-in-OpenShell deployed and verified."
-  info "Control UI: https://openclaw-gw--openclaw-ui.$(get_apps_domain)"
+  info "Control UI: https://openclaw-ui.$(get_apps_domain)/"
+  info "MLflow UI:  https://mlflow-observability.$(get_apps_domain)/"
   info "Stop CRC:   ./scripts/crc-lifecycle.sh stop"
   info "Teardown:   ./scripts/crc-lifecycle.sh teardown"
   info "Delete VM:  ./scripts/crc-lifecycle.sh delete"
@@ -237,6 +285,8 @@ case "$COMMAND" in
     echo "Flags:"
     echo "  --with-oidc   Also deploy Keycloak OIDC (Phase 7)"
     echo "  --with-obs    Also deploy observability stack (Phase 8)"
+    echo "  --minimal     Skip OIDC and observability in 'full' mode"
+    echo "  --fresh       Delete existing CRC VM before setup (full reset)"
     ;;
   *)
     error "Unknown command: $COMMAND"
