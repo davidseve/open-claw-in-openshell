@@ -2,6 +2,8 @@
 secrets/*.env
 secrets/*.yaml
 secrets/.openclaw-gw-token
+secrets/.*
+!secrets/.gitkeep
 !secrets/secrets.template.env
 .env
 .env.*
@@ -29,6 +31,10 @@ Thumbs.db
 tmp/
 *.tmp
 *.bak
+
+# Local deploy/monitor state
+.deploy-state.json
+.monitor-state.json
 
 # Rendered templates (generated at deploy time from .tpl files)
 .rendered/
