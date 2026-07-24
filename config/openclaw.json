@@ -26,10 +26,11 @@
     }
   },
   "tools": {
-    "deny": ["gateway", "cron", "openclaw"],
+    "deny": ["gateway", "cron", "openclaw", "browser", "nodes"],
     "fs": { "workspaceOnly": true }
   },
   "plugins": {
+    "deny": ["workboard", "admin-http-rpc"],
     "entries": {
       "diagnostics-otel": {
         "enabled": false
@@ -78,6 +79,15 @@
         "https://openclaw-gw--openclaw-ui.apps-crc.testing"
       ],
       "dangerouslyDisableDeviceAuth": true
+    },
+    "terminal": {
+      "enabled": false
+    },
+    "reload": {
+      "mode": "off"
+    },
+    "nodes": {
+      "denyCommands": ["system.run", "canvas.navigate"]
     },
     "http": {
       "endpoints": {

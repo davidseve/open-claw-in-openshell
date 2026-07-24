@@ -363,7 +363,6 @@ echo "CLEANUP_DONE"
 # Step 9b: Start gateway (openshell sandbox exec --no-tty = sandbox namespace)
 openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 25 \
   --env HOME=/sandbox/workspace \
-  --env MLFLOW_TRACKING_URI=http://mlflow.observability.svc:5000 \
   --env OTEL_TRACES_EXPORTER=none \
   --env OTEL_LOGS_EXPORTER=none \
   --env OTEL_METRICS_EXPORTER=none \
