@@ -1,6 +1,6 @@
 # OpenClaw in OpenShell
 
-OpenClaw runs **inside** an OpenShell sandbox on OpenShift (Pattern A, [ADR-0007](docs/adrs/ADR-0007-openclaw-inside-sandbox.md)), with inference via Red Hat MaaS (LiteLLM) and OIDC login through Keycloak federated to OpenShift OAuth.
+OpenClaw runs **inside** an OpenShell sandbox on OpenShift (Pattern A, [ADR-0007](docs/adrs/ADR-0007-openclaw-inside-sandbox.md)), with inference via Red Hat MaaS (LiteLLM) and browser login through OpenShift's own native OAuth server ([ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md); no Keycloak in this path). Keycloak remains deployed only as the OIDC issuer for the CLI/gRPC gateway auth path.
 
 Supports both AWS OCP clusters and local CRC (CodeReady Containers / OpenShift Local) for development.
 
@@ -18,8 +18,7 @@ flowchart LR
   Router["OCP Router<br/>TLS passthrough"]
 
   subgraph auth["Authentication"]
-    OAuth2["oauth2-proxy<br/>OIDC session"]
-    KC["Keycloak<br/>Identity broker"]
+    OAuthProxy["oauth-proxy<br/>OpenShift-native OAuth"]
   end
 
   GW["OpenShell Gateway<br/>HTTP + gRPC"]
@@ -33,36 +32,35 @@ flowchart LR
 
   MaaS["Red Hat MaaS<br/>Claude Sonnet 4.6"]
 
-  Browser -->|"Route openclaw-ui"| OAuth2
-  OAuth2 -->|"x-forwarded-user"| Router
-  CLI -->|"Route openshell-gw<br/>Bearer JWT"| Router
+  Browser -->|"Route openclaw-ui-auth"| OAuthProxy
+  OAuthProxy -->|"x-forwarded-email/user"| Router
+  CLI -->|"Route openshell-gw<br/>Bearer JWT (Keycloak-issued)"| Router
   Router --> GW
   GW -->|"relay → loopback :18789"| OC
-  OAuth2 -.->|"OIDC login"| KC
+  OAuthProxy -.->|"OAuth login (SA-based client)"| OCPOAuth["OCP OAuth server"]
   Proxy -->|"allow + credential rewrite"| MaaS
 ```
 
-### Identity (OIDC)
+### Identity (OAuth)
 
 ```mermaid
 sequenceDiagram
   actor User
   participant Browser
-  participant OAuth2 as oauth2-proxy
-  participant KC as Keycloak
-  participant OCP as OCP OAuth
+  participant OAuthProxy as oauth-proxy
+  participant OCP as OCP OAuth server
   participant GW as OpenShell Gateway
   participant OC as OpenClaw
 
-  User->>Browser: https://openclaw-ui.apps.domain
-  Browser->>OAuth2: GET /
-  OAuth2->>KC: OIDC redirect
-  KC->>OCP: Login with OpenShift
-  OCP-->>KC: user identity
-  KC-->>OAuth2: id_token + access_token
-  OAuth2-->>Browser: session cookie + redirect
-  Browser->>OAuth2: GET /chat (with cookie)
-  OAuth2->>GW: proxy + x-forwarded-user header
+  User->>Browser: https://openclaw-gw--openclaw-ui.apps.domain
+  Browser->>OAuthProxy: GET /
+  OAuthProxy->>OCP: OAuth redirect (SA-based client, no Keycloak)
+  OCP-->>Browser: login form (HTPasswd/LDAP/federated IdP)
+  Browser->>OCP: credentials
+  OCP-->>OAuthProxy: authorization code → token exchange
+  OAuthProxy-->>Browser: session cookie + redirect
+  Browser->>OAuthProxy: GET /chat (with cookie)
+  OAuthProxy->>GW: proxy + x-forwarded-email/user header
   GW->>OC: relay → loopback (trusted-proxy)
   OC-->>Browser: WebSocket connected
 ```
@@ -71,17 +69,18 @@ sequenceDiagram
 
 | Path | Flow |
 |------|------|
-| **Control UI** | Browser → oauth2-proxy (OIDC) → Route → Gateway → sandbox `:18789` (trusted-proxy, `x-forwarded-user`) |
-| **CLI / gRPC** | CLI → Route `openshell-gw` → Gateway (OIDC JWT) → sandbox lifecycle / SSH relay |
-| **Login** | Browser → oauth2-proxy → Keycloak → OCP OAuth → session cookie |
+| **Control UI** | Browser → oauth-proxy (OpenShift-native OAuth) → Route → Gateway → sandbox `:18789` (trusted-proxy, `x-forwarded-email`) |
+| **CLI / gRPC** | CLI → Route `openshell-gw` → Gateway (OIDC JWT, issued by Keycloak) → sandbox lifecycle / SSH relay |
+| **Login** | Browser → oauth-proxy → OCP OAuth server → session cookie (see [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)) |
 | **Inference** | OpenClaw → L7 proxy → MaaS (`openshell:resolve:env:LITELLM_API_KEY` rewritten; never on disk) |
 
 ### Security posture
 
 | Layer | Mechanism |
 |-------|-----------|
-| Identity | Keycloak OIDC broker → OCP credentials; `allowUnauthenticatedUsers: false` ([ADR-0010](docs/adrs/ADR-0010-oidc-ocp-federation.md)) |
-| Browser auth | oauth2-proxy OIDC session; unauthenticated requests redirect to Keycloak ([ADR-0011](docs/adrs/ADR-0011-oauth2-proxy-ui-auth.md)) |
+| Identity (browser) | OpenShift-native OAuth via SA-based client; `allowUnauthenticatedUsers: false` ([ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)) |
+| Identity (CLI/gRPC) | Keycloak OIDC broker → OCP credentials, still required for JWT/JWKS validation ([ADR-0010](docs/adrs/ADR-0010-oidc-ocp-federation.md)) |
+| Browser auth | oauth-proxy OAuth session; unauthenticated requests redirect to the OCP OAuth server ([ADR-0011](docs/adrs/ADR-0011-oauth2-proxy-ui-auth.md) superseded by [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)) |
 | Transport | Server TLS + passthrough Routes; mTLS remains load-bearing for sandbox internals ([ADR-0008](docs/adrs/ADR-0008-deployment-findings.md)) |
 | Isolation | Sandbox netns + nftables + Landlock; process runs as `sandbox` user |
 | Network | Default-deny; only MaaS endpoint allowed (`policies/openclaw-sandbox.yaml`) |
@@ -90,7 +89,7 @@ sequenceDiagram
 
 ### Why no gateway token?
 
-The OpenClaw gateway uses `auth.mode: trusted-proxy` instead of a static token. See [ADR-0012](docs/adrs/ADR-0012-trusted-proxy-auth.md) for the full rationale. In summary: the token was a shared static secret that added friction without meaningful security, since four outer layers already protect access (network namespace isolation, OpenShell mTLS+OIDC, oauth2-proxy OIDC, Keycloak identity management).
+The OpenClaw gateway uses `auth.mode: trusted-proxy` instead of a static token. See [ADR-0012](docs/adrs/ADR-0012-trusted-proxy-auth.md) for the full rationale. In summary: the token was a shared static secret that added friction without meaningful security, since outer layers already protect access (network namespace isolation, OpenShell mTLS+OIDC, oauth-proxy OAuth session).
 
 ## Quick start
 
@@ -104,11 +103,11 @@ cp secrets/secrets.template.env secrets/secrets.env
 # 3. Deploy OpenShell gateway + Route + MaaS provider
 ./scripts/deploy-openshell.sh
 
-# 4. Keycloak OIDC + OCP federation
+# 4. Keycloak OIDC + OCP federation (CLI/gRPC gateway auth only, see ADR-0016)
 ./scripts/deploy-keycloak.sh
 ./scripts/configure-oidc.sh
 
-# 5. oauth2-proxy for browser SSO
+# 5. oauth-proxy for browser SSO (OpenShift-native OAuth, no Keycloak)
 ./scripts/deploy-oauth2-proxy.sh
 
 # 6. Launch OpenClaw sandbox, policy, Control UI Route
@@ -145,10 +144,16 @@ oc login -u kubeadmin -p $(crc console --credentials | grep kubeadmin | awk -F"'
 ## Browser access
 
 ```
-https://openclaw-ui.<APPS_DOMAIN>/
+https://openclaw-gw--openclaw-ui.<APPS_DOMAIN>/
 ```
 
-Login via Keycloak (OCP credentials or `admin/admin` in dev). No token needed.
+Login with any OpenShift cluster identity (HTPasswd, LDAP, or a federated corporate IdP) — authenticated directly against OCP's own OAuth server, no Keycloak involved ([ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)). No token needed.
+
+The hostname is uglier than a plain `openclaw-ui.<domain>` on purpose: it
+must equal OpenShell's `{sandbox}--{service}` service-routing pattern to
+work around a WebSocket Host-header bug in the `openshift/oauth-proxy` fork
+(see ADR-0016). There is no unauthenticated fallback route anymore — this is
+the only Kubernetes-level entry point onto the Control UI.
 
 ## Repository layout
 
@@ -157,7 +162,7 @@ Login via Keycloak (OCP credentials or `admin/admin` in dev). No token needed.
 | `charts/openshell/values-ocp.yaml.tpl` | Helm overrides template (OIDC, PKI SANs, no GPU) |
 | `config/openclaw.json.tpl` | OpenClaw config template (trusted-proxy auth, MaaS provider) |
 | `policies/openclaw-sandbox.yaml` | Sandbox FS + network policy (MaaS allow) |
-| `manifests/` | Routes, Keycloak, oauth2-proxy, observability, Agent Sandbox pin |
+| `manifests/` | Routes, Keycloak (CLI/gRPC OIDC only), oauth-proxy (browser OAuth), observability, Agent Sandbox pin |
 | `scripts/` | Bootstrap → deploy → launch → verify → teardown |
 | `tests/` | Playwright E2E tests (UI + sandbox security) with OIDC auth |
 | `docs/adrs/` | Architecture Decision Records |
@@ -166,15 +171,15 @@ Login via Keycloak (OCP credentials or `admin/admin` in dev). No token needed.
 
 ## Testing
 
-The Playwright test suite validates the full user flow through OIDC authentication:
+The Playwright test suite validates the full user flow through OpenShift-native OAuth authentication:
 
 ```bash
 cd tests && npm install && npx playwright install chromium
-OPENCLAW_BASE_URL="https://openclaw-ui.<APPS_DOMAIN>" npx playwright test
+OPENCLAW_BASE_URL="https://openclaw-gw--openclaw-ui.<APPS_DOMAIN>" npx playwright test
 ```
 
 Tests are organized in three projects:
-1. **auth-setup**: Automated Keycloak login, saves browser session
+1. **auth-setup**: Automated OCP OAuth login (HTPasswd form), saves browser session
 2. **ui-tests**: Control UI functionality (health, navigation, chat E2E via MaaS)
 3. **security-tests**: Sandbox isolation (egress blocking, credential protection, privilege escalation, tool policy enforcement)
 
@@ -186,6 +191,6 @@ See [ROADMAP.md](ROADMAP.md) for the current pin table (OpenShell chart/gateway,
 
 - [ROADMAP.md](ROADMAP.md) — deployment phases and verification status
 - [AGENTS.md](AGENTS.md) — roles and security baseline
-- ADRs: [0001](docs/adrs/ADR-0001-helm-local-no-gpu.md) Helm/no GPU · [0007](docs/adrs/ADR-0007-openclaw-inside-sandbox.md) Pattern A · [0008](docs/adrs/ADR-0008-deployment-findings.md) TLS · [0009](docs/adrs/ADR-0009-external-service-routing.md) UI Route · [0010](docs/adrs/ADR-0010-oidc-ocp-federation.md) OIDC · [0011](docs/adrs/ADR-0011-oauth2-proxy-ui-auth.md) oauth2-proxy · [0012](docs/adrs/ADR-0012-trusted-proxy-auth.md) trusted-proxy auth
+- ADRs: [0001](docs/adrs/ADR-0001-helm-local-no-gpu.md) Helm/no GPU · [0007](docs/adrs/ADR-0007-openclaw-inside-sandbox.md) Pattern A · [0008](docs/adrs/ADR-0008-deployment-findings.md) TLS · [0009](docs/adrs/ADR-0009-external-service-routing.md) UI Route · [0010](docs/adrs/ADR-0010-oidc-ocp-federation.md) OIDC (CLI/gRPC) · [0011](docs/adrs/ADR-0011-oauth2-proxy-ui-auth.md) oauth2-proxy (superseded) · [0012](docs/adrs/ADR-0012-trusted-proxy-auth.md) trusted-proxy auth · [0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md) OpenShift-native OAuth (browser UI, current)
 - [OpenShell on OpenShift](https://docs.nvidia.com/openshell/kubernetes/openshift)
 - [OpenClaw LiteLLM provider](https://docs.openclaw.ai/providers/litellm)

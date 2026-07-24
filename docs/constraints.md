@@ -19,9 +19,9 @@ the agent from modifying system files, configs, or escaping the sandbox.
 gateway creates `.openclaw/` under `$HOME`, so this puts all writable state
 in the workspace directory.
 
-**Scripts affected**: `launch-openclaw.sh` (Step 3, Step 10)
+**Scripts affected**: `launch-openclaw.sh` (Step 3, Step 9)
 
-## 2. Networking — L7 Binary Path Enforcement
+## 2. Networking — L7 Binary Path Enforcement (RESOLVED via policy)
 
 **Constraint**: The sandbox proxy uses nftables (L4 redirect) combined with L7
 inspection. The L7 inspector checks `/proc/<pid>/exe` to identify which binary
@@ -32,19 +32,23 @@ the connection is DENIED.
 **Why**: This prevents arbitrary binaries from making network connections.
 Only explicitly allowed binaries can communicate with allowed endpoints.
 
-**Failure mode**: When `n` (Node.js version manager) upgrades Node.js, it installs
-the binary at `/usr/local/bin/node`. Since `/usr/local/bin` is typically first
-in `$PATH`, all Node.js processes use this path. The proxy resolves
-`/proc/<pid>/exe` to `/usr/local/bin/node`, which is NOT in the allow list.
-Result: ALL Node.js network traffic is silently DENIED.
+**Original failure mode (historical)**: When `n` (Node.js version manager)
+upgrades Node.js, it installs the binary at `/usr/local/bin/node`. Since
+`/usr/local/bin` is typically first in `$PATH`, all Node.js processes use this
+path. If the policy only allows `/usr/bin/node`, the proxy resolves
+`/proc/<pid>/exe` to `/usr/local/bin/node`, which is NOT in the allow list,
+and ALL Node.js network traffic is silently DENIED.
 
-**Workaround**: After any Node.js upgrade via `n`:
-```bash
-cp /usr/local/bin/node /usr/bin/node
-rm -f /usr/local/bin/node
-```
+**Resolution**: `policies/openclaw-sandbox.yaml` now lists both
+`/usr/bin/node` and `/usr/local/bin/node` in the `binaries` section of every
+network policy (`maas_inference`, `observability`, `mlflow_direct`). This
+makes the `cp`/`rm` binary-relocation dance in `launch-openclaw.sh` after a
+`n` upgrade unnecessary — the proxy accepts connections from either path.
+If the base image or install method ever changes the Node.js binary path
+again, add the new path to the `binaries` list instead of reintroducing a
+relocation workaround.
 
-**Scripts affected**: `launch-openclaw.sh` (Step 2), `verify.sh` (Layer 5b Check 1)
+**Scripts affected**: `policies/openclaw-sandbox.yaml`, `verify.sh` (Layer 5b Check 1)
 
 ## 3. Networking — Node.js fetch() and Proxy Credential Injection
 
@@ -63,8 +67,14 @@ gateway appears healthy but cannot reach the LLM provider.
 
 **Workaround**: Do NOT rely on proxy credential injection for Node.js `fetch()`.
 Instead:
-1. Inject the real API key directly into `openclaw.json` using `launch-openclaw.sh`.
-   The key is passed via stdin (not command-line args) to avoid `/proc/<pid>/cmdline` exposure.
+1. Bake the real API key directly into `openclaw.json` at template-render time.
+   `config/openclaw.json.tpl` holds a `__MAAS_API_KEY__` placeholder;
+   `render_openclaw_config()` in `scripts/common.sh` substitutes it with the
+   real `MAAS_API_KEY` (from `secrets/secrets.env`) using bash string
+   replacement (not sed/awk, so key characters like `/` are never
+   misinterpreted). The resulting `.rendered/openclaw.json` — never committed,
+   see `.gitignore` — is what gets uploaded/copied into the sandbox, so no
+   separate post-copy injection step is needed.
 2. Do NOT set `HTTP_PROXY` or `HTTPS_PROXY` — this forces `fetch()` to use
    HTTP CONNECT tunneling, which the proxy rejects with 403.
 3. Do NOT set `NODE_OPTIONS="--require http-proxy-bootstrap.js"` — same reason.
@@ -72,7 +82,8 @@ Instead:
 
 **Upstream tracking**: OpenShell issue #894 (binary resolution for undici), #896 (enhanced provider management).
 
-**Scripts affected**: `launch-openclaw.sh` (Step 4, Step 10)
+**Scripts affected**: `config/openclaw.json.tpl`, `scripts/common.sh`
+(`render_openclaw_config`), `launch-openclaw.sh` (Step 3, Step 9)
 
 ## 4. Plugins — Directory Structure and Ownership
 
@@ -92,7 +103,7 @@ the plugin is not loaded.
 chown -R root:root /sandbox/workspace/.openclaw/extensions/<plugin-id>
 ```
 
-**Scripts affected**: `launch-openclaw.sh` (Step 7, Step 8)
+**Scripts affected**: `launch-openclaw.sh` (Step 6, Step 7)
 
 ## 5. Plugins — SDK Compatibility
 
@@ -110,7 +121,7 @@ at gateway startup. The plugin fails to load and no traces are generated.
 1. Replaces `onDiagnosticEvent` import with a no-op function
 2. Replaces `definePluginEntry({...})` with a plain object export
 
-**Scripts affected**: `launch-openclaw.sh` (Step 8)
+**Scripts affected**: `launch-openclaw.sh` (Step 7)
 
 ## 6. Process Management
 
@@ -132,7 +143,7 @@ sleep 2
 rm -f .openclaw/state/*.lock .openclaw/*.lock /tmp/openclaw/*.lock
 ```
 
-**Scripts affected**: `launch-openclaw.sh` (Step 10)
+**Scripts affected**: `launch-openclaw.sh` (Step 9)
 
 ## 7. Observability — OTEL Exporters and Trace Duplication
 
@@ -154,7 +165,7 @@ endpoints are DENIED by proxy, causing error spam in logs.
 2. Set `diagnostics.otel.traces: false` in `openclaw.json.tpl`
 3. Disable `diagnostics-otel` plugin in config
 
-**Scripts affected**: `launch-openclaw.sh` (Step 10), `config/openclaw.json.tpl`
+**Scripts affected**: `launch-openclaw.sh` (Step 9), `config/openclaw.json.tpl`
 
 ## 8. Sidecar Communication — curl vs fetch()
 
@@ -199,7 +210,11 @@ using the Keycloak admin API during deployment.
    installed (otherwise: "has no deployed releases").
 2. Provider creation requires an OIDC token, so `configure-oidc.sh` MUST run
    first (otherwise: "missing authorization header").
-3. `oauth2-proxy` needs both Keycloak and OpenShell running.
+3. `deploy-oauth2-proxy.sh` (browser UI auth) only needs OpenShell running —
+   since ADR-0016, it deploys `oauth-proxy` with OpenShift-native OAuth and
+   no longer depends on Keycloak at all. Keycloak is still deployed earlier
+   in the sequence purely because the CLI/gRPC OIDC path (`configure-oidc.sh`,
+   step 5 below) still needs it as a JWKS-serving issuer.
 4. `launch-openclaw.sh` needs MLflow for prompt seeding and the provider to
    already exist for model routing.
 
@@ -207,18 +222,18 @@ using the Keycloak admin API during deployment.
 causes cascading authentication or "not found" failures.
 
 **Failure mode**: Various — `helm upgrade` fails, provider creation fails with
-"missing authorization header", oauth2-proxy has no backend, OpenClaw can't
+"missing authorization header", oauth-proxy has no backend, OpenClaw can't
 reach the model provider.
 
 **Workaround**: Correct deploy order in `crc-lifecycle.sh cmd_deploy()`:
 1. `bootstrap-ocp.sh` — namespace, SCCs, secrets
-2. `deploy-keycloak.sh` — OIDC issuer available
+2. `deploy-keycloak.sh` — OIDC issuer available (CLI/gRPC path only, see #3 above)
 3. `deploy-observability.sh` — MLflow + Tempo + OTel + prompt seeding
 4. `deploy-openshell.sh` with `WITH_OIDC=false` — Helm install without OIDC
    (the pod would block on the missing `openshell-oidc-ca` ConfigMap otherwise)
 5. `configure-oidc.sh` — creates OIDC CA ConfigMap + Helm upgrade with OIDC + obtain token
 6. `create_provider` — now has OIDC token
-7. `deploy-oauth2-proxy.sh` — needs Keycloak + OpenShell
+7. `deploy-oauth2-proxy.sh` — needs OpenShell only (OpenShift-native OAuth, ADR-0016)
 8. `launch-openclaw.sh` — everything ready
 
 **Scripts affected**: `scripts/crc-lifecycle.sh`, `scripts/deploy-openshell.sh`, `scripts/common.sh`
@@ -229,8 +244,9 @@ reach the model provider.
 port 18789) MUST be started from within the sandbox network namespace, not from
 the container's root network namespace. The OpenShell supervisor creates a
 separate network namespace for sandbox processes. `oc exec` runs commands in the
-container's root namespace, while `openshell sandbox connect` runs commands in
-the sandbox network namespace.
+container's root namespace, while both `openshell sandbox connect` and
+`openshell sandbox exec` (gRPC exec endpoint) run commands in the sandbox
+network namespace.
 
 **Why**: The OpenShell service relay (which makes services like the Control UI
 accessible via external routes) connects to ports through the supervisor's SSH
@@ -247,20 +263,34 @@ the container root namespace), making it look like the gateway is running fine.
 **Workaround**: In `launch-openclaw.sh`:
 1. Use `oc exec` only for root-privilege operations: kill processes, chown files,
    clean lock files, install packages
-2. Use `openshell sandbox connect` to start the gateway and trace linker processes
+2. Use `openshell sandbox exec --no-tty` to start the gateway and trace linker
+   processes (backgrounded with `nohup ... & disown`)
 3. Fix file ownership (chown sandbox:sandbox) before starting, since
-   `openshell sandbox connect` runs as user `sandbox`, not root
+   `openshell sandbox exec` runs as user `sandbox`, not root
 
 ```bash
 # Cleanup (root, container namespace)
 oc exec $SANDBOX -c agent -- bash -c 'kill ...; chown ...'
 
 # Start gateway (sandbox namespace — where the relay can reach it)
-printf '... nohup openclaw gateway run ... &\nexit\n' \
-  | openshell sandbox connect $SANDBOX
+openshell sandbox exec -n $SANDBOX --no-tty --env HOME=/sandbox/workspace \
+  -- bash -c 'nohup openclaw gateway run ... & disown'
 ```
 
-**Scripts affected**: `launch-openclaw.sh` (Step 10a, 10b, 10c)
+**`sandbox exec` vs `sandbox connect`**: Both run in the sandbox network
+namespace via the same underlying gRPC path, but `sandbox exec` is preferred
+for scripted/non-interactive process startup:
+- `--no-tty` avoids PTY escape sequences (e.g. `\[?2004`) that `sandbox
+  connect` emits and that previously had to be filtered out of captured
+  output with `grep -v '^\[?2004'`.
+- `--env KEY=VALUE` sets environment variables natively, instead of prefixing
+  them inline on the command string piped into `sandbox connect`.
+- Validated live (2026-07): a process started via `sandbox exec --no-tty` with
+  `nohup cmd & disown` is reparented to pid 1 and remains running and
+  reachable on the sandbox's loopback after the exec channel closes —
+  equivalent detachment behavior to `sandbox connect`.
+
+**Scripts affected**: `launch-openclaw.sh` (Step 9a, 9b, 9c)
 
 ## 12. TLS Route Stabilization After Helm Upgrade
 
@@ -329,7 +359,68 @@ chown sandbox:sandbox /sandbox/workspace/.prompt-versions.json
 rm -f /tmp/openclaw-*/*.lock
 ```
 
-**Scripts affected**: `scripts/launch-openclaw.sh` (Step 10a)
+**Scripts affected**: `scripts/launch-openclaw.sh` (Step 9a)
+
+## 14. L7 Proxy Failure Modes — Credential Injection and Policy Denial
+
+**Context**: While comparing this deployment against `claw-operator` (which
+documents an explicit `502` for credential-injection failures and `403` for
+disallowed domains — never a silent passthrough), an audit of OpenShell's L7
+proxy (`crates/openshell-supervisor-network/src/l7/`) found that OpenShell
+implements **two different failure behaviors** depending on *which* credential
+mechanism fails, and only one of them matches the `claw-operator` pattern.
+
+**Policy denial (domain/path not allowed)** — matches `claw-operator`'s `403`
+pattern exactly. `deny_with_redacted_target` in
+[`crates/openshell-supervisor-network/src/l7/rest.rs`](../../../OpenShell/crates/openshell-supervisor-network/src/l7/rest.rs)
+writes a structured `403` JSON body (policy name + reason), called from
+`relay.rs` when `allowed` is `false` and enforcement mode is not `Audit`. This
+is the path exercised by `verify.sh` Layer 4 (`github.com` → expected 403).
+
+**OAuth/token-grant credential injection failure** — also matches
+`claw-operator`'s `502` pattern. In
+[`crates/openshell-supervisor-network/src/l7/relay.rs:910-923`](../../../OpenShell/crates/openshell-supervisor-network/src/l7/relay.rs),
+if `token_grant_injection::inject_if_needed()` fails, the relay explicitly
+calls `write_bad_gateway_response(client)` (`502`) before closing the
+connection. No silent passthrough here either.
+
+**Generic placeholder credential injection failure (`openshell:resolve:env:KEY`)
+— does NOT match the pattern.** This is the mechanism actually used by this
+deployment for MaaS API key injection (constraint #3 above). When a request
+carries an `openshell:resolve:env:...` placeholder that the `SecretResolver`
+cannot resolve, the fail-closed scan in `rewrite_http_header_block`
+([`rest.rs:481-482`](../../../OpenShell/crates/openshell-supervisor-network/src/l7/rest.rs))
+returns `Err` *before any bytes are written to the client or upstream*. That
+error propagates via `?` through `relay_http_request_with_options_guarded` →
+`relay_rest` (`relay.rs:943`) → `relay_with_inspection` → the caller in
+`proxy.rs`, with **no explicit HTTP response written at any point** — the
+connection is simply torn down (TCP/TLS reset), not answered with `502`.
+
+This is not a credential leak — the test
+`relay_request_without_resolver_fails_closed_on_placeholder`
+([`rest.rs:4868-4927`](../../../OpenShell/crates/openshell-supervisor-network/src/l7/rest.rs))
+proves zero bytes reach upstream when the placeholder is unresolved, so the
+fail-closed security invariant holds. The gap is purely observability: an
+operator or client sees a generic connection-reset/EOF instead of a `502`
+they could alert on or distinguish from a network blip.
+
+**Failure mode**: If the MaaS API key credential ever fails to resolve (e.g.
+provider misconfiguration, stale env), OpenClaw's HTTP client sees a connection
+reset rather than a `502` response body, making the root cause harder to
+diagnose from gateway logs alone (an OCSF `warn!` is emitted server-side, but
+the client gets no status code to correlate).
+
+**Workaround**: None needed for this deployment today — the credential is
+injected successfully in the current setup (constraint #3's workaround avoids
+this exact mechanism for Node.js `fetch()` anyway). Flagged for upstream
+awareness: OpenShell could route the placeholder-resolution failure through
+the same `write_bad_gateway_response()` helper already used for
+`token_grant_injection` failures, for consistent `502` semantics across all
+credential-injection failure modes.
+
+**Scripts affected**: None (informational finding, no local workaround
+required). Relevant upstream files: `crates/openshell-supervisor-network/src/l7/rest.rs`,
+`crates/openshell-supervisor-network/src/l7/relay.rs` (OpenShell repo).
 
 ---
 
@@ -378,3 +469,133 @@ AND value LIKE '/mlflow/artifacts/%';
 
 **Scripts affected**: `manifests/observability/mlflow.yaml`,
 `scripts/deploy-observability.sh`
+
+---
+
+## 15. `verify.sh` False Positives — Gateway Config-Write Restarts and BOOTSTRAP.md Lifecycle
+
+**Context**: Found while running the full `verify.sh` suite to green after the
+constraint #14 audit. Two Layer 5b/8b checks failed consistently, but both
+turned out to be flaws in the *test's* assumptions, not real deployment
+defects. Both are now fixed in `scripts/verify.sh` directly (see inline
+comments there); this entry records the root-cause evidence.
+
+**Finding A — `gateway.http.endpoints.chatCompletions.enabled` writes restart
+the whole gateway.** Layer 5b Check 4 temporarily flips this config key to
+`true`, sends a real `/v1/chat/completions` request, then (previously) flipped
+it back to `false` immediately. Layer 5b Check 5 then polled MLflow for a
+fresh trace from that request and consistently found a stale one (many
+minutes old).
+
+Root cause, confirmed from both sides:
+- OpenClaw's gateway config-reload planner
+  (`src/gateway/config-reload-plan.ts` in the openclaw repo) has no specific
+  rule for `gateway.http.endpoints.*`, so it falls through to the catch-all
+  `{ prefix: "gateway", kind: "restart" }` rule. Writing this key always
+  restarts the gateway (confirmed live in `openclaw.log`:
+  `[reload] config change requires gateway restart
+  (gateway.http.endpoints.chatCompletions.enabled)` → `SIGUSR1` → in-process
+  restart, same PID, ~30ms shutdown).
+- The `mlflow-openclaw` plugin flushes each trace asynchronously
+  (`queueMicrotask` in `agent_end`'s handler, `src/service.ts`) *after* the
+  HTTP response has already been sent to the client — so `curl` returning
+  successfully does not mean the trace has reached MLflow yet. A restart
+  landing in that window drops the in-flight trace with no error (the
+  "shutdown completed cleanly" log line does not wait for pending plugin
+  flushes).
+- The config-file watcher that triggers this restart also has multi-second
+  detection latency (the completions *request itself* succeeds immediately
+  because the route handler reads the config file live at request time — a
+  separate, faster path than the watcher-driven reload). So a restart from
+  the *enable* write can land seconds after the request already returned,
+  independent of when the test disables the flag again.
+- Manually reproducing the same request with **no** config write immediately
+  before/after it showed the trace lands in MLflow within about a second of
+  the LLM response — the plugin itself works correctly; only the restart
+  race caused the staleness.
+
+**Fix** (in `scripts/verify.sh`): added an 8s buffer sleep right after the
+completions request returns (before evaluating the response or polling
+MLflow), and deferred the `enabled=false` restore until *after* Check 5's
+trace-recency poll completes, so the test no longer triggers a second,
+self-inflicted restart while it's still waiting on the trace.
+
+**Finding B — `BOOTSTRAP.md` is expected to disappear after the sandbox's
+first real conversation.** Layer 8b's "N/7 prompt files are read-only" check
+originally required all 7 fetched prompt files (`AGENTS`, `SOUL`, `TOOLS`,
+`IDENTITY`, `USER`, `HEARTBEAT`, `BOOTSTRAP`) to permanently exist as
+root-owned `chmod 444`. `BOOTSTRAP.md` was consistently the one missing file.
+
+Root cause: this is intentional OpenClaw behavior, not a fetch/deploy failure.
+`prompts/BOOTSTRAP.md`'s own text says *"This file is only shown during your
+first conversation. After setup completes, it will not appear again."*
+OpenClaw's workspace setup
+(`src/agents/workspace.ts`, `fs.rm(bootstrapPath, { force: true })`) deletes
+it once `workspaceHasBootstrapCompletionEvidence()` is true. The sandbox in
+this deployment has had many real conversations (Playwright E2E chat runs
+across prior `verify.sh` invocations), so `BOOTSTRAP.md` had already been
+consumed and removed — permanently, going forward, by design.
+
+**Fix** (in `scripts/verify.sh`): the read-only check now validates the 6
+persistent prompt files (`AGENTS`/`SOUL`/`TOOLS`/`IDENTITY`/`USER`/`HEARTBEAT`)
+separately from `BOOTSTRAP.md`. `BOOTSTRAP.md` being absent is treated as
+healthy (setup already completed); it only fails if the file exists with any
+permission other than `444` (an actual security regression).
+
+**Scripts affected**: `scripts/verify.sh` (Layer 5b Check 4/5, Layer 8b).
+Relevant upstream files (openclaw repo): `src/gateway/config-reload-plan.ts`,
+`src/agents/workspace.ts`, `node_modules/@mlflow/mlflow-openclaw/src/service.ts`
+(inside the sandbox at
+`/sandbox/workspace/.openclaw/extensions/mlflow-openclaw/node_modules/@mlflow/mlflow-openclaw/src/service.ts`).
+
+## 16. `verify.sh` Layer 7b WebSocket Probe — Flaky Under Rapid Repeated Runs
+
+**Context**: Found while validating the `launch-openclaw.sh` simplification
+plan (removal of the dead Node binary workaround, template-based API key
+injection, baseline-comment fix, and the `sandbox connect` → `sandbox exec
+--no-tty` migration for gateway/linker startup). None of those changes touch
+`oauth-proxy`, WebSocket routing, or Layer 7b's check itself, but this finding
+is recorded here since it surfaced during that validation.
+
+**Observation**: `scripts/verify.sh` was run 6 times in immediate succession
+against the same CRC sandbox (2 full `launch-openclaw.sh` redeploys + 6
+`verify.sh` runs + 1 `configure-oidc.sh` OIDC refresh within ~35 minutes, to
+rule out regressions from the plan's changes). Layer 7b's raw `curl`-based
+WebSocket-upgrade probe (`Connection: Upgrade` / `Sec-WebSocket-*` headers
+against the oauth-proxy route, expecting `HTTP 101`) passed on the first
+clean run and then returned `HTTP 502` on every subsequent run, regardless of
+cooldown time (tested up to a 2-minute gap between runs).
+
+**This is not a functional regression**: in every single one of those 6 runs
+— including the ones where the raw curl probe reported `502` — Layer 9's
+Playwright suite (a real browser logging in, opening the Control UI, and
+completing "E2E chat: Claude responds via MaaS" over the *same* WebSocket
+path) passed. `oauth-proxy`'s own logs show no error or `502` logged for the
+probe's timestamp, and the sandbox's `openclaw.log` shows real webchat
+connections succeeding and receiving `200` model responses throughout the
+same window. Layer 5b (LLm connectivity, including the constraint #2 binary
+policy check) and the MLflow trace/prompt pipeline (Layers 8/8b) stayed green
+across all 6 runs.
+
+**Likely cause (not fully isolated)**: the synthetic `curl -m 3` WS-upgrade
+probe leaves a connection in a non-standard state (curl aborts a successful
+`101` upgrade via its own timeout rather than a clean close, since a
+successful WebSocket upgrade never "completes" from curl's perspective — see
+the comment above the check in `verify.sh`). Repeating this probe many times
+within a short window against the same passthrough-TLS route, on a
+single-node CRC cluster already under load from repeated `sandbox exec`
+calls and Playwright browser instances, plausibly exhausts a connection or
+session resource specific to that raw-curl code path without affecting real
+browser-driven WebSocket clients.
+
+**Workaround**: None needed — this is a test-probe artifact under
+unrealistic rapid-repeat load, not a deployment defect. A normal single
+`launch-openclaw.sh` + `verify.sh` cycle (the actual supported workflow) sees
+this check pass. If it recurs during normal (non-stress-tested) usage,
+treat Layer 9's Playwright chat result as the authoritative signal for
+whether chat actually works, and check `oc -n openshell logs deploy/oauth-proxy`
+plus `openclaw.log`'s `[ws]` lines for real errors before assuming a
+regression.
+
+**Scripts affected**: None (informational finding from validation testing,
+no code change required). Relevant file: `scripts/verify.sh` (Layer 7b).

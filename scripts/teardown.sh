@@ -28,6 +28,10 @@ helm uninstall openshell -n "$NAMESPACE" 2>/dev/null && info "Helm release remov
 
 step "Removing OpenShift Routes"
 oc delete -f "${PROJECT_DIR}/manifests/openshell-route.yaml" 2>/dev/null || true
+# openclaw-ui (unauthenticated static-token Route) was retired in ADR-0016;
+# this delete is only a safety net for clusters still running the old manifest.
+# oauth-proxy's own Route/Deployment/Service/SA are cleaned up below by the
+# namespace deletion.
 oc -n "$NAMESPACE" delete route openclaw-ui 2>/dev/null || true
 
 step "Removing PKI and JWT secrets"

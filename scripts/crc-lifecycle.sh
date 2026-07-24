@@ -164,7 +164,7 @@ cmd_deploy() {
       sleep 5
     done
 
-    step "Phase 6: Deploy oauth2-proxy (OIDC UI auth)"
+    step "Phase 6: Deploy oauth-proxy (OpenShift-native OAuth UI auth, ADR-0016)"
     "${SCRIPT_DIR}/deploy-oauth2-proxy.sh"
   fi
 
@@ -229,7 +229,7 @@ cmd_full() {
   echo ""
   step "Full lifecycle complete"
   info "CRC is running with OpenClaw-in-OpenShell deployed and verified."
-  info "Control UI: https://openclaw-ui.$(get_apps_domain)/"
+  info "Control UI: https://openclaw-gw--openclaw-ui.$(get_apps_domain)/"
   info "MLflow UI:  https://mlflow-observability.$(get_apps_domain)/"
   info "Stop CRC:   ./scripts/crc-lifecycle.sh stop"
   info "Teardown:   ./scripts/crc-lifecycle.sh teardown"

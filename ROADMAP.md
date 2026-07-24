@@ -110,6 +110,9 @@ Decision: ADR-0009 — Explicit Route per service + wildcard SAN + passthrough T
 - [x] Update `manifests/openclaw-service-route.yaml`, `deploy-openshell.sh`, `launch-openclaw.sh`
 - [x] Add Layer 7b external access verification to `verify.sh`
 - [x] Create `scripts/upgrade-pki.sh` for cert secret delete + helm upgrade cycle
+- [x] **Superseded in Phase 13.1** (ADR-0016): the unauthenticated `openclaw-ui` Route this
+  phase created was retired. `oauth-proxy`'s own Route now reuses this same hostname
+  (`openclaw-gw--openclaw-ui.<domain>`) as the sole, OAuth-gated entry point.
 
 ## Phase 7: Keycloak OIDC with OCP Identity Federation
 
@@ -166,8 +169,10 @@ The `trusted-proxy` auth mode required several non-obvious settings to work with
 
 **Browser UI access (SSO, no token needed):**
 ```
-https://openclaw-ui.<APPS_DOMAIN>/
+https://openclaw-gw--openclaw-ui.<APPS_DOMAIN>/
 ```
+(Historical note: this URL was `openclaw-ui.<APPS_DOMAIN>` until Phase 13.1's
+WebSocket fix — see ADR-0016.)
 
 **CLI access:**
 ```bash
@@ -200,7 +205,7 @@ Access: `https://mlflow-observability.<APPS_DOMAIN>/`
 ### Phase 8 cleanup (low priority)
 
 - [ ] Remove stale `MLFLOW_TRACKING_URI` env var from `scripts/launch-openclaw.sh` line 375 (contradicts ADR-0014 Problem 7; not causing issues currently but is dead config)
-- [ ] Sync config drift between `config/openclaw.json` (live CRC) and `config/openclaw.json.tpl` (template): `diagnostics-otel.enabled`, `diagnostics.otel.logs`, `gateway.auth.trustedProxy.allowLoopback`
+- [x] Sync config drift between `config/openclaw.json` (reference snapshot) and `config/openclaw.json.tpl` (template): regenerated the snapshot from a real render of the template (`diagnostics-otel.enabled`, `diagnostics.otel.logs`, `diagnostics.otel.captureContent`, `mlflow-openclaw.hooks.allowConversationAccess`, `gateway.auth.trustedProxy.allowLoopback` were the drifted keys). Root cause: no deploy script ever writes to `config/openclaw.json` — `launch-openclaw.sh` and `deploy-oauth2-proxy.sh` both render `.tpl` straight into `.rendered/`, so the committed snapshot only stays accurate by hand. Added `check_config_snapshot_drift()` in `scripts/common.sh`, wired into `verify.sh` as "Layer 1a: Config template drift" so future drift fails verification instead of silently accumulating.
 
 ## Phase 8b: System Prompts via MLflow Prompt Registry
 
@@ -329,14 +334,18 @@ Deferred from the security review (branch `security-review/remediation-v1`). The
 
 ### 13.1 Eliminate Keycloak — use OpenShift OAuth directly
 
-The Red Hat reference pattern (`claw-installer`) uses OpenShift OAuth natively via an `oauth-proxy` sidecar, eliminating Keycloak entirely. This would remove:
+The Red Hat reference pattern (`claw-installer`) uses OpenShift OAuth natively via an `oauth-proxy` sidecar. This has been done for the **browser UI path**. For the **CLI/gRPC path**, full removal was investigated and closed as a decision to keep Keycloak (see below) — this is no longer an open TODO for that path. If it is ever revisited, it would fully remove:
 
 - [ ] Entire `openshell-keycloak` namespace
 - [ ] `scripts/deploy-keycloak.sh`, `scripts/configure-oidc.sh`
 - [ ] Realm ConfigMap, broker secrets, ROPC client config
 - [ ] `directAccessGrantsEnabled` (ROPC grant), token TTL workarounds
 
-**Blocker**: Our topology has OpenShell in the middle (Browser -> oauth-proxy -> OpenShell relay -> sandbox gateway). The `claw-installer` sidecar pattern goes directly to the pod. Need to verify if OpenShift OAuth can work with the OpenShell relay topology.
+**Status: browser UI path done and live in production.** See [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md) "Rollout to production". The production Route `openclaw-ui-auth` (`openclaw-gw--openclaw-ui.<APPS_DOMAIN>`) now points at `oauth-proxy` (OpenShift fork, SA-based OAuth client) in `manifests/oauth2-proxy/` — the former community `oauth2-proxy` + Keycloak stack there was replaced, not run side by side. `scripts/deploy-oauth2-proxy.sh`, `scripts/verify.sh` (Layer 7b), and `tests/auth.setup.ts` were all updated accordingly. Browsers now authenticate directly against OCP's own OAuth server; zero Keycloak involvement in this path. Three real defects were found and fixed along the way: `--upstream-ca` for the relay's passthrough-TLS cert; and a WebSocket-specific Host-header bug in this `oauth-proxy` fork (present in `openshift/oauth-proxy` and, verified separately, in `opendatahub-io/kube-auth-proxy` too) that broke chat logins entirely — fixed by making the public Route hostname equal OpenShell's own `{sandbox}--{service}` pattern, `--pass-host-header=true`, and a `hostAliases` entry so `oauth-proxy`'s own upstream can still reach the `openshell` Service without looping back through its own Route. This also retired the old unauthenticated static-token Route (`openclaw-ui`), which had used that same hostname. See ADR-0016's "WebSocket login failure" section. **Correction vs. the original idea**: the community `oauth2-proxy` image has no `openshift` provider; the fix required swapping in the separate `openshift/oauth-proxy` fork, not a config flag change.
+
+**Status: CLI/gRPC path — investigated and closed, decision is to keep Keycloak.** This is not an open blocker waiting on future work in this repo; it's a completed investigation with a documented conclusion. The CLI/gRPC gateway auth path (`scripts/configure-oidc.sh`, `charts/openshell/values-ocp.yaml.tpl` `server.oidc`) validates bearer JWTs against a JWKS-serving OIDC issuer and expects a Keycloak-specific `realm_access.roles` claim for admin/user role mapping. OCP's native OAuth server issues opaque tokens with no JWKS endpoint and cannot satisfy this — confirmed directly against the OpenShell gateway source (`crates/openshell-server/src/auth/oidc.rs`, `k8s_sa.rs`, `multiplex.rs`), not just inferred from behavior. Dropping Keycloak today would mean either running CLI/gRPC unauthenticated (`allowUnauthenticatedUsers: true`, rejected — real security regression) or swapping in a different OIDC broker (doesn't remove the architectural dependency, just changes which pod provides it). **The one condition that would reopen this**: the OpenShell gateway gaining native support for validating OpenShift user OAuth tokens directly (new `TokenReview`/`SubjectAccessReview`-based authenticator for human callers — upstream work in a different repository, not scheduled). See [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)'s "Decision record: Keycloak stays, scoped to the CLI/gRPC path" for the full technical wall, options table, and rejection rationale.
+
+Also still open (browser UI path, unrelated to the Keycloak decision): SAR-based access scoping, and re-verifying `x-forwarded-email` with a real (non-HTPasswd) IdP — see ADR-0016's "Open questions from the original spike".
 
 ### 13.2 Simplify gateway auth mode
 
@@ -359,6 +368,53 @@ Remediates HIGH-3 (MLflow deployed without authentication):
 - [ ] Restrict sandbox policy `mlflow_direct` to read-only (only `GET`/`HEAD` methods from sandbox)
 - [ ] Update `seed-mlflow-prompts.sh` and `fetch-prompts-from-mlflow.sh` with basic-auth credentials
 - [ ] Add MLflow auth verification to `verify.sh`
+
+### 13.4 Review: plaintext MaaS API key on disk + no per-user session isolation
+
+Flagged from a chat-session security review (jailbreak/exfiltration probing found in a
+real session transcript — the agent correctly refused all attempts, but the underlying
+architecture relies on soft controls in two places that deserve a hard fix:
+
+**A. Plaintext API key in the sandbox workspace.** Constraint #3 (`docs/constraints.md`)
+requires `launch-openclaw.sh` to inject the real `MAAS_API_KEY` directly into
+`/sandbox/workspace/.openclaw/openclaw.json` instead of the `openshell:resolve:env:...`
+placeholder pattern, because Node's `fetch()`/`undici` breaks proxy credential injection.
+That path is Landlock **read-write** and not on the `tools.deny` list (only `gateway`,
+`cron`, `openclaw` are denied) — the agent's normal `read`/`exec` tools can access it.
+Today the only things standing between a malicious prompt and the raw key are: (1) the
+LLM's own judgment to refuse (soft — worked in the observed session, but not guaranteed),
+and (2) OpenClaw's pattern-based transcript/tool-output redaction (hard, but incomplete —
+it doesn't cover every way the key text could be reshaped before being echoed).
+
+- [ ] Re-investigate OpenShell issue #894 (undici binary resolution) for a fix that
+      restores true placeholder-based credential injection for Node.js `fetch()`, removing
+      the need to ever write the real key to sandbox disk
+- [ ] Until #894 lands, evaluate mitigations: register the plaintext MaaS key in
+      OpenClaw's exact-value secret registry (`secrets/runtime.ts`) so redaction isn't
+      purely pattern-based, and/or add the workspace config path to a denylist for
+      generic file-read/`exec` tools
+- [ ] Add an automated check (in `verify.sh` or a Playwright test) that attempts common
+      jailbreak/exfiltration prompts against a live session and asserts the real key
+      never appears unmasked in `chat.history` / the `.jsonl` transcript
+
+**B. No per-user session isolation in the Control UI.** OpenClaw's gateway is
+single-tenant by design (`docs/gateway/security/index.md`): `chat.history` and
+`sessions.list` are gated only by the `operator.read` scope, with no check that the
+calling identity owns the session being read. Combined with oauth-proxy's
+`--provider=openshift` having no `-openshift-sar` (ADR-0016), **any** OpenShift user
+who can authenticate can open the Control UI, get full operator scopes (including
+`operator.admin`, via `dangerouslyDisableDeviceAuth`), and read every other user's
+session transcripts — not just their own. This overlaps with the still-open
+"SAR-based access scoping" item noted in 13.1/ADR-0016, but is worth calling out
+explicitly as a session-privacy issue, not just an access-scope one.
+
+- [ ] Add `-openshift-sar` to the oauth-proxy Deployment to restrict Control UI login
+      to a named group/role, not "any cluster user" (tracked in ADR-0016 open questions)
+- [ ] Decide whether this deployment needs true per-user session isolation (each OCP
+      identity only sees its own sessions) or whether "shared operator access for a small
+      trusted team" is an acceptable model — document the decision in an ADR either way
+- [ ] If per-user isolation is required, this is an OpenClaw core gap, not something
+      fixable purely in this repo's config — file/track upstream
 
 ## References
 

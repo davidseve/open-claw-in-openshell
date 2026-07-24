@@ -101,6 +101,19 @@ When deploying to a different cluster, only `values-ocp.yaml` serverDnsNames nee
 - Transitioning to trusted certs requires cert-manager (future Phase 7 or dedicated cert work)
 - The wildcard SAN does not weaken security because the cert is self-signed (not trusted by default)
 
+## Update (2026-07-23): the `openclaw-ui` Route itself was retired
+
+The **mechanism** described above (wildcard SAN + Host-header service
+routing) is unchanged and still how OpenShell routes to sandbox services.
+But the specific `openclaw-ui` Route this ADR introduced — unauthenticated,
+static-token access straight to the `openshell` Service — was deleted in
+[ADR-0016](ADR-0016-openshift-native-oauth-spike.md)'s WebSocket fix.
+`oauth-proxy`'s own Route now claims this same hostname
+(`openclaw-gw--openclaw-ui.<domain>`) as the sole, OAuth-gated entry point;
+`oauth-proxy` reaches the `openshell` Service directly via a `hostAliases`
+entry instead of going back out through a Route for that hostname. There is
+no more unauthenticated static-token path onto this service.
+
 ## References
 
 - [OpenShell service routing docs](https://docs.nvidia.com/openshell/sandboxes/manage-gateways) — Host-based routing, `server_sans`

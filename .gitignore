@@ -35,6 +35,7 @@ tmp/
 # Local deploy/monitor state
 .deploy-state.json
 .monitor-state.json
+.verify-status.json
 
 # Rendered templates (generated at deploy time from .tpl files)
 .rendered/

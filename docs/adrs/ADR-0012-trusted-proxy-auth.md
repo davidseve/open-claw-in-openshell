@@ -1,7 +1,14 @@
 # ADR-0012: Trusted-Proxy Auth — Eliminating the Static Gateway Token
 
 ## Status
-Accepted (supersedes token auth from ADR-0008)
+Accepted (supersedes token auth from ADR-0008). **Addendum (2026-07-23,
+[ADR-0016](ADR-0016-openshift-native-oauth-spike.md)): the identity provider
+in front of this trusted-proxy boundary changed** (`oauth2-proxy` + Keycloak
+→ `oauth-proxy` + OpenShift-native OAuth). This ADR's core decision —
+`trusted-proxy` mode, the `x-forwarded-email` header contract,
+`allowLoopback`, `dangerouslyDisableDeviceAuth`, and the full defense-in-depth
+analysis below — is unaffected and still governs the browser UI today. See
+the "Addendum" section near the end for what changed and what didn't.
 
 ## Context
 
@@ -187,10 +194,47 @@ The following risks are accepted trade-offs of this architecture:
 - `dangerouslyDisableDeviceAuth` should be removed if OpenClaw adds support for device pairing through proxy chains in a future release.
 - For production deployments, the `trustedProxies` CIDRs should be tightened to match actual cluster network ranges (avoid broad `192.168.0.0/16` unless the environment requires it).
 
+## Addendum (2026-07-23): identity provider swap, trusted-proxy contract unchanged
+
+[ADR-0016](ADR-0016-openshift-native-oauth-spike.md) replaced the browser
+UI's identity provider — `oauth2-proxy` (community) + Keycloak became
+`oauth-proxy` (OpenShift fork) + OpenShift's own OAuth server — without
+touching anything decided in this ADR:
+
+- **Header contract preserved unchanged.** `oauth-proxy` is invoked with
+  `--pass-user-headers=true` (the fork's equivalent of `oauth2-proxy`'s
+  `pass_user_headers`), so it still injects `x-forwarded-email` (and
+  `x-forwarded-user`/`x-forwarded-preferred-username`) exactly as
+  `oauth2-proxy` did. `userHeader: "x-forwarded-email"` in `config/openclaw.json.tpl`
+  did not need to change.
+- **`allowLoopback`, `trustedProxies`, `requiredHeaders`,
+  `dangerouslyDisableDeviceAuth` all unchanged.** The proxy chain topology
+  (`Browser → Route → proxy → OpenShell relay → sandbox loopback`) is
+  identical in shape; only the box performing the OIDC/OAuth handshake
+  changed.
+- **Threat model and defense-in-depth table unaffected.** Every row in
+  "Threat model comparison" and "Defense-in-depth summary" above that
+  mentions "oauth2-proxy + Keycloak" reads identically as
+  "oauth-proxy + OpenShift-native OAuth" — same guarantee (unauthenticated
+  browser access blocked by a redirect to a real login page), different
+  implementation.
+- **Validated in production, not just asserted**: MLflow trace user
+  attribution (which depends on `x-forwarded-email` reaching the OpenClaw
+  gateway correctly) was re-verified end-to-end against the new
+  `oauth-proxy` path and passed — the header contract this ADR defined
+  survived the swap intact.
+
+This addendum intentionally does not restate ADR-0016's full rationale for
+*why* the swap happened (see that ADR) — it only records that this ADR's
+own decision required no changes.
+
 ## References
 
 - ADR-0008: Deployment Findings (original `config.patch` vulnerability)
 - ADR-0010: OIDC + OCP Federation
-- ADR-0011: oauth2-proxy UI Authentication
+- ADR-0011: oauth2-proxy UI Authentication (superseded by ADR-0016 for the
+  browser UI path; this ADR's `trusted-proxy` decision is not superseded)
+- ADR-0016: OpenShift-Native OAuth Instead of Keycloak (identity provider
+  swap addressed in the addendum above)
 - [OpenClaw Trusted Proxy Auth](https://docs.openclaw.ai/gateway/trusted-proxy)
 - [OpenClaw Security](https://docs.openclaw.ai/gateway/security)

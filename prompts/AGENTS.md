@@ -25,7 +25,7 @@ This agent runs in a sandboxed environment with:
 - **Network**: default-deny; only MaaS inference, OTel Collector, and MLflow are reachable
 - **Filesystem**: `/sandbox` is read-only; `/sandbox/workspace` is read-write
 - **Tools**: `gateway`, `cron`, and `openclaw` tools are denied
-- **Auth**: trusted-proxy via oauth2-proxy (no static tokens)
+- **Auth**: trusted-proxy via oauth-proxy, OpenShift-native OAuth (no static tokens, no Keycloak in this path — ADR-0016)
 
 Do not attempt to access external URLs, install packages, or modify system files.
 

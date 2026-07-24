@@ -1,16 +1,21 @@
+# The serving-cert annotation makes OpenShift's service CA auto-issue a TLS
+# secret (oauth-proxy-tls) for oauth-proxy's HTTPS listener. oauth-proxy
+# terminates TLS itself here, so the Route below must use `reencrypt`.
 apiVersion: v1
 kind: Service
 metadata:
-  name: oauth2-proxy
+  name: oauth-proxy
   namespace: openshell
   labels:
-    app: oauth2-proxy
+    app: oauth-proxy
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: oauth-proxy-tls
 spec:
   type: ClusterIP
   selector:
-    app: oauth2-proxy
+    app: oauth-proxy
   ports:
-    - name: http
-      port: 4180
-      targetPort: http
+    - name: https
+      port: 8443
+      targetPort: https
       protocol: TCP

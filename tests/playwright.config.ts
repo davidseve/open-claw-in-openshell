@@ -1,6 +1,6 @@
 import { defineConfig, devices } from '@playwright/test';
 
-const baseURL = process.env.OPENCLAW_BASE_URL || 'https://openclaw-ui.apps-crc.testing';
+const baseURL = process.env.OPENCLAW_BASE_URL || 'https://openclaw-gw--openclaw-ui.apps-crc.testing';
 
 export default defineConfig({
   testDir: '.',

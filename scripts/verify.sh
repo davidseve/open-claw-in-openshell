@@ -78,6 +78,16 @@ for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
 done
 
 # =============================================================================
+# Layer 1a: Config template drift
+# =============================================================================
+# WHY: config/openclaw.json is a committed reference snapshot, but no deploy
+#   script writes to it (they render config/openclaw.json.tpl straight into
+#   .rendered/). It only stays accurate by hand-editing — this check catches
+#   when the snapshot and template have quietly diverged.
+step "Layer 1a: Config template drift (openclaw.json vs .tpl)"
+check_config_snapshot_drift
+
+# =============================================================================
 # Layer 1b: Keycloak OIDC
 # =============================================================================
 # WHY: All user-facing access (Control UI, CLI) goes through OIDC.
@@ -417,17 +427,30 @@ with open(CFG,\"w\") as f: json.dump(d,f,indent=2)
     -H 'Content-Type: application/json' \
     -H 'X-Forwarded-Email: verify@test.local' \
     -H 'X-Forwarded-Proto: https' \
-    -H 'X-Forwarded-Host: openclaw-ui.${APPS_DOMAIN}' \
+    -H 'X-Forwarded-Host: openclaw-gw--openclaw-ui.${APPS_DOMAIN}' \
     -d '{\"model\":\"openclaw\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: VERIFY_OK\"}],\"stream\":false,\"max_tokens\":20}' 2>&1; echo GW_LLM_EXIT:\$?" || true)
 
-  # Restore chatCompletions to disabled
-  sandbox_run 'python3 -c "
-import json
-CFG=\"/sandbox/workspace/.openclaw/openclaw.json\"
-with open(CFG) as f: d=json.load(f)
-d[\"gateway\"][\"http\"][\"endpoints\"][\"chatCompletions\"][\"enabled\"]=False
-with open(CFG,\"w\") as f: json.dump(d,f,indent=2)
-"' > /dev/null 2>&1 || true
+  # NOTE on both the sleep below and deferring the chatCompletions.enabled=false
+  # restore until AFTER Check 5's trace-recency poll (not done here immediately
+  # after the request): `gateway.http.endpoints.*` has no dedicated hot-reload
+  # rule in OpenClaw's config-reload-plan.ts, so it falls through to the
+  # generic `gateway` prefix rule (kind: "restart") — writing this key
+  # restarts the entire gateway process (confirmed live: gateway.log shows
+  # "[reload] config change requires gateway restart" -> SIGUSR1 -> in-process
+  # restart). The gateway's own config-file watcher also detects our *enable*
+  # write above with several seconds of latency (it's not the live per-request
+  # read that let the completions call above succeed immediately), so a
+  # restart from enabling can land seconds after the request already
+  # returned. Either restart races the mlflow-openclaw plugin's async
+  # agent_end -> MLflow flush (queueMicrotask in service.ts): live testing
+  # showed the flush lands within ~1s of the LLM response in the absence of a
+  # restart, but a restart mid-flush drops the trace before it reaches
+  # MLflow, so Check 5 always found a stale trace. The sleep gives the flush
+  # a safety margin before either restart can hit; deferring the disable-write
+  # avoids adding a second, self-inflicted restart during Check 5's own poll.
+  # See docs/constraints.md #14 for the related L7 proxy failure-mode audit
+  # that surfaced this while investigating.
+  sleep 8
 
   if echo "$GW_LLM" | grep -qi "choices\|content\|VERIFY_OK"; then
     pass "Gateway LLM request completed (model responded)"
@@ -492,107 +515,165 @@ else:
       fi
     fi
   fi
+
+  # Restore chatCompletions to disabled now that Check 5's trace poll is
+  # done. Writing this key restarts the gateway (see NOTE above Check 4), so
+  # it must happen after — not before — we've finished waiting on the trace.
+  sandbox_run 'python3 -c "
+import json
+CFG=\"/sandbox/workspace/.openclaw/openclaw.json\"
+with open(CFG) as f: d=json.load(f)
+d[\"gateway\"][\"http\"][\"endpoints\"][\"chatCompletions\"][\"enabled\"]=False
+with open(CFG,\"w\") as f: json.dump(d,f,indent=2)
+"' > /dev/null 2>&1 || true
 else
   warn "openshell CLI not available, skipping LLM connectivity checks"
 fi
 
 # =============================================================================
-# Layer 7b: External Service URL Access
+# Layer 7a: Unauthenticated Direct-Access Route Is Retired
 # =============================================================================
-# WHY: Verifies that the OpenClaw UI is reachable from outside the cluster
-#   through the OpenShift route and oauth2-proxy.
-step "Layer 7b: External Access via Service Route"
+# WHY: ADR-0016 retired the unauthenticated static-token Route `openclaw-ui`
+#   (it pointed straight at the `openshell` Service, bypassing oauth-proxy
+#   entirely) once oauth-proxy became the sole browser auth path. This check
+#   is intentionally inverted from what it used to verify: it now confirms
+#   the insecure Route stays gone, instead of proving it works.
+step "Layer 7a: Unauthenticated direct-access Route is retired"
 
-MTLS_DIR="$HOME/.config/openshell/gateways/ocp/mtls"
-SVC_ROUTE_HOST=$(oc -n "$NAMESPACE" get route openclaw-ui -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
-
-if [[ -n "$SVC_ROUTE_HOST" ]]; then
-  pass "Service Route exists: $SVC_ROUTE_HOST"
-
-  if [[ -f "$MTLS_DIR/tls.crt" && -f "$MTLS_DIR/tls.key" && -f "$MTLS_DIR/ca.crt" ]]; then
-    EXTERNAL_URL="$(get_service_url "$SANDBOX_NAME" openclaw-ui)"
-    HEALTH_EXT=$(curl -sk --cert "$MTLS_DIR/tls.crt" \
-                          --key  "$MTLS_DIR/tls.key" \
-                          --cacert "$MTLS_DIR/ca.crt" \
-                          "${EXTERNAL_URL}/health" 2>&1 || true)
-    if echo "$HEALTH_EXT" | grep -q '"ok":true'; then
-      pass "External access: /health returns ok via service Route"
-    elif echo "$HEALTH_EXT" | grep -qiE "alert|handshake|certificate"; then
-      warn "External access: TLS handshake issue (wildcard SAN may be missing — run scripts/upgrade-pki.sh)"
-    else
-      warn "External access: unexpected response (${HEALTH_EXT:0:80})"
-    fi
-  else
-    warn "mTLS certs not found at $MTLS_DIR — skipping mTLS external access tests"
-  fi
+if oc -n "$NAMESPACE" get route openclaw-ui &>/dev/null; then
+  fail "Route 'openclaw-ui' still exists — unauthenticated direct access to the sandbox service is possible, bypassing oauth-proxy (see ADR-0016)"
 else
-  warn "Service Route 'openclaw-ui' not found — apply manifests/openclaw-service-route.yaml"
+  pass "Route 'openclaw-ui' does not exist — no unauthenticated direct access path"
 fi
 
 # =============================================================================
-# Layer 7b: oauth2-proxy OIDC UI Authentication
+# Layer 7b: oauth-proxy OpenShift-native OAuth UI Authentication
 # =============================================================================
-# WHY: Users access the OpenClaw UI through oauth2-proxy, which handles
-#   Keycloak OIDC login. This verifies the full auth chain:
-#   1. oauth2-proxy route exists and pod is running
-#   2. Unauthenticated requests redirect to Keycloak (302)
-#   3. Redirect points to the correct Keycloak realm
-#   4. Password grant works (proves client credentials are correct)
+# WHY: Users access the OpenClaw UI through oauth-proxy (OpenShift fork,
+#   `-provider=openshift`), which authenticates browsers directly against
+#   OCP's own OAuth server via a ServiceAccount-based OAuth client -- no
+#   Keycloak broker in this path (see ADR-0016). This verifies the chain:
+#   1. oauth-proxy route exists and pod is running
+#   2. Unauthenticated requests redirect to the OCP OAuth server (302)
+#   3. Redirect points to the cluster's real OAuth route (oauth-openshift)
+#   Keycloak remains deployed only for the separate CLI/gRPC OIDC path
+#   (scripts/configure-oidc.sh) -- see Layer 7c below.
 # HOW TO FIX: scripts/deploy-oauth2-proxy.sh
-step "Layer 7b: oauth2-proxy OIDC UI Authentication"
+step "Layer 7b: oauth-proxy OpenShift-native OAuth UI Authentication"
 
-OAUTH2_PROXY_HOST="openclaw-ui.${APPS_DOMAIN}"
-KC_HOST="keycloak-openshell-keycloak.${APPS_DOMAIN}"
+# Hostname must equal OpenShell's {sandbox}--{service} pattern -- see
+# manifests/oauth2-proxy/route.yaml.tpl for why (WebSocket Host-header bug
+# in this oauth-proxy fork, ADR-0016).
+OAUTH_PROXY_HOST="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
 
 if oc -n "$NAMESPACE" get route openclaw-ui-auth &>/dev/null; then
-  pass "oauth2-proxy route exists"
+  pass "oauth-proxy route exists"
 
-  if oc -n "$NAMESPACE" get deployment oauth2-proxy &>/dev/null; then
-    READY=$(oc -n "$NAMESPACE" get deployment oauth2-proxy -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+  if oc -n "$NAMESPACE" get deployment oauth-proxy &>/dev/null; then
+    READY=$(oc -n "$NAMESPACE" get deployment oauth-proxy -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
     if [[ "$READY" -ge 1 ]]; then
-      pass "oauth2-proxy pod is running (${READY} replicas)"
+      pass "oauth-proxy pod is running (${READY} replicas)"
     else
-      fail "oauth2-proxy pod not ready"
+      fail "oauth-proxy pod not ready"
     fi
   else
-    fail "oauth2-proxy deployment not found"
+    fail "oauth-proxy deployment not found"
   fi
 
-  REDIRECT_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://${OAUTH2_PROXY_HOST}/" 2>/dev/null || echo "000")
+  REDIRECT_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://${OAUTH_PROXY_HOST}/" 2>/dev/null || echo "000")
   if [[ "$REDIRECT_CODE" == "302" || "$REDIRECT_CODE" == "303" ]]; then
-    pass "Unauthenticated request redirects to Keycloak (HTTP ${REDIRECT_CODE})"
+    pass "Unauthenticated request redirects to OCP OAuth server (HTTP ${REDIRECT_CODE})"
   else
     fail "Expected 302/303 redirect, got HTTP ${REDIRECT_CODE}"
   fi
 
-  REDIRECT_LOCATION=$(curl -sk -o /dev/null -w '%{redirect_url}' "https://${OAUTH2_PROXY_HOST}/" 2>/dev/null || echo "")
-  if echo "$REDIRECT_LOCATION" | grep -q "${KC_HOST}"; then
-    pass "Redirect target is Keycloak issuer"
+  REDIRECT_LOCATION=$(curl -sk -o /dev/null -w '%{redirect_url}' "https://${OAUTH_PROXY_HOST}/" 2>/dev/null || echo "")
+  if echo "$REDIRECT_LOCATION" | grep -q "oauth-openshift"; then
+    pass "Redirect target is OCP's native OAuth server (zero Keycloak involvement)"
   else
-    warn "Redirect location does not point to Keycloak: ${REDIRECT_LOCATION:0:80}"
+    warn "Redirect location does not point to oauth-openshift: ${REDIRECT_LOCATION:0:80}"
   fi
 
-  CLIENT_SECRET_FILE="${PROJECT_DIR}/secrets/.oauth2-proxy-client-secret"
-  if [[ -f "$CLIENT_SECRET_FILE" ]]; then
-    UI_CLIENT_SECRET=$(cat "$CLIENT_SECRET_FILE")
-    TOKEN_RESP=$(curl -sk -X POST \
-      "https://${KC_HOST}/realms/openshell/protocol/openid-connect/token" \
-      -d "grant_type=password" \
-      -d "client_id=openclaw-ui" \
-      -d "client_secret=${UI_CLIENT_SECRET}" \
-      -d "username=admin" \
-      -d "password=admin" \
-      -d "scope=openid email profile" 2>/dev/null || echo "")
-    if echo "$TOKEN_RESP" | grep -q "access_token"; then
-      pass "Password grant token acquisition (openclaw-ui client)"
+  # Full authorization-code flow against the HTPasswd `developer` user,
+  # proving end-to-end login without any Keycloak hop (ADR-0016 evidence).
+  CJ=$(mktemp)
+  LOGIN_HTML=$(mktemp)
+  curl -sk -c "$CJ" -L "https://${OAUTH_PROXY_HOST}/" -o "$LOGIN_HTML" 2>/dev/null || true
+  CSRF=$(grep -oP 'name="csrf" value="\K[^"]+' "$LOGIN_HTML" 2>/dev/null || true)
+  THEN_RAW=$(grep -oP 'name="then" value="\K[^"]+' "$LOGIN_HTML" 2>/dev/null || true)
+  if [[ -n "$CSRF" && -n "$THEN_RAW" ]]; then
+    THEN=$(python3 -c "import sys,html; print(html.unescape(sys.argv[1]))" "$THEN_RAW" 2>/dev/null || echo "$THEN_RAW")
+    FINAL_URL=$(curl -sk -b "$CJ" -c "$CJ" -L \
+      --data-urlencode "csrf=${CSRF}" \
+      --data-urlencode "then=${THEN}" \
+      --data-urlencode "username=developer" \
+      --data-urlencode "password=developer" \
+      "https://oauth-openshift.${APPS_DOMAIN}/login" \
+      -o /dev/null -w '%{url_effective}' 2>/dev/null || echo "")
+    if [[ "$FINAL_URL" == "https://${OAUTH_PROXY_HOST}/" ]]; then
+      pass "Full OAuth login flow (HTPasswd developer user) reaches the Control UI"
+
+      # Regression check for the WebSocket Host-header bug this hostname
+      # unification fix addresses (ADR-0016 "WebSocket login failure"): a
+      # real browser opens wss://<OAUTH_PROXY_HOST>/ for the OpenClaw chat
+      # gateway once logged in. If oauth-proxy's WebSocket proxy ever
+      # forwards an unrewritten Host again, OpenShell's service routing
+      # returns 404 here instead of 101.
+      #
+      # IMPORTANT: a *successful* 101 upgrade leaves the connection open
+      # indefinitely (that's the point of WebSocket) -- curl's `-w
+      # '%{http_code}'` only populates once the transfer completes, which
+      # never happens here, so it always reports empty/000 on success and
+      # is indistinguishable from a real failure. Use `-D` instead: curl
+      # writes response headers to that file as soon as they're received,
+      # before the body/frames start streaming, so the status line is
+      # captured correctly even though the subsequent `-m` timeout on the
+      # now-open connection is expected and ignored.
+      WS_HEADERS=$(mktemp)
+      timeout 6 curl -sk -b "$CJ" -m 3 -D "$WS_HEADERS" -o /dev/null \
+        -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+        -H 'Sec-WebSocket-Version: 13' \
+        -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+        "https://${OAUTH_PROXY_HOST}/" 2>/dev/null || true
+      WS_CODE=$(grep -oP 'HTTP/[\d.]+ \K\d+' "$WS_HEADERS" 2>/dev/null | head -1 || echo "000")
+      rm -f "$WS_HEADERS"
+      if [[ "$WS_CODE" == "101" ]]; then
+        pass "WebSocket upgrade through oauth-proxy succeeds (HTTP 101) -- chat gateway reachable"
+      else
+        fail "WebSocket upgrade through oauth-proxy returned HTTP ${WS_CODE} (expected 101) -- chat will show 'Could not connect'"
+      fi
     else
-      fail "Could not acquire token via password grant for openclaw-ui"
+      warn "OAuth login flow did not land on the Control UI (got: ${FINAL_URL:0:80})"
     fi
   else
-    warn "Client secret file not found, skipping token test"
+    warn "Could not parse OCP login form (csrf/then fields) -- skipping full login flow test"
+  fi
+  rm -f "$CJ" "$LOGIN_HTML"
+else
+  warn "oauth-proxy route 'openclaw-ui-auth' not found — run scripts/deploy-oauth2-proxy.sh"
+fi
+
+# =============================================================================
+# Layer 7c: Keycloak (CLI/gRPC OIDC issuer only -- not used by the browser UI)
+# =============================================================================
+# WHY: Keycloak is intentionally still deployed. It is the OIDC issuer for
+#   the openshell CLI/gRPC gateway auth path only (scripts/configure-oidc.sh),
+#   because that path needs a real JWKS-serving OIDC provider with a
+#   realm_access.roles claim (charts/openshell/values-ocp.yaml.tpl
+#   server.oidc.rolesClaim) -- OCP's native OAuth server does not produce
+#   that claim shape. See ADR-0016 "Follow-up: retiring Keycloak".
+step "Layer 7c: Keycloak (CLI/gRPC OIDC issuer)"
+
+KC_HOST="keycloak-openshell-keycloak.${APPS_DOMAIN}"
+if oc get ns openshell-keycloak &>/dev/null; then
+  DISCOVERY=$(curl -sk "https://${KC_HOST}/realms/openshell/.well-known/openid-configuration" 2>/dev/null || true)
+  if echo "$DISCOVERY" | grep -q "jwks_uri"; then
+    pass "Keycloak OIDC discovery reachable (CLI/gRPC issuer)"
+  else
+    fail "Keycloak OIDC discovery not reachable at ${KC_HOST}"
   fi
 else
-  warn "oauth2-proxy route 'openclaw-ui-auth' not found — run scripts/deploy-oauth2-proxy.sh"
+  warn "openshell-keycloak namespace not found -- CLI/gRPC OIDC auth (scripts/configure-oidc.sh) will fail"
 fi
 
 # =============================================================================
@@ -826,13 +907,35 @@ sys.exit(0 if found else 1)
       fail "Prompt manifest missing or empty in sandbox"
     fi
 
-    # Verify prompt files are read-only (chmod 444, root-owned)
-    PROT_CHECK=$(sandbox_run 'c=0; for f in AGENTS SOUL TOOLS IDENTITY USER HEARTBEAT BOOTSTRAP; do test -f /sandbox/workspace/${f}.md && p=$(stat -c %a /sandbox/workspace/${f}.md 2>/dev/null) && [ "$p" = "444" ] && c=$((c+1)); done; echo "PROTECTED:$c"' || true)
+    # Verify prompt files are read-only (chmod 444, root-owned).
+    # BOOTSTRAP.md is intentionally excluded from the "must be present"
+    # count: OpenClaw's workspace setup (src/agents/workspace.ts,
+    # fs.rm(bootstrapPath) once workspaceHasBootstrapCompletionEvidence() is
+    # true) deletes it after the sandbox's first conversation completes —
+    # see prompts/BOOTSTRAP.md's own text ("This file is only shown during
+    # your first conversation. After setup completes, it will not appear
+    # again."). A missing BOOTSTRAP.md is expected/healthy once the sandbox
+    # has done real onboarding; only "present but not 444" would be a defect.
+    PERSISTENT_PROMPT_COUNT=$((${#PROMPT_NAMES[@]} - 1)) # excludes BOOTSTRAP
+    PROT_CHECK=$(sandbox_run 'c=0; for f in AGENTS SOUL TOOLS IDENTITY USER HEARTBEAT; do test -f /sandbox/workspace/${f}.md && p=$(stat -c %a /sandbox/workspace/${f}.md 2>/dev/null) && [ "$p" = "444" ] && c=$((c+1)); done; echo "PROTECTED:$c"' || true)
     PROTECTED=$(echo "$PROT_CHECK" | grep -oP 'PROTECTED:\K[0-9]+' | head -1 || echo "0")
-    if [[ "$PROTECTED" -ge ${#PROMPT_NAMES[@]} ]]; then
-      pass "All ${PROTECTED} prompt files are read-only (chmod 444)"
+    # sandbox_run's PTY echoes the command text before running it, so the
+    # literal string "BOOTSTRAP_PERM:%a" (unexpanded) always appears once
+    # from the echo. Only `stat`'s real numeric output can satisfy the
+    # \d+ capture below, so take the LAST match (the real result, printed
+    # after the echoed input line) rather than checking substring presence.
+    BOOTSTRAP_CHECK=$(sandbox_run 'if [ ! -f /sandbox/workspace/BOOTSTRAP.md ]; then echo "BOOTSTRAP_PERM:none"; else stat -c "BOOTSTRAP_PERM:%a" /sandbox/workspace/BOOTSTRAP.md 2>/dev/null || echo "BOOTSTRAP_PERM:err"; fi' || true)
+    BOOTSTRAP_PERM=$(echo "$BOOTSTRAP_CHECK" | grep -oE 'BOOTSTRAP_PERM:(none|err|[0-9]+)' | tail -1 | cut -d: -f2)
+    if [[ "$PROTECTED" -ge $PERSISTENT_PROMPT_COUNT ]]; then
+      if [[ "$BOOTSTRAP_PERM" != "none" && "$BOOTSTRAP_PERM" != "444" ]]; then
+        fail "BOOTSTRAP.md exists with insecure permissions: ${BOOTSTRAP_PERM}"
+      elif [[ "$BOOTSTRAP_PERM" == "444" ]]; then
+        pass "All ${PROTECTED} persistent prompt files are read-only (chmod 444); BOOTSTRAP.md present and protected"
+      else
+        pass "All ${PROTECTED} persistent prompt files are read-only (chmod 444); BOOTSTRAP.md absent (setup already completed)"
+      fi
     elif [[ "$PROTECTED" -gt 0 ]]; then
-      warn "Only ${PROTECTED}/${#PROMPT_NAMES[@]} prompt files are read-only"
+      warn "Only ${PROTECTED}/${PERSISTENT_PROMPT_COUNT} persistent prompt files are read-only"
     else
       fail "No prompt files found or none are read-only"
     fi
@@ -888,10 +991,11 @@ fi
 # =============================================================================
 # Layer 9: Control UI (Playwright)
 # =============================================================================
-# WHY: End-to-end verification that a real browser can log in via Keycloak
-#   and interact with the OpenClaw Control UI.
-# HOW TO FIX: Check oauth2-proxy logs, Keycloak client config, and
-#   the auth.setup.ts test file for URL patterns.
+# WHY: End-to-end verification that a real browser can log in via OCP's
+#   native OAuth server (no Keycloak) and interact with the OpenClaw
+#   Control UI.
+# HOW TO FIX: Check oauth-proxy logs, the SA's oauth-redirectreference
+#   annotation, and the auth.setup.ts test file for URL/selector patterns.
 step "Layer 9: Control UI Validation (Playwright)"
 
 if command -v openshell &>/dev/null; then
@@ -902,9 +1006,9 @@ fi
 
 TEST_DIR="${PROJECT_DIR}/tests"
 if command -v npx &>/dev/null && [[ -d "${TEST_DIR}/node_modules/@playwright" ]]; then
-  OAUTH2_ROUTE="openclaw-ui.${APPS_DOMAIN}"
-  OPENCLAW_BASE_URL="https://${OAUTH2_ROUTE}"
-  info "Using oauth2-proxy route for Playwright: ${OPENCLAW_BASE_URL}"
+  OAUTH_ROUTE="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
+  OPENCLAW_BASE_URL="https://${OAUTH_ROUTE}"
+  info "Using oauth-proxy route for Playwright: ${OPENCLAW_BASE_URL}"
 
   export OPENCLAW_BASE_URL
   if (cd "$TEST_DIR" && npx playwright test) 2>&1; then
@@ -916,6 +1020,15 @@ else
   warn "Playwright not installed, skipping UI tests"
   echo "    Install with: cd ${TEST_DIR} && npm install && npx playwright install chromium"
 fi
+
+# =============================================================================
+# Structured output (conditions JSON)
+# =============================================================================
+# Emitted before the "Verification Summary" step() call so that step doesn't
+# add an empty trailing layer to the JSON. Enables CI gates / dashboards to
+# consume per-layer status without parsing the plain-text output above.
+VERIFY_STATUS_FILE="${VERIFY_STATUS_FILE:-${PROJECT_DIR}/.verify-status.json}"
+emit_conditions_json "$VERIFY_STATUS_FILE"
 
 # =============================================================================
 # Summary

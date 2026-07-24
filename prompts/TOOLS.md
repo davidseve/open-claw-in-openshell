@@ -7,7 +7,7 @@ This file is for your specifics — the stuff that's unique to this deployment.
 - **Platform**: OpenShift Container Platform (OCP)
 - **Inference**: Red Hat MaaS (LiteLLM) → Claude Sonnet 4.6
 - **Observability**: MLflow + OTel Collector + Tempo
-- **Auth**: Keycloak OIDC via oauth2-proxy
+- **Auth**: OpenShift-native OAuth via oauth-proxy (browser UI, ADR-0016); Keycloak OIDC remains for the CLI/gRPC gateway path only
 
 ## Network Access (from sandbox)
 

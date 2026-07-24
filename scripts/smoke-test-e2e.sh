@@ -45,7 +45,7 @@ SEND_RESULT=$(sandbox_run 'curl -sf -X POST http://127.0.0.1:18789/v1/chat/compl
   -H "Content-Type: application/json" \
   -H "X-Forwarded-Email: smoke-test@test.local" \
   -H "X-Forwarded-Proto: https" \
-  -H "X-Forwarded-Host: openclaw-ui.'"${APPS_DOMAIN}"'" \
+  -H "X-Forwarded-Host: openclaw-gw--openclaw-ui.'"${APPS_DOMAIN}"'" \
   -d '"'"'{"model":"maas/claude-sonnet-4-6","messages":[{"role":"user","content":"Respond with exactly one word: OK"}],"stream":false,"max_tokens":10}'"'"' 2>&1 || echo SEND_FAILED' || true)
 
 if echo "$SEND_RESULT" | grep -qi "SEND_FAILED\|error\|Not Found"; then

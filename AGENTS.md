@@ -9,7 +9,7 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 - **Sandbox isolation**: all agent workloads run inside OpenShell sandboxes with nftables, Landlock LSM, and network namespace enforcement.
 - **Credential injection without filesystem exposure**: API keys are injected as environment variables by the OpenShell provider system. Child processes see opaque placeholders; real secrets are resolved by the proxy at request time. Credentials never touch the sandbox filesystem.
 - **Default-deny networking**: all outbound traffic from sandboxes is blocked unless explicitly allowed by a network policy with L7 inspection.
-- **OIDC authentication**: browser access to the Control UI goes through oauth2-proxy → Keycloak OIDC. The OpenClaw gateway uses `auth.mode: trusted-proxy` — no static tokens (ADR-0012).
+- **OIDC authentication**: browser access to the Control UI goes through oauth-proxy → OpenShift's native OAuth server (ADR-0016; no Keycloak in this path). Keycloak remains the OIDC issuer for the separate CLI/gRPC gateway auth path only. The OpenClaw gateway uses `auth.mode: trusted-proxy` — no static tokens (ADR-0012).
 - **Supply chain awareness**: all images, charts, and operators are version-pinned. No `latest` tags in production configurations.
 
 ### Security Guidelines (all roles)
@@ -21,7 +21,7 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 - Use `installPlanApproval: Manual` for OLM operators to prevent unreviewed upgrades.
 - Rotate credentials periodically. Document rotation procedures.
 - Review deny logs from the sandbox proxy (`openshell logs`) for unauthorized access attempts.
-- Never use `gateway.auth.mode: "none"` or `"token"` in sandbox environments. Use `trusted-proxy` with oauth2-proxy OIDC (ADR-0012).
+- Never use `gateway.auth.mode: "none"` or `"token"` in sandbox environments. Use `trusted-proxy` with oauth-proxy (ADR-0012, ADR-0016).
 - Use `__APPS_DOMAIN__` template placeholders in all manifests and configs. Never hardcode cluster-specific domains.
 
 ---

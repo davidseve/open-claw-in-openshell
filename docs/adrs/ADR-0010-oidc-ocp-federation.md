@@ -1,7 +1,15 @@
 # ADR-0010: OIDC via Keycloak with OCP Identity Federation
 
 ## Status
-Accepted
+Accepted. **Scope narrowed by [ADR-0016](ADR-0016-openshift-native-oauth-spike.md)
+(2026-07-23): this ADR's decision now applies only to the CLI/gRPC gateway
+auth path.** The browser UI path described here (and in
+[ADR-0011](ADR-0011-oauth2-proxy-ui-auth.md)) was migrated off Keycloak
+entirely to OpenShift-native OAuth. The "Why not direct OCP OAuth?"
+incompatibility table below is still the accurate, current reason Keycloak
+remains required for CLI/gRPC — ADR-0016's "Decision record" section
+restates and confirms it against the OpenShell gateway source directly, and
+is the canonical place to check before re-litigating Keycloak's removal.
 
 ## Context
 Phase 5 established mTLS client certificates as the authentication mechanism for the OpenShell gateway. This requires users to import a PKCS12 bundle into their browser or use `openshell forward service` for local access. Phase 6 confirmed that browser access via the external service Route still requires the client cert.
@@ -41,6 +49,10 @@ CLI/Browser → Keycloak → "Login with OpenShift" → OCP OAuth
                 ↓
 CLI/Browser → OpenShell Gateway (validates JWT via JWKS)
 ```
+
+> As of ADR-0016, "Browser" above applies only to the CLI/gRPC path's
+> historical context; the live browser UI flow no longer goes through
+> Keycloak (see ADR-0016's rollout). This diagram remains accurate for CLI.
 
 ### Key configuration
 

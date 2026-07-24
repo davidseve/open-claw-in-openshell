@@ -3,7 +3,7 @@
     "providers": {
       "maas": {
         "baseUrl": "https://maas-rhdp.apps.maas.redhatworkshops.io/v1",
-        "apiKey": "openshell:resolve:env:LITELLM_API_KEY",
+        "apiKey": "__MAAS_API_KEY__",
         "api": "openai-completions",
         "models": [
           {
@@ -29,6 +29,23 @@
     "deny": ["gateway", "cron", "openclaw"],
     "fs": { "workspaceOnly": true }
   },
+  "plugins": {
+    "entries": {
+      "diagnostics-otel": {
+        "enabled": false
+      },
+      "mlflow-openclaw": {
+        "enabled": true,
+        "config": {
+          "trackingUri": "http://mlflow.observability.svc:5000",
+          "experimentId": "0"
+        },
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  },
   "diagnostics": {
     "enabled": true,
     "otel": {
@@ -38,22 +55,9 @@
       "serviceName": "openclaw-agent",
       "traces": false,
       "metrics": true,
-      "logs": true,
-      "sampleRate": 1.0
-    }
-  },
-  "plugins": {
-    "entries": {
-      "diagnostics-otel": {
-        "enabled": true
-      },
-      "mlflow-openclaw": {
-        "enabled": true,
-        "config": {
-          "trackingUri": "http://mlflow.observability.svc:5000",
-          "experimentId": "0"
-        }
-      }
+      "logs": false,
+      "sampleRate": 1.0,
+      "captureContent": true
     }
   },
   "gateway": {
@@ -64,13 +68,13 @@
       "mode": "trusted-proxy",
       "trustedProxy": {
         "userHeader": "x-forwarded-email",
-        "requiredHeaders": ["x-forwarded-proto", "x-forwarded-host"]
+        "requiredHeaders": ["x-forwarded-proto", "x-forwarded-host"],
+        "allowLoopback": true
       }
     },
     "trustedProxies": ["127.0.0.1", "::1", "10.217.0.0/22", "10.217.4.0/23", "192.168.0.0/16"],
     "controlUi": {
       "allowedOrigins": [
-        "https://openclaw-ui.apps-crc.testing",
         "https://openclaw-gw--openclaw-ui.apps-crc.testing"
       ],
       "dangerouslyDisableDeviceAuth": true

@@ -3,7 +3,7 @@
     "providers": {
       "maas": {
         "baseUrl": "https://maas-rhdp.apps.maas.redhatworkshops.io/v1",
-        "apiKey": "openshell:resolve:env:LITELLM_API_KEY",
+        "apiKey": "__MAAS_API_KEY__",
         "api": "openai-completions",
         "models": [
           {
@@ -75,7 +75,6 @@
     "trustedProxies": ["127.0.0.1", "::1", "10.217.0.0/22", "10.217.4.0/23", "192.168.0.0/16"],
     "controlUi": {
       "allowedOrigins": [
-        "https://openclaw-ui.__APPS_DOMAIN__",
         "https://openclaw-gw--openclaw-ui.__APPS_DOMAIN__"
       ],
       "dangerouslyDisableDeviceAuth": true

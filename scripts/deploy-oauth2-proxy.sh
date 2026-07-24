@@ -1,136 +1,72 @@
 #!/usr/bin/env bash
-# Phase 7b: Deploy oauth2-proxy for OpenClaw UI OIDC authentication.
+# Phase 7b / 13.1: Deploy oauth-proxy (OpenShift-native OAuth) for the
+# OpenClaw Control UI. Browsers authenticate directly against OCP's own
+# OAuth server via a ServiceAccount-based OAuth client -- no Keycloak
+# broker, no cluster-scoped OAuthClient. See ADR-0016.
+#
+# Keycloak itself is NOT removed by this script: it remains the OIDC issuer
+# for the separate CLI/gRPC gateway auth path (scripts/configure-oidc.sh),
+# which depends on Keycloak's realm_access.roles JWT claim shape
+# (charts/openshell/values-ocp.yaml.tpl server.oidc.rolesClaim) that OCP's
+# native OAuth server does not produce. Only the browser UI path moves off
+# Keycloak here.
 #
 # Prerequisites:
-#   - Keycloak deployed (scripts/deploy-keycloak.sh)
-#   - OpenShell deployed with OIDC (scripts/configure-oidc.sh)
+#   - OpenShell deployed (scripts/crc-lifecycle.sh / deploy-openshell.sh)
 #   - OpenClaw sandbox running (scripts/launch-openclaw.sh)
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
 check_prereqs
 detect_environment
-KC_NAMESPACE="openshell-keycloak"
-KC_ROUTE_HOST="keycloak-${KC_NAMESPACE}.${APPS_DOMAIN}"
-KC_ISSUER="https://${KC_ROUTE_HOST}/realms/openshell"
-OAUTH2_PROXY_ROUTE_HOST="openclaw-ui.${APPS_DOMAIN}"
+render_all_templates
 
-# ── Step 1: Generate secrets ──────────────────────────────────────────────────
+# Public hostname must equal OpenShell's {sandbox}--{service} service-routing
+# pattern -- see route.yaml.tpl and deployment.yaml.tpl for why (WebSocket
+# Host-header bug in this oauth-proxy fork, ADR-0016).
+OAUTH_PROXY_ROUTE_HOST="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
 
-step "Generating oauth2-proxy secrets"
-
-COOKIE_SECRET=$(openssl rand -base64 32 | tr -d '\n' | head -c 32)
-CLIENT_SECRET=$(openssl rand -hex 32)
-
-info "Cookie secret generated (32 bytes)"
-info "Client secret generated for openclaw-ui Keycloak client"
-
-# ── Step 2: Register client in Keycloak via Admin API ─────────────────────────
-
-step "Registering openclaw-ui client in Keycloak"
-
-KC_ADMIN_TOKEN=$(curl -sk -X POST \
-  "https://${KC_ROUTE_HOST}/realms/master/protocol/openid-connect/token" \
-  -d "grant_type=password" \
-  -d "client_id=admin-cli" \
-  -d "username=admin" \
-  -d "password=admin" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
-
-if [[ -z "$KC_ADMIN_TOKEN" ]]; then
-  fail "Could not obtain Keycloak admin token"
+# The Route above now owns this hostname, so oauth-proxy's own --upstream
+# (which targets the same hostname, to reach the `openshell` Service) can no
+# longer resolve it through the Route without looping back into itself.
+# Resolve the `openshell` Service's ClusterIP and bake it into a hostAlias
+# in the rendered Deployment so --upstream dials the Service directly.
+step "Resolving openshell Service ClusterIP for oauth-proxy hostAlias"
+OPENSHELL_GW_CLUSTER_IP=$(oc -n "$NAMESPACE" get svc openshell -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+if [[ -z "$OPENSHELL_GW_CLUSTER_IP" ]]; then
+  error "Could not resolve ClusterIP for Service 'openshell' in namespace $NAMESPACE"
   exit 1
 fi
-info "Keycloak admin token obtained"
+info "openshell Service ClusterIP: ${OPENSHELL_GW_CLUSTER_IP}"
+sed -i "s/__OPENSHELL_GW_CLUSTER_IP__/${OPENSHELL_GW_CLUSTER_IP}/g" \
+  "${RENDERED_DIR}/oauth2-proxy/deployment.yaml"
 
-CLIENT_EXISTS=$(curl -sk -o /dev/null -w '%{http_code}' \
-  -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" \
-  "https://${KC_ROUTE_HOST}/admin/realms/openshell/clients?clientId=openclaw-ui")
+# ── Step 1: Session secret ────────────────────────────────────────────────────
 
-if [[ "$CLIENT_EXISTS" == "200" ]]; then
-  EXISTING=$(curl -sk \
-    -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" \
-    "https://${KC_ROUTE_HOST}/admin/realms/openshell/clients?clientId=openclaw-ui")
-  if echo "$EXISTING" | grep -q '"openclaw-ui"'; then
-    info "Client openclaw-ui already exists, updating secret"
-    CLIENT_UUID=$(echo "$EXISTING" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-    curl -sk -X PUT \
-      -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" \
-      -H "Content-Type: application/json" \
-      "https://${KC_ROUTE_HOST}/admin/realms/openshell/clients/${CLIENT_UUID}" \
-      -d "{
-        \"clientId\": \"openclaw-ui\",
-        \"name\": \"OpenClaw UI (oauth2-proxy)\",
-        \"enabled\": true,
-        \"publicClient\": false,
-        \"standardFlowEnabled\": true,
-        \"directAccessGrantsEnabled\": true,
-        \"protocol\": \"openid-connect\",
-        \"secret\": \"${CLIENT_SECRET}\",
-        \"redirectUris\": [\"https://${OAUTH2_PROXY_ROUTE_HOST}/oauth2/callback\"],
-        \"webOrigins\": [\"https://${OAUTH2_PROXY_ROUTE_HOST}\"],
-        \"defaultClientScopes\": [\"openid\", \"profile\", \"email\", \"roles\"],
-        \"attributes\": {\"pkce.code.challenge.method\": \"S256\"}
-      }" >/dev/null
-    pass "Client openclaw-ui updated"
-  else
-    info "Creating new client openclaw-ui"
-    curl -sk -X POST \
-      -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" \
-      -H "Content-Type: application/json" \
-      "https://${KC_ROUTE_HOST}/admin/realms/openshell/clients" \
-      -d "{
-        \"clientId\": \"openclaw-ui\",
-        \"name\": \"OpenClaw UI (oauth2-proxy)\",
-        \"enabled\": true,
-        \"publicClient\": false,
-        \"standardFlowEnabled\": true,
-        \"directAccessGrantsEnabled\": true,
-        \"protocol\": \"openid-connect\",
-        \"secret\": \"${CLIENT_SECRET}\",
-        \"redirectUris\": [\"https://${OAUTH2_PROXY_ROUTE_HOST}/oauth2/callback\"],
-        \"webOrigins\": [\"https://${OAUTH2_PROXY_ROUTE_HOST}\"],
-        \"defaultClientScopes\": [\"openid\", \"profile\", \"email\", \"roles\"],
-        \"attributes\": {\"pkce.code.challenge.method\": \"S256\"},
-        \"protocolMappers\": [{
-          \"name\": \"audience-mapper\",
-          \"protocol\": \"openid-connect\",
-          \"protocolMapper\": \"oidc-audience-mapper\",
-          \"config\": {
-            \"included.client.audience\": \"openclaw-ui\",
-            \"id.token.claim\": \"true\",
-            \"access.token.claim\": \"true\"
-          }
-        }]
-      }" >/dev/null
-    pass "Client openclaw-ui created"
-  fi
+step "Generating oauth-proxy session secret"
+
+if oc -n "$NAMESPACE" get secret oauth-proxy-session-secret &>/dev/null; then
+  info "Secret oauth-proxy-session-secret already exists, leaving it in place"
+else
+  oc -n "$NAMESPACE" create secret generic oauth-proxy-session-secret \
+    --from-literal=session_secret="$(openssl rand -base64 32 | tr -d '\n' | head -c 32)"
+  info "Secret oauth-proxy-session-secret created"
 fi
 
-# ── Step 3: Create Kubernetes secret ─────────────────────────────────────────
+# ── Step 2: Apply manifests (SA, Service, Deployment, Route) ──────────────────
 
-step "Creating oauth2-proxy Kubernetes secret"
+step "Deploying oauth-proxy (OpenShift-native OAuth)"
 
-oc -n "$NAMESPACE" create secret generic oauth2-proxy-secrets \
-  --from-literal=client-secret="${CLIENT_SECRET}" \
-  --from-literal=cookie-secret="${COOKIE_SECRET}" \
-  --dry-run=client -o yaml | oc apply -f -
+oc apply -f "${PROJECT_DIR}/manifests/oauth2-proxy/serviceaccount.yaml"
+oc apply -f "${PROJECT_DIR}/manifests/oauth2-proxy/service.yaml"
+oc apply -f "${RENDERED_DIR}/oauth2-proxy/deployment.yaml"
+oc apply -f "${RENDERED_DIR}/oauth2-proxy/route.yaml"
 
-info "Secret oauth2-proxy-secrets created/updated"
+step "Waiting for oauth-proxy to be ready"
+oc -n "$NAMESPACE" rollout status deployment/oauth-proxy --timeout=120s
+pass "oauth-proxy deployment ready"
 
-# ── Step 4: Apply oauth2-proxy manifests ──────────────────────────────────────
-
-step "Deploying oauth2-proxy"
-
-for manifest in configmap deployment service route; do
-  sed "s|apps.ocp.sandbox315.opentlc.com|${APPS_DOMAIN}|g" \
-    "${PROJECT_DIR}/manifests/oauth2-proxy/${manifest}.yaml" | oc apply -f -
-done
-
-step "Waiting for oauth2-proxy to be ready"
-oc -n "$NAMESPACE" rollout status deployment/oauth2-proxy --timeout=120s
-pass "oauth2-proxy deployment ready"
-
-# ── Step 5: Update OpenClaw config in sandbox ─────────────────────────────────
+# ── Step 3: Update OpenClaw config in sandbox ─────────────────────────────────
 
 step "Updating OpenClaw config to trusted-proxy mode"
 
@@ -138,7 +74,6 @@ SANDBOX_POD=$(oc -n "$NAMESPACE" get pods -l sandbox.agents.x-k8s.io/name="${SAN
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
 if [[ -n "$SANDBOX_POD" ]]; then
-  render_all_templates
   OPENCLAW_CONFIG=$(cat "${RENDERED_DIR}/openclaw.json")
 
   echo "$OPENCLAW_CONFIG" | oc -n "$NAMESPACE" exec -i "$SANDBOX_POD" -c agent -- \
@@ -156,50 +91,29 @@ else
   info "Config file updated at config/openclaw.json for future deployments."
 fi
 
-# ── Step 6: Verify ────────────────────────────────────────────────────────────
+# ── Step 4: Verify ────────────────────────────────────────────────────────────
 
-step "Verifying oauth2-proxy OIDC flow"
+step "Verifying oauth-proxy OAuth flow"
 
 sleep 3
 HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
-  "https://${OAUTH2_PROXY_ROUTE_HOST}/" 2>/dev/null || echo "000")
+  "https://${OAUTH_PROXY_ROUTE_HOST}/" 2>/dev/null || echo "000")
 
 if [[ "$HTTP_CODE" == "302" || "$HTTP_CODE" == "303" ]]; then
-  pass "oauth2-proxy redirects to Keycloak (HTTP ${HTTP_CODE})"
+  pass "oauth-proxy redirects to OCP OAuth server (HTTP ${HTTP_CODE})"
 else
   warn "Expected 302/303 redirect, got HTTP ${HTTP_CODE}"
 fi
 
-# Test token acquisition and authenticated access
-TOKEN_RESPONSE=$(curl -sk -X POST \
-  "https://${KC_ROUTE_HOST}/realms/openshell/protocol/openid-connect/token" \
-  -d "grant_type=password" \
-  -d "client_id=openclaw-ui" \
-  -d "client_secret=${CLIENT_SECRET}" \
-  -d "username=admin" \
-  -d "password=admin" \
-  -d "scope=openid email profile" 2>/dev/null || echo "")
-
-if echo "$TOKEN_RESPONSE" | grep -q "access_token"; then
-  pass "Token acquisition via password grant (admin user)"
-else
-  warn "Could not obtain token via password grant"
-fi
-
 # ── Summary ───────────────────────────────────────────────────────────────────
 
-step "Phase 7b deployment complete"
+step "Phase 7b/13.1 deployment complete"
 echo ""
-info "OpenClaw UI (OIDC protected): https://${OAUTH2_PROXY_ROUTE_HOST}"
-info "Login with Keycloak credentials (admin/admin or user/user)"
-info "Or use OCP credentials via Keycloak identity broker"
+info "OpenClaw UI (OpenShift-native OAuth): https://${OAUTH_PROXY_ROUTE_HOST}"
+info "Login with any OCP cluster identity (HTPasswd/LDAP/OIDC-federated IdP)"
 echo ""
-info "Old direct-access route still available (for debugging):"
-info "  https://openclaw-gw--openclaw-ui.${APPS_DOMAIN}/#token=<TOKEN>"
+info "There is no unauthenticated direct-access route anymore -- oauth-proxy"
+info "is the only Kubernetes-level entry point onto this service (ADR-0016)."
 echo ""
-info "To fully remove static token access, delete the old route:"
-info "  oc -n $NAMESPACE delete route openclaw-ui"
-
-# Save client secret for reference
-echo "$CLIENT_SECRET" > "${PROJECT_DIR}/secrets/.oauth2-proxy-client-secret"
-chmod 600 "${PROJECT_DIR}/secrets/.oauth2-proxy-client-secret"
+info "Keycloak remains deployed for the CLI/gRPC OIDC path (scripts/configure-oidc.sh)."
+info "See ADR-0016 for why full Keycloak retirement is a separate follow-up."

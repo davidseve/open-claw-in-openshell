@@ -44,7 +44,6 @@ done
 
 step "Applying OpenShift Routes (passthrough TLS)"
 oc apply -f "${PROJECT_DIR}/manifests/openshell-route.yaml"
-oc apply -f "${RENDERED_DIR}/openclaw-service-route.yaml"
 
 step "Detecting gateway Route hostname"
 GW_ROUTE=""

@@ -16,12 +16,13 @@
 #
 #   2. NETWORKING: The sandbox proxy uses nftables (L4) + L7 binary inspection.
 #      - L7 checks /proc/<pid>/exe to identify which binary made the connection.
-#      - Policy allows specific binaries: /usr/bin/node, /usr/bin/curl.
-#      - `n` (Node version manager) installs to /usr/local/bin/node.
-#        The proxy sees the REAL binary path from /proc/<pid>/exe.
-#        If /usr/local/bin/node exists, Node.js traffic is DENIED.
-#      => After upgrading Node.js via `n`, ALWAYS:
-#         cp /usr/local/bin/node /usr/bin/node && rm -f /usr/local/bin/node
+#      - `n` (Node version manager) installs to /usr/local/bin/node, which
+#        differs from the stock image's /usr/bin/node.
+#      - policies/openclaw-sandbox.yaml explicitly allows BOTH
+#        /usr/bin/node and /usr/local/bin/node in every network policy's
+#        `binaries` list, so no post-upgrade binary relocation is needed.
+#      => Nothing to do here — just keep both paths in the policy's
+#         `binaries` list whenever the base image or Node install path changes.
 #
 #   3. CREDENTIAL INJECTION: The proxy resolves openshell:resolve:env:KEY
 #      placeholders by inspecting HTTP traffic. However, Node.js fetch()
@@ -29,7 +30,9 @@
 #      map to a process binary via /proc/net/tcp. This causes DENIED with
 #      "failed to resolve peer binary".
 #      => Do NOT rely on proxy credential injection for Node.js fetch().
-#      => Inject the real API key directly into openclaw.json.
+#      => Bake the real API key into openclaw.json at template-render time
+#         instead (see render_openclaw_config() in common.sh, which resolves
+#         the __MAAS_API_KEY__ placeholder from openclaw.json.tpl).
 #      => Do NOT set HTTP_PROXY or HTTPS_PROXY — this forces fetch() to use
 #         HTTP CONNECT tunneling, which the proxy rejects with 403.
 #      => Do NOT set NODE_OPTIONS="--require http-proxy-bootstrap.js" — same
@@ -118,9 +121,10 @@ fi
 # ─── Step 2: Upgrade Node.js and OpenClaw ────────────────────────────────────
 # The stock sandbox image ships an older Node.js and OpenClaw.
 # OpenClaw 2026.7.1 requires Node.js >= 22.22.3.
-# CRITICAL: After `n` upgrades Node.js, the binary is at /usr/local/bin/node.
-# The sandbox proxy L7 policy only allows /usr/bin/node.
-# We MUST copy the binary and remove the /usr/local path. (See constraint #2)
+# `n` installs the upgraded Node.js at /usr/local/bin/node. No binary
+# relocation is needed: policies/openclaw-sandbox.yaml already allows both
+# /usr/bin/node and /usr/local/bin/node in every network policy. (See
+# constraint #2)
 step "Upgrading Node.js and OpenClaw to 2026.7.1"
 CURRENT_VERSION=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- \
   openclaw --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "unknown")
@@ -130,56 +134,27 @@ else
   info "Current version: $CURRENT_VERSION — upgrading..."
   oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
     npm install -g n 2>/dev/null && n 22.22.3 2>/dev/null
-    cp /usr/local/bin/node /usr/bin/node 2>/dev/null || true
-    rm -f /usr/local/bin/node 2>/dev/null || true
     npm install -g openclaw@2026.7.1 2>/dev/null
     echo "NODE=$(node --version) OPENCLAW=$(openclaw --version 2>&1 | grep -oP "\d+\.\d+\.\d+")"
   ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 fi
 
-# Ensure /usr/local/bin/node does not exist even if OpenClaw was already current.
-# A previous failed run might have left it behind. (See constraint #2)
-oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
-  if [ -f /usr/local/bin/node ]; then
-    cp /usr/local/bin/node /usr/bin/node
-    rm -f /usr/local/bin/node
-    echo "FIXED: removed /usr/local/bin/node"
-  fi
-' 2>&1 | while IFS= read -r line; do info "  $line"; done
-
 # ─── Step 3: Copy config to writable workspace ──────────────────────────────
 # /sandbox/ is read-only (Landlock). OpenClaw needs to write state, logs, and
 # locks. We set HOME=/sandbox/workspace so .openclaw/ is writable. (See constraint #1)
+#
+# The real MaaS API key is already baked into ${RENDERED_DIR}/openclaw.json by
+# render_openclaw_config() (see common.sh), which resolves the __MAAS_API_KEY__
+# placeholder from config/openclaw.json.tpl at render time. No separate
+# post-copy injection step is needed. (See constraint #3 — the sandbox proxy's
+# openshell:resolve:env:KEY injection is not used here because Node.js
+# fetch()/undici connections are too ephemeral for the proxy to map to a
+# process binary.)
 step "Copying config to writable workspace"
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/state
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/agents
 oc -n "$NAMESPACE" cp "${RENDERED_DIR}/openclaw.json" \
   "${SANDBOX_NAME}:/sandbox/workspace/.openclaw/openclaw.json" -c agent 2>/dev/null || true
-
-# ─── Step 4: Inject real API key ─────────────────────────────────────────────
-# The config template uses openshell:resolve:env:LITELLM_API_KEY as placeholder.
-# The sandbox proxy SHOULD resolve this, but Node.js fetch() (undici) creates
-# connections too ephemeral for the proxy to map to /proc/<pid>/exe.
-# Result: DENIED with "failed to resolve peer binary".
-# FIX: Inject the real key directly. (See constraint #3)
-step "Injecting MaaS API key into config"
-load_secrets
-if [[ -n "${MAAS_API_KEY:-}" ]]; then
-  # Inject via stdin to avoid exposing the key in /proc/<pid>/cmdline
-  echo "${MAAS_API_KEY}" | oc -n "$NAMESPACE" exec -i "$SANDBOX_NAME" -c agent -- python3 -c '
-import json, sys
-key = sys.stdin.readline().strip()
-CFG = "/sandbox/workspace/.openclaw/openclaw.json"
-with open(CFG, "r") as f:
-    d = json.load(f)
-d["models"]["providers"]["maas"]["apiKey"] = key
-with open(CFG, "w") as f:
-    json.dump(d, f, indent=2)
-print("API key injected")
-' 2>&1 | while IFS= read -r line; do info "  $line"; done
-else
-  warn "MAAS_API_KEY not found in secrets.env — LLM requests will fail"
-fi
 
 # Fix ownership so sandbox user can read the config
 SANDBOX_UID=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- id -u sandbox 2>/dev/null || echo "1000")
@@ -187,7 +162,7 @@ SANDBOX_GID=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- id -g sandbox 
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- chown -R "${SANDBOX_UID}:${SANDBOX_GID}" /sandbox/workspace
 info "Config at /sandbox/workspace/.openclaw/openclaw.json"
 
-# ─── Step 5: Fetch system prompts from MLflow ────────────────────────────────
+# ─── Step 4: Fetch system prompts from MLflow ────────────────────────────────
 # Prompts are versioned in MLflow Prompt Registry. fetch-prompts-from-mlflow.sh
 # downloads them with @production alias, writes .prompt-versions.json manifest,
 # and the files are then locked (root-owned, chmod 444) so the agent can't modify them.
@@ -213,7 +188,7 @@ else
   warn "No prompts fetched from MLflow — OpenClaw will use default templates"
 fi
 
-# ─── Step 6: Install prompt trace linker sidecar ─────────────────────────────
+# ─── Step 5: Install prompt trace linker sidecar ─────────────────────────────
 # The linker polls MLflow for unlinked traces and adds mlflow.linkedPrompts
 # tags (populates the "Prompt" column in MLflow UI). Uses /usr/bin/curl
 # for HTTP because Node.js fetch() is blocked by the proxy for the same
@@ -222,7 +197,7 @@ step "Installing prompt trace linker sidecar"
 oc -n "$NAMESPACE" cp "${PROJECT_DIR}/scripts/prompt-trace-linker.js" \
   "${SANDBOX_NAME}:/tmp/prompt-trace-linker.js" -c agent 2>/dev/null || true
 
-# ─── Step 7: Install mlflow-openclaw plugin ──────────────────────────────────
+# ─── Step 6: Install mlflow-openclaw plugin ──────────────────────────────────
 # This plugin hooks into OpenClaw's agent lifecycle events and creates MLflow
 # traces. It requires specific directory structure and patching. (See constraints #4, #5)
 #
@@ -260,7 +235,7 @@ with open('package.json','w') as f: json.dump(d,f,indent=2)
   " 2>&1 | while IFS= read -r line; do info "  $line"; done
 fi
 
-# ─── Step 8: Patch plugin for OpenClaw 2026.7.1 compatibility ────────────────
+# ─── Step 7: Patch plugin for OpenClaw 2026.7.1 compatibility ────────────────
 # @mlflow/mlflow-openclaw@0.2.0-rc.0 was built for a newer OpenClaw SDK.
 # Two incompatibilities must be patched (see constraint #5):
 #   1. service.ts imports diagnostics-otel → replaced with no-op
@@ -321,25 +296,37 @@ oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- \
   chown -R root:root /sandbox/workspace/.openclaw/extensions/mlflow-openclaw 2>/dev/null || true
 info "Plugin installed and patched (root-owned)"
 
-# ─── Step 9: Initialize OpenClaw baseline ────────────────────────────────────
-# Creates initial workspace structure. --accept-risk suppresses the interactive
-# security prompt. This is safe because we overwrite the config anyway.
+# ─── Step 8: Initialize OpenClaw baseline ────────────────────────────────────
+# Validates the existing openclaw.json (from Step 3) and creates the
+# workspace/session directory structure ($HOME/.openclaw/agents/main/sessions).
+# --accept-risk suppresses the interactive security prompt.
+# Empirically verified (md5sum + mtime unchanged across a live run): this
+# command does NOT rewrite openclaw.json — it only reports "Config OK" and
+# provisions directories. Order relative to Step 3's config copy therefore
+# does not matter for the config's contents.
 step "Initializing OpenClaw baseline config"
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
   HOME=/sandbox/workspace openclaw setup --baseline --non-interactive --accept-risk 2>/dev/null || true
 ' 2>&1 | tail -3 | while IFS= read -r line; do info "  $line"; done
 
-# ─── Step 10: Start gateway and trace linker ─────────────────────────────────
+# ─── Step 9: Start gateway and trace linker ──────────────────────────────────
 # CRITICAL CONSTRAINTS:
 #
 # A. NETWORK NAMESPACE (constraint #11): The gateway MUST be started from within
-#    the sandbox network namespace (via `openshell sandbox connect`), NOT from the
-#    container root namespace (via `oc exec`). The OpenShell supervisor relay
-#    connects to ports in the sandbox namespace. If the gateway binds to 127.0.0.1
-#    in the container root namespace, the relay gets "Connection refused" and the
-#    web UI shows "Service endpoint is not reachable".
+#    the sandbox network namespace, NOT from the container root namespace (via
+#    `oc exec`). The OpenShell supervisor relay connects to ports in the sandbox
+#    namespace. If the gateway binds to 127.0.0.1 in the container root
+#    namespace, the relay gets "Connection refused" and the web UI shows
+#    "Service endpoint is not reachable".
 #    - Use `oc exec` ONLY for cleanup (kill, chown) — runs as root in container ns
-#    - Use `openshell sandbox connect` for starting processes — runs in sandbox ns
+#    - Use `openshell sandbox exec --no-tty` for starting processes — runs in
+#      the sandbox namespace via the gRPC exec endpoint, same as `sandbox
+#      connect` but without a PTY (no ANSI escape codes to filter) and with
+#      native `--env KEY=VALUE` support instead of inline shell env prefixes.
+#      Validated live: a `nohup ... & disown`'d process started this way is
+#      reparented to pid 1 and stays up (and reachable on the sandbox's
+#      loopback) after the exec channel closes — same detachment behavior as
+#      `sandbox connect` previously relied on.
 #    - Fix file ownership BEFORE starting so sandbox user can write logs
 #
 # B. ENVIRONMENT (constraint #3): Do NOT set any of these:
@@ -356,7 +343,7 @@ oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
 
 step "Starting OpenClaw gateway and trace linker"
 
-# Step 10a: Cleanup (oc exec = root, container namespace)
+# Step 9a: Cleanup (oc exec = root, container namespace)
 # Fix ownership of ALL files the gateway needs to write. Previous steps
 # (plugin install, prompt seed, config injection) run as root and leave
 # files owned by root. The gateway runs as sandbox user.
@@ -373,26 +360,34 @@ chown sandbox:sandbox /sandbox/workspace/openclaw.log /sandbox/workspace/linker.
 echo "CLEANUP_DONE"
 ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 
-# Step 10b: Start gateway (openshell sandbox connect = sandbox namespace)
-printf 'HOME=/sandbox/workspace MLFLOW_TRACKING_URI=http://mlflow.observability.svc:5000 OTEL_TRACES_EXPORTER=none OTEL_LOGS_EXPORTER=none OTEL_METRICS_EXPORTER=none nohup openclaw gateway run > /sandbox/workspace/openclaw.log 2>&1 &
-echo "GW_PID=$!"
-sleep 12
-grep -E "ready|mlflow|error|fail" /sandbox/workspace/openclaw.log | tail -5
-exit
-' | timeout 25 openshell sandbox connect "$SANDBOX_NAME" 2>&1 \
-  | grep -v '^\[?2004' | grep -v '^$' \
-  | while IFS= read -r line; do info "  $line"; done
+# Step 9b: Start gateway (openshell sandbox exec --no-tty = sandbox namespace)
+openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 25 \
+  --env HOME=/sandbox/workspace \
+  --env MLFLOW_TRACKING_URI=http://mlflow.observability.svc:5000 \
+  --env OTEL_TRACES_EXPORTER=none \
+  --env OTEL_LOGS_EXPORTER=none \
+  --env OTEL_METRICS_EXPORTER=none \
+  -- bash -c '
+    nohup openclaw gateway run > /sandbox/workspace/openclaw.log 2>&1 &
+    disown
+    echo "GW_PID=$!"
+    sleep 12
+    grep -E "ready|mlflow|error|fail" /sandbox/workspace/openclaw.log | tail -5
+  ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 
-# Step 10c: Start trace linker (openshell sandbox connect = sandbox namespace)
-printf 'MLFLOW_EXPERIMENT_ID='"${MLFLOW_EXP_ID}"' MLFLOW_URL=http://mlflow.observability.svc:5000 OPENCLAW_WORKSPACE_DIR=/sandbox/workspace nohup node /tmp/prompt-trace-linker.js > /sandbox/workspace/linker.log 2>&1 &
-sleep 3
-tail -3 /sandbox/workspace/linker.log
-exit
-' | timeout 15 openshell sandbox connect "$SANDBOX_NAME" 2>&1 \
-  | grep -v '^\[?2004' | grep -v '^$' \
-  | while IFS= read -r line; do info "  $line"; done
+# Step 9c: Start trace linker (openshell sandbox exec --no-tty = sandbox namespace)
+openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 15 \
+  --env MLFLOW_EXPERIMENT_ID="${MLFLOW_EXP_ID}" \
+  --env MLFLOW_URL=http://mlflow.observability.svc:5000 \
+  --env OPENCLAW_WORKSPACE_DIR=/sandbox/workspace \
+  -- bash -c '
+    nohup node /tmp/prompt-trace-linker.js > /sandbox/workspace/linker.log 2>&1 &
+    disown
+    sleep 3
+    tail -3 /sandbox/workspace/linker.log
+  ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 
-# ─── Step 11: Verify gateway startup ────────────────────────────────────────
+# ─── Step 10: Verify gateway startup ────────────────────────────────────────
 step "Verifying gateway startup"
 GW_UP=false
 for attempt in 1 2 3 4 5; do
@@ -419,21 +414,24 @@ else
   warn "mlflow-openclaw plugin may not have loaded — check gateway log"
 fi
 
-# ─── Step 12: Expose Control UI ─────────────────────────────────────────────
+# ─── Step 11: Expose Control UI ─────────────────────────────────────────────
+# Registers the "openclaw-ui" service name -> sandbox port 18789 mapping in
+# OpenShell's own gRPC-based service routing table. This is independent of
+# any Kubernetes Route: it's what lets the gateway resolve the
+# `openclaw-gw--openclaw-ui` Host-header pattern at all. oauth-proxy is the
+# only Kubernetes-level external entry point onto this service (see
+# scripts/deploy-oauth2-proxy.sh) -- there is no separate unauthenticated
+# Route anymore (ADR-0016).
 step "Exposing Control UI service"
 openshell service expose "$SANDBOX_NAME" 18789 openclaw-ui 2>/dev/null \
   && info "Service exposed" \
   || info "Service may already be exposed"
 
-step "Applying OpenClaw service Route"
-oc apply -f "${RENDERED_DIR}/openclaw-service-route.yaml"
-info "Route applied"
-
 # ─── Summary ────────────────────────────────────────────────────────────────
 step "OpenClaw launch complete"
 echo ""
-info "Control UI (via oauth2-proxy): https://openclaw-ui.${APPS_DOMAIN}/"
-info "  Login: Keycloak OIDC (admin/admin in dev)"
+info "Control UI (via oauth-proxy): https://openclaw-gw--openclaw-ui.${APPS_DOMAIN}/"
+info "  Login: any OCP cluster identity (OpenShift-native OAuth, ADR-0016)"
 echo ""
 info "Observability:"
 info "  - mlflow-openclaw plugin: traces → MLflow experiment ${MLFLOW_EXP_ID}"
