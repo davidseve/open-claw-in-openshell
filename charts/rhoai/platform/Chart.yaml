@@ -1,0 +1,6 @@
+apiVersion: v2
+name: rhoai-platform
+description: "Minimal RHOAI DataScienceCluster — mlflowoperator only, everything else Removed (see ADR-0017)"
+type: application
+version: 0.1.0
+appVersion: "3.4"

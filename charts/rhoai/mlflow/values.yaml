@@ -1,0 +1,21 @@
+postgresql:
+  host: mlflow-db.redhat-ods-applications.svc
+  port: 5432
+  user: mlflow
+  # Never commit secrets to git (AGENTS.md). Left blank here on purpose —
+  # scripts/deploy-rhoai-mlflow.sh generates/loads this from
+  # secrets/secrets.env and injects it via `helm --set-string`. Must match
+  # ../database's database.password (same generated value).
+  password: ""
+  database: mlflow
+
+mlflow:
+  enabled: true
+  name: mlflow
+  replicas: 1
+  serveArtifacts: true
+  artifactsDestination: "file:///mlflow/artifacts"
+  storage:
+    size: 10Gi
+  route:
+    enabled: true

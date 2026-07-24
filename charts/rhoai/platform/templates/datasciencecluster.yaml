@@ -1,0 +1,46 @@
+apiVersion: datasciencecluster.opendatahub.io/v2
+kind: DataScienceCluster
+metadata:
+  name: {{ .Values.datasciencecluster.name }}
+spec:
+  components:
+    dashboard:
+      managementState: {{ .Values.datasciencecluster.components.dashboard.managementState }}
+    kserve:
+      managementState: {{ .Values.datasciencecluster.components.kserve.managementState }}
+      rawDeploymentServiceConfig: {{ .Values.datasciencecluster.components.kserve.rawDeploymentServiceConfig }}
+      modelsAsService:
+        managementState: {{ .Values.datasciencecluster.components.modelsAsService.managementState }}
+      wva:
+        managementState: {{ .Values.datasciencecluster.components.kserve.wva.managementState }}
+    llamastackoperator:
+      managementState: {{ .Values.datasciencecluster.components.llamastackoperator.managementState }}
+    aipipelines:
+      managementState: {{ .Values.datasciencecluster.components.aipipelines.managementState }}
+    feastoperator:
+      managementState: {{ .Values.datasciencecluster.components.feastoperator.managementState }}
+    kueue:
+      managementState: {{ .Values.datasciencecluster.components.kueue.managementState }}
+    mlflowoperator:
+      managementState: {{ .Values.datasciencecluster.components.mlflowoperator.managementState }}
+    modelregistry:
+      managementState: {{ .Values.datasciencecluster.components.modelregistry.managementState }}
+      {{- if eq .Values.datasciencecluster.components.modelregistry.managementState "Managed" }}
+      registriesNamespace: {{ .Values.datasciencecluster.components.modelregistry.registriesNamespace }}
+      {{- end }}
+    ray:
+      managementState: {{ .Values.datasciencecluster.components.ray.managementState }}
+    trainer:
+      managementState: {{ .Values.datasciencecluster.components.trainer.managementState }}
+    trainingoperator:
+      managementState: {{ .Values.datasciencecluster.components.trainingoperator.managementState }}
+    trustyai:
+      managementState: {{ .Values.datasciencecluster.components.trustyai.managementState }}
+      eval:
+        lmeval:
+          permitCodeExecution: {{ .Values.datasciencecluster.components.trustyai.eval.lmeval.permitCodeExecution }}
+          permitOnline: {{ .Values.datasciencecluster.components.trustyai.eval.lmeval.permitOnline }}
+    sparkoperator:
+      managementState: {{ .Values.datasciencecluster.components.sparkoperator.managementState }}
+    workbenches:
+      managementState: {{ .Values.datasciencecluster.components.workbenches.managementState }}

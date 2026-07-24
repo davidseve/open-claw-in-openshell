@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.service.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.service.name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.service.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.service.name }}
+    spec:
+      containers:
+      - name: postgres
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+        env:
+        - name: POSTGRESQL_USER
+          value: {{ .Values.database.user }}
+        - name: POSTGRESQL_PASSWORD
+          value: {{ .Values.database.password | quote }}
+        - name: POSTGRESQL_DATABASE
+          value: {{ .Values.database.name }}
+        ports:
+        - containerPort: 5432
+        resources:
+          requests:
+            cpu: {{ .Values.resources.requests.cpu | quote }}
+            memory: {{ .Values.resources.requests.memory | quote }}
+          limits:
+            cpu: {{ .Values.resources.limits.cpu | quote }}
+            memory: {{ .Values.resources.limits.memory | quote }}

@@ -18,6 +18,7 @@ Supports both AWS OCP clusters and local CRC (CodeReady Containers) for developm
 | Tempo | `2.7.2` | `grafana/tempo:2.7.2` |
 | OTel Collector | `0.121.0` | `otel/opentelemetry-collector-contrib:0.121.0` |
 | MLflow | `v3.10.1` | `ghcr.io/mlflow/mlflow:v3.10.1` (RHOAI 3.4 GA aligned) |
+| RHOAI operator (Phase 12, `charts/rhoai/`) | `stable-3.4` channel, `rhods-operator.3.4.2` | `redhat-operators` catalog, `installPlanApproval: Manual` |
 
 ## Environment Support
 
@@ -204,7 +205,7 @@ Access: `https://mlflow-observability.<APPS_DOMAIN>/`
 
 ### Phase 8 cleanup (low priority)
 
-- [ ] Remove stale `MLFLOW_TRACKING_URI` env var from `scripts/launch-openclaw.sh` line 375 (contradicts ADR-0014 Problem 7; not causing issues currently but is dead config)
+- [x] Remove stale `MLFLOW_TRACKING_URI` env var from `scripts/launch-openclaw.sh` (contradicts ADR-0014 Problem 7; plugin config comes from `config.json` only)
 - [x] Sync config drift between `config/openclaw.json` (reference snapshot) and `config/openclaw.json.tpl` (template): regenerated the snapshot from a real render of the template (`diagnostics-otel.enabled`, `diagnostics.otel.logs`, `diagnostics.otel.captureContent`, `mlflow-openclaw.hooks.allowConversationAccess`, `gateway.auth.trustedProxy.allowLoopback` were the drifted keys). Root cause: no deploy script ever writes to `config/openclaw.json` — `launch-openclaw.sh` and `deploy-oauth2-proxy.sh` both render `.tpl` straight into `.rendered/`, so the committed snapshot only stays accurate by hand. Added `check_config_snapshot_drift()` in `scripts/common.sh`, wired into `verify.sh` as "Layer 1a: Config template drift" so future drift fails verification instead of silently accumulating.
 
 ## Phase 8b: System Prompts via MLflow Prompt Registry
@@ -253,7 +254,9 @@ results = mlflow.genai.evaluate(
 )
 ```
 
-## Phase 9 (future): Simplify Control UI for End Users
+## Phase 9: Simplify Control UI for End Users
+
+**Status: PARTIAL** — config-level hardening done; scope-narrowing via proxy deferred (see below).
 
 Objective: minimize the exposed surface of the OpenClaw Control UI so that users only see a chat interface without access to settings, plugins, or advanced configuration.
 
@@ -261,19 +264,21 @@ Objective: minimize the exposed surface of the OpenClaw Control UI so that users
 
 OpenClaw has no native "kiosk mode." The approach combines operator scopes, plugin/tool policy, and gateway config to produce a minimal UX.
 
-### Configuration Changes (`config/openclaw.json`)
+### Configuration Changes (`config/openclaw.json.tpl`)
 
-- [ ] Add `plugins.deny: ["workboard", "admin-http-rpc"]` to hide non-essential sidebar tabs
-- [ ] Set `gateway.terminal.enabled: false` explicitly
-- [ ] Set `gateway.reload.mode: "off"` to prevent live config edits from UI
-- [ ] Expand `tools.deny` to include `browser` and `nodes`
-- [ ] Add `gateway.nodes.denyCommands: ["system.run", "canvas.navigate"]`
-- [ ] Set `gateway.controlUi.toolTitles: false` explicitly
+- [x] Add `plugins.deny: ["workboard", "admin-http-rpc"]` — these plugins are already disabled by default; this prevents an `operator.admin` session from re-enabling them from the Plugins page. It does **not** hide the Plugins sidebar entry, which OpenClaw always shows regardless of plugin state.
+- [x] Set `gateway.terminal.enabled: false` explicitly (already the default; now documented in config)
+- [x] Set `gateway.reload.mode: "off"` to prevent live config edits from UI from being applied without a restart
+- [x] Expand `tools.deny` (top-level, governs what the agent itself can invoke) to include `browser` and `nodes`
+- [x] Add `gateway.nodes.denyCommands: ["system.run", "canvas.navigate"]` — key verified directly against the deployed OpenClaw 2026.7.1 gateway's live JSON Schema (`openclaw config schema`, `gateway.nodes` is `{browser, pairing, allowCommands, denyCommands}` with `additionalProperties: false`). The original ROADMAP wording (`denyCommands`) was correct; a nested `gateway.nodes.commands.deny` shape (seen in newer upstream docs) does **not** exist in this pinned version and was rejected at gateway startup (`gateway.nodes: Invalid input`) before being corrected here.
+- [ ] ~~Set `gateway.controlUi.toolTitles: false`~~ — dropped. This key does not exist in the deployed 2026.7.1 schema either (`controlUi` keys are `enabled, basePath, root, embedSandbox, allowExternalEmbedUrls, chatMessageMaxWidth, allowedOrigins, dangerouslyAllowHostHeaderOriginFallback, allowInsecureAuth, dangerouslyDisableDeviceAuth`, also `additionalProperties: false`); adding it also caused a hard startup rejection (`gateway.controlUi: Invalid input`). Revisit only after upgrading past 2026.7.1 and re-checking the schema.
 
-### Trusted-Proxy Scope Mapping (via oauth2-proxy)
+### Trusted-Proxy Scope Mapping — deferred, not Keycloak-based
 
-- [ ] Add `x-openclaw-scopes` header from oauth2-proxy to enforce `operator.write` for all proxied users
-- [ ] Map Keycloak roles to OpenClaw operator scopes (admin role → `operator.admin`, user role → `operator.write`)
+The original plan for this section ("Map Keycloak roles to OpenClaw operator scopes") is obsolete: [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md) (2026-07-23) replaced Keycloak with `oauth-proxy` (OpenShift fork, native OCP OAuth) for the entire browser auth path. Keycloak is no longer in that path at all — it remains only for the CLI/gRPC gateway auth path. OCP's native OAuth server does not expose roles/groups in the token (they live in the Kubernetes User/Group API, not the JWT/opaque token), so there is no role claim left to map.
+
+- [ ] **Blocked**: inject a static `x-openclaw-scopes: operator.write` header from the proxy to cap all proxied Control UI sessions. Investigated and found infeasible with the current stack: `registry.redhat.io/openshift4/ose-oauth-proxy` (see [manifests/oauth2-proxy/deployment.yaml.tpl](manifests/oauth2-proxy/deployment.yaml.tpl)) only forwards identity headers it already derives from the IdP (`x-forwarded-user`, `x-forwarded-email`, `x-forwarded-preferred-username` via `--pass-user-headers=true`); it has no flag to inject an arbitrary static header. Implementing this would require either patching/forking `oauth-proxy` or adding a header-rewriting sidecar between it and the OpenShell relay — disproportionate for this phase, and risky given ADR-0016 already documents this fork as fragile (the WebSocket/Host-header bug it had to work around). Revisit if/when the proxy is replaced (e.g. `kube-auth-proxy`, noted as a non-blocking follow-up in ADR-0016) with something that supports custom header injection.
+- [ ] **Follow-up investigation (not scheduled)**: re-verify the actual runtime behavior of `gateway.controlUi.dangerouslyDisableDeviceAuth: true` (set in [config/openclaw.json.tpl](config/openclaw.json.tpl), documented in [ADR-0012](docs/adrs/ADR-0012-trusted-proxy-auth.md)) against the currently deployed OpenClaw 2026.7.1 gateway. Current OpenClaw docs describe this key as a retired break-glass/migration setting rather than a persistently supported config, which may mean device-less trusted-proxy sessions today behave differently (e.g. scopes cleared to `[]` by default) than what ADR-0012 assumed. This is a deeper auth-architecture question, out of scope for "reduce UI surface."
 
 ## Phase 10 (future): Custom Sandbox Image
 
@@ -296,6 +301,14 @@ Objective: Replace standalone MLflow (observability namespace) with RHOAI's shar
 
 Reference: [agentic-starter-kits mlflow-tracing overlay](https://github.com/red-hat-data-services/agentic-starter-kits/blob/main/agents/openclaw/deployment/docs/mlflow-tracing.md)
 
+### Environment scope: AWS for the combined stack, CRC as a standalone-only experiment
+
+Decision: **[ADR-0017](docs/adrs/ADR-0017-rhoai-mlflow-scope.md)** — empirically tested (not just inferred from Red Hat's documented 32 CPU/128 GiB single-node minimum) on this project's CRC dev laptop on 2026-07-24:
+- RHOAI + a minimal MLflow-only `DataScienceCluster` **alone** fits comfortably on a 16 vCPU / 40 GiB CRC VM (host stayed at 18 GiB free out of 62 GiB total).
+- Combined with the rest of the OpenShell + OpenClaw stack, host free memory dropped to 11 GiB and swap engaged — functionally fine (no crashes, no pod evictions) but below the safety margin this project reserves for keeping a shared dev laptop's Cursor session responsive.
+- **Result**: `charts/rhoai/` (operators + platform + database + mlflow, trimmed from `agentops-example` to only `mlflowoperator: Managed`) and `scripts/deploy-rhoai-mlflow.sh` exist and work, but are **not** wired into `crc-lifecycle.sh`'s combined `deploy`/`full` commands. On CRC, run `deploy-rhoai-mlflow.sh` standalone only, never alongside the full stack for long. On AWS it's unconstrained — see `deploy-full-aws` skill's new "Phase 9b" step.
+- The `mlflow-openclaw` plugin transport (tasks below) stays pointed at the standalone MLflow (ADR-0014) by default on both environments until this actually runs against AWS.
+
 ### Architecture change
 
 Current (dev):
@@ -317,15 +330,18 @@ The starter-kit uses an OTel Collector sidecar to forward `diagnostics-otel` spa
 
 ### Tasks
 
-- [ ] Create `openclaw-tracing` ServiceAccount with `mlflow-integration` ClusterRole binding
-- [ ] Configure `mlflow-openclaw` plugin with RHOAI endpoint (`https://mlflow.redhat-ods-applications.svc.cluster.local:8443`)
+- [x] Vendor minimal RHOAI Helm charts (`charts/rhoai/{operators,platform,database,mlflow}` + `Makefile`, trimmed from `agentops-example`, only `mlflowoperator: Managed`)
+- [x] Create `scripts/deploy-rhoai-mlflow.sh` (secret generation via `openssl rand`, no plaintext DB password committed)
+- [x] Empirically validate resource fit on CRC (Stage 1: alone — pass; Stage 2: combined with full stack — functional pass, resource-budget fail; see ADR-0017)
+- [ ] Create `openclaw-tracing` ServiceAccount with `mlflow-integration` ClusterRole binding (AWS)
+- [ ] Configure `mlflow-openclaw` plugin with RHOAI endpoint (`https://mlflow.redhat-ods-applications.svc.cluster.local:8443`), gated by `CRC_MODE` so CRC keeps using standalone MLflow
 - [ ] Add bearer token auth to plugin config (or env var `MLFLOW_TRACKING_TOKEN`)
 - [ ] Add TLS CA config (service-ca.crt mount)
 - [ ] Add `X-MLFLOW-WORKSPACE` header (namespace)
 - [ ] Create experiment in RHOAI MLflow workspace
 - [ ] Update network policy: allow egress to `mlflow.redhat-ods-applications.svc:8443`
 - [ ] Verify prompt-trace-linker.js works with RHOAI MLflow auth
-- [ ] Remove standalone MLflow deployment from observability namespace
+- [ ] Remove standalone MLflow deployment from observability namespace (AWS only — CRC keeps it per ADR-0017)
 - [ ] Update ADR-0014 with production migration notes
 
 ## Phase 13 (future): Security Hardening — Auth Simplification + MLflow Auth

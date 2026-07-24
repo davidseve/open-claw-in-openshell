@@ -1,0 +1,6 @@
+apiVersion: v2
+name: rhoai-operators
+description: "RHOAI operator subscription (minimal, MLflow-only integration — see ADR-0017)"
+type: application
+version: 0.1.0
+appVersion: "3.4"

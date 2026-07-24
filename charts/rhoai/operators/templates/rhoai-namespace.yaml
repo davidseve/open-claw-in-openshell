@@ -1,0 +1,13 @@
+{{- if .Values.rhoai.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.rhoai.namespace }}
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: redhat-ods-operator
+  namespace: {{ .Values.rhoai.namespace }}
+spec: {}
+{{- end }}

@@ -81,10 +81,11 @@ No CRC-specific config files exist. Same templates, same scripts, different doma
 
 ## CRC vs AWS Differences
 
-Only two differences, both isolated:
+Three differences, all isolated:
 
 1. **OLM operator**: CRC skips OLM subscription (single-node may lack catalog). CRDs are applied directly. Controlled by `CRC_MODE` in `bootstrap-ocp.sh`.
 2. **Keycloak/Observability**: Opt-in on CRC via `--with-oidc` / `--with-obs` flags. Always deployed on AWS.
+3. **RHOAI-managed MLflow (Phase 12)**: standalone-only experiment on CRC via `./scripts/deploy-rhoai-mlflow.sh`, run manually and never combined with the rest of the stack for long. Empirically tested (not just inferred from docs) — see [ADR-0017](../../docs/adrs/ADR-0017-rhoai-mlflow-scope.md): RHOAI + minimal MLflow alone fits fine on a 16 vCPU / 40 GiB CRC VM, but combined with the full OpenShell + OpenClaw stack it drops host free memory below this project's Cursor-safety floor (fine functionally, not fine for a shared dev laptop). Not wired into `crc-lifecycle.sh`'s `deploy`/`full` commands for this reason. AWS is the primary target for running it together with everything else — see `deploy-full-aws` skill.
 
 ## Known Issues
 

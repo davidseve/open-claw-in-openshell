@@ -50,6 +50,7 @@ constraint #10 in `docs/constraints.md`.
 
 ```bash
 ./scripts/crc-lifecycle.sh deploy --with-oidc --with-obs
+./scripts/deploy-rhoai-mlflow.sh   # Phase 12, AWS only — see below
 ./scripts/crc-lifecycle.sh verify
 ```
 
@@ -62,6 +63,26 @@ This runs the 8-phase deploy sequence:
 6. Deploy oauth-proxy (browser UI auth via OpenShift-native OAuth, no Keycloak — ADR-0016)
 7. Launch OpenClaw in sandbox
 8. Full verification
+
+### Phase 9b (optional): RHOAI-managed MLflow (Phase 12)
+
+`./scripts/deploy-rhoai-mlflow.sh` deploys the minimal RHOAI operator +
+`DataScienceCluster` (`mlflowoperator` only) + Postgres + `MLflow` CR via
+`charts/rhoai/`. Empirically tested on CRC first (see
+[ADR-0017](../../docs/adrs/ADR-0017-rhoai-mlflow-scope.md)): it works fine
+alone, but combined with the rest of the stack it uses more memory than a
+shared dev laptop can safely spare — so AWS is the intended environment for
+running it *together* with everything else. Run it after step 8 (full
+verification) once RHOAI's operator catalog is confirmed available
+(`oc get packagemanifest rhods-operator -n openshift-marketplace`).
+`installPlanApproval: Manual` — approve the `InstallPlan` once:
+```bash
+oc -n redhat-ods-operator get installplan
+oc -n redhat-ods-operator patch installplan <name> --type merge -p '{"spec":{"approved":true}}'
+```
+The plugin transport switch (bearer SA token, TLS CA, `X-MLFLOW-WORKSPACE`
+header — remaining Phase 12 tasks in `ROADMAP.md`) is not yet wired up; this
+phase currently only proves the RHOAI MLflow instance itself comes up.
 
 All scripts use `detect_environment()` from `common.sh` which auto-detects
 `APPS_DOMAIN` and `CRC_MODE`. No AWS-specific flags needed.
