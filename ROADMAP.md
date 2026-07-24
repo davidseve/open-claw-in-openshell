@@ -369,13 +369,13 @@ Remediates HIGH-3 (MLflow deployed without authentication):
 - [ ] Update `seed-mlflow-prompts.sh` and `fetch-prompts-from-mlflow.sh` with basic-auth credentials
 - [ ] Add MLflow auth verification to `verify.sh`
 
-### 13.4 Review: plaintext MaaS API key on disk + no per-user session isolation
+### 13.4 Review: plaintext MaaS API key on disk
 
 Flagged from a chat-session security review (jailbreak/exfiltration probing found in a
 real session transcript — the agent correctly refused all attempts, but the underlying
-architecture relies on soft controls in two places that deserve a hard fix:
+architecture relies on soft controls that deserve a hard fix:
 
-**A. Plaintext API key in the sandbox workspace.** Constraint #3 (`docs/constraints.md`)
+**Plaintext API key in the sandbox workspace.** Constraint #3 (`docs/constraints.md`)
 requires `launch-openclaw.sh` to inject the real `MAAS_API_KEY` directly into
 `/sandbox/workspace/.openclaw/openclaw.json` instead of the `openshell:resolve:env:...`
 placeholder pattern, because Node's `fetch()`/`undici` breaks proxy credential injection.
@@ -396,25 +396,6 @@ it doesn't cover every way the key text could be reshaped before being echoed).
 - [ ] Add an automated check (in `verify.sh` or a Playwright test) that attempts common
       jailbreak/exfiltration prompts against a live session and asserts the real key
       never appears unmasked in `chat.history` / the `.jsonl` transcript
-
-**B. No per-user session isolation in the Control UI.** OpenClaw's gateway is
-single-tenant by design (`docs/gateway/security/index.md`): `chat.history` and
-`sessions.list` are gated only by the `operator.read` scope, with no check that the
-calling identity owns the session being read. Combined with oauth-proxy's
-`--provider=openshift` having no `-openshift-sar` (ADR-0016), **any** OpenShift user
-who can authenticate can open the Control UI, get full operator scopes (including
-`operator.admin`, via `dangerouslyDisableDeviceAuth`), and read every other user's
-session transcripts — not just their own. This overlaps with the still-open
-"SAR-based access scoping" item noted in 13.1/ADR-0016, but is worth calling out
-explicitly as a session-privacy issue, not just an access-scope one.
-
-- [ ] Add `-openshift-sar` to the oauth-proxy Deployment to restrict Control UI login
-      to a named group/role, not "any cluster user" (tracked in ADR-0016 open questions)
-- [ ] Decide whether this deployment needs true per-user session isolation (each OCP
-      identity only sees its own sessions) or whether "shared operator access for a small
-      trusted team" is an acceptable model — document the decision in an ADR either way
-- [ ] If per-user isolation is required, this is an OpenClaw core gap, not something
-      fixable purely in this repo's config — file/track upstream
 
 ## References
 
