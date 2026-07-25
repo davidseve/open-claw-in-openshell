@@ -19,6 +19,30 @@ const EXPERIMENT_ID = process.env.MLFLOW_EXPERIMENT_ID || "0";
 const POLL_INTERVAL_MS = parseInt(process.env.LINKER_POLL_MS || "30000", 10);
 const LINKED_PROMPTS_TAG = "mlflow.linkedPrompts";
 
+// RHOAI-managed MLflow (docs/adrs/ADR-0017-rhoai-mlflow-scope.md) requires a
+// Bearer token (self_subject_access_review RBAC) and an X-MLFLOW-WORKSPACE
+// header on every request, plus TLS validated against openshift-service-
+// ca.crt (see MLFLOW_TRACKING_SERVER_CERT_PATH — staged into the sandbox by
+// scripts/launch-openclaw.sh --rhoai-mlflow). All three are no-ops when
+// unset, so standalone MLflow mode (plain HTTP, no auth) is unaffected.
+const MLFLOW_TRACKING_TOKEN = process.env.MLFLOW_TRACKING_TOKEN || null;
+const MLFLOW_WORKSPACE = process.env.MLFLOW_WORKSPACE || null;
+const MLFLOW_CA_PATH = process.env.MLFLOW_TRACKING_SERVER_CERT_PATH || null;
+
+function extraCurlArgs() {
+  const args = [];
+  if (MLFLOW_TRACKING_TOKEN) {
+    args.push("-H", `Authorization: Bearer ${MLFLOW_TRACKING_TOKEN}`);
+  }
+  if (MLFLOW_WORKSPACE) {
+    args.push("-H", `X-MLFLOW-WORKSPACE: ${MLFLOW_WORKSPACE}`);
+  }
+  if (MLFLOW_CA_PATH) {
+    args.push("--cacert", MLFLOW_CA_PATH);
+  }
+  return args;
+}
+
 let promptRefs = null;
 let linkedPromptsTagValue = null;
 let promptSummary = null;
@@ -53,6 +77,7 @@ function curlGet(urlPath) {
     const out = execFileSync("/usr/bin/curl", [
       "-sf",
       "--max-time", "10",
+      ...extraCurlArgs(),
       `${MLFLOW_URL}${urlPath}`,
     ], { encoding: "utf-8", timeout: 15000 });
     return { status: 200, body: out };
@@ -68,6 +93,7 @@ function curlPatch(urlPath, data) {
       "--max-time", "10",
       "-X", "PATCH",
       "-H", "Content-Type: application/json",
+      ...extraCurlArgs(),
       "-d", JSON.stringify(data),
       `${MLFLOW_URL}${urlPath}`,
     ], { encoding: "utf-8", timeout: 15000 });
@@ -84,6 +110,7 @@ function curlPost(urlPath, data) {
       "--max-time", "10",
       "-X", "POST",
       "-H", "Content-Type: application/json",
+      ...extraCurlArgs(),
       "-d", JSON.stringify(data),
       `${MLFLOW_URL}${urlPath}`,
     ], { encoding: "utf-8", timeout: 15000 });

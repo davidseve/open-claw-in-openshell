@@ -1,7 +1,15 @@
 # ADR-0014: Agent Observability — Dual-Pipeline Tracing with OTel + MLflow
 
 ## Status
-Accepted (supersedes original ADR-0012 observability design)
+**Superseded by [ADR-0018](ADR-0018-rhoai-mlflow-sole-backend.md)** for the
+MLflow half of this decision (Pipeline 2): the standalone
+`ghcr.io/mlflow/mlflow` deployment described here was fully removed and
+replaced by RHOAI-managed MLflow. Kept as-is below for historical record —
+do not edit the content past this point; see ADR-0018 for the current
+architecture. The OTel/Tempo half (Pipeline 1, infrastructure logs/metrics)
+is **still Accepted and unaffected** by this migration.
+
+Originally: Accepted (supersedes original ADR-0012 observability design)
 
 ## Context
 

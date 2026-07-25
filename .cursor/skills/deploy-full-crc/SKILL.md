@@ -52,15 +52,19 @@ For reuse (existing VM):
 ./scripts/crc-lifecycle.sh verify
 ```
 
-The `full --fresh` command handles the entire 8-phase deploy autonomously:
+The `full --fresh` command handles the entire 10-phase deploy autonomously
+(RHOAI + MLflow phases are unconditional, not gated behind `--with-obs` —
+see [ADR-0018](../../docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)):
 1. Bootstrap OCP (namespace, SCCs, secrets)
 2. Deploy Keycloak (OIDC issuer — CLI/gRPC gateway auth only, see ADR-0016)
-3. Deploy Observability (Tempo, OTel, MLflow, prompt seeding)
-4. Deploy OpenShell (Helm install, best-effort provider)
-5. Configure OIDC (Helm upgrade + obtain token + create provider)
-6. Deploy oauth-proxy (browser UI auth via OpenShift-native OAuth, no Keycloak — ADR-0016)
-7. Launch OpenClaw in sandbox (with all constraint workarounds)
-8. Smoke test + full verification
+3. Deploy infra observability (Tempo, OTel Collector — logs/metrics only, `--with-obs`)
+4. Deploy RHOAI + MLflow (sole tracing/prompt-registry backend, unconditional)
+5. Deploy OpenShell (Helm install, best-effort provider)
+6. Wire RHOAI MLflow tracing (RBAC, SA token, experiment, CA, prompt seeding — unconditional)
+7. Configure OIDC (Helm upgrade + obtain token + create provider)
+8. Deploy oauth-proxy (browser UI auth via OpenShift-native OAuth, no Keycloak — ADR-0016)
+9. Launch OpenClaw in sandbox (with all constraint workarounds)
+10. Smoke test + full verification
 
 See `docs/constraints.md` constraint #10 for why this order matters.
 
@@ -68,7 +72,7 @@ See `docs/constraints.md` constraint #10 for why this order matters.
 
 If the command exits 0 — done. Report the URLs:
 - Control UI: `https://openclaw-gw--openclaw-ui.apps-crc.testing/`
-- MLflow UI: `https://mlflow-observability.apps-crc.testing/`
+- MLflow UI: RHOAI's Route (`oc get route mlflow -n redhat-ods-applications`)
 - Keycloak: `https://keycloak-openshell-keycloak.apps-crc.testing/`
 
 If it fails — read the output, identify the failing phase, check

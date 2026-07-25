@@ -105,6 +105,196 @@ chown -R root:root /sandbox/workspace/.openclaw/extensions/<plugin-id>
 
 **Scripts affected**: `launch-openclaw.sh` (Step 6, Step 7)
 
+## 4b. Plugins — Pinned `@mlflow/core` Misses the `X-MLFLOW-WORKSPACE` Fix (RESOLVED via source-patch backport)
+
+**Constraint**: `@mlflow/mlflow-openclaw@0.2.0-rc.0` (the pinned plugin version
+installed in Step 6) declares `@mlflow/core@^0.2.0` as a dependency. npm's
+caret range resolves that to `0.2.0` exactly (published 2026-02-27) — it
+never crosses into `0.3.x`, even though `0.3.0` (published 2026-07-07) is
+available. [mlflow/mlflow#23927](https://github.com/mlflow/mlflow/pull/23927)
+(merged 2026-06-11) fixed a gap in `@mlflow/core`'s TypeScript SDK where
+`createOssAuth` did not send the `X-MLFLOW-WORKSPACE` header — but that fix
+landed in `0.3.0`, so it never reaches this plugin's pinned dependency tree.
+
+**Why this matters**: RHOAI-managed MLflow (`docs/adrs/ADR-0017-rhoai-mlflow-
+scope.md`) always runs with `--enable-workspaces`, so every request needs
+`X-MLFLOW-WORKSPACE`. **Confirmed live** (2026-07-25, after constraints #4c
+and #4d were both fixed and every earlier layer — network policy, TLS,
+RBAC, SA token auth — was working end-to-end): the plugin's real
+`createTrace` call reaches MLflow's actual API handler and gets back
+`HTTP 400: {"error":{"code":"INVALID_PARAMETER_VALUE","message":"Workspace
+context is required for this request."}}`. This is now the **only**
+remaining gap to a real trace landing in RHOAI MLflow.
+
+**Fix attempted, blocked**: added `"overrides": {"@mlflow/core": "0.3.0"}`
+to the plugin directory's own `package.json` (it's installed as its own
+isolated npm project via `npm init -y`, so `overrides` applies locally) and
+re-ran `npm install`. Failed with:
+
+```
+npm error code E403
+npm error 403 403 Forbidden - GET https://registry.npmjs.org/@mlflow%2fcore - policy_denied
+```
+
+The exact same package name was fetched successfully earlier for the
+original `^0.2.0` resolution, so this isn't a blanket npm-registry block —
+some other, more specific policy decision denies this particular fetch. Not
+configured anywhere in `policies/openclaw-sandbox.yaml` (no npm/registry
+entries exist there at all), so it must come from OpenShell's own base
+sandbox policy or a supply-chain control outside this project's
+configuration surface — see constraint #4e (left open; not needed for the
+fix below). Reverted the `package.json` change (harmless no-op, since `npm
+install` never completed).
+
+**Real fix (validated live, 2026-07-25)**: backported the fix as a source
+patch on the already-installed `@mlflow/core@0.2.0` file, sidestepping the
+npm registry entirely — the same technique already used for two other
+compatibility gaps on this same plugin (constraint #5), just applied one
+file deeper into the dependency tree. `dist/auth/index.js`'s
+`createOssAuth().headersProvider` builds `Content-Type`/`Authorization` but
+never `X-MLFLOW-WORKSPACE`; patched it to add the header from
+`process.env.MLFLOW_WORKSPACE` when set:
+
+```javascript
+const headersProvider = async () => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (authHeader) {
+        headers['Authorization'] = authHeader;
+    }
+    const workspace = options.workspace || process.env.MLFLOW_WORKSPACE;
+    if (workspace) {
+        headers['X-MLFLOW-WORKSPACE'] = workspace;
+    }
+    return headers;
+};
+```
+
+**Confirmed live**: with this patch plus the fixes in constraints #4c and
+#4d, a real chat turn produced a real trace, verified by querying RHOAI
+MLflow's traces API directly (`request_id: tr-692adb65bddad6913a4ddfdd93929028`, `status: OK`, real input/output content) —
+and `scripts/prompt-trace-linker.js` tagged it on its very next poll cycle.
+Full pipeline (gateway → RHOAI MLflow trace → linker tag) works end-to-end,
+with `HTTP 200` MaaS chat throughout (no regression). See
+`docs/adrs/ADR-0017-rhoai-mlflow-scope.md`'s 2026-07-25 "Resolution" section.
+
+**Scripts affected**: `scripts/launch-openclaw.sh` (Step 7's
+`patch-mlflow-plugin.py` heredoc, extended with a third, idempotent patch
+function for `@mlflow/core/dist/auth/index.js`).
+
+## 4c. `NODE_EXTRA_CA_CERTS` is Single-Value: Must Be Extended, Never Overwritten (RESOLVED)
+
+**Constraint**: the OpenShell sandbox runtime itself already sets
+`NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem` on every gateway
+process (confirmed via `/proc/<pid>/environ`, not just `oc exec`'s own
+shell env — that value is injected by OpenShell, not by anything in this
+repo). It also sets `HTTPS_PROXY=http://<sandbox-proxy>:3128` and
+`NODE_USE_ENV_PROXY=1`, which makes Node's (experimental)
+`EnvHttpProxyAgent` route **every** `fetch()` call through the sandbox proxy
+via HTTP `CONNECT`, for any destination. `openshell-ca.pem` is the CA that
+signs the proxy's own MITM certificates on every endpoint the proxy
+terminates TLS for (i.e. every endpoint *without* `tls: skip`, such as
+`maas_inference`) — Node needs to trust it for MaaS chat to work at all.
+
+To make the `mlflow-openclaw` plugin's plain Node `fetch()` also trust RHOAI
+MLflow's `service-ca`-signed certificate (needed even with `tls: skip` on
+the network policy — the plugin's own TLS handshake with real MLflow still
+needs a trusted CA; `MLFLOW_TRACKING_SERVER_CERT_PATH` is a no-op, see
+constraint #4b), an earlier attempt pointed `NODE_EXTRA_CA_CERTS` at a file
+containing *only* the RHOAI CA via `--env`. Since it's a single-value env
+var, this **overwrote** (not extended) OpenShell's baseline value — Node
+stopped trusting the proxy's own MITM cert, breaking the MaaS call in the
+same process (`SELF_SIGNED_CERT_IN_CHAIN`, then
+`RequestAbortedError: Proxy response (403) !== 200 when HTTP Tunneling`).
+
+**Fix (validated live, 2026-07-25)**: `NODE_EXTRA_CA_CERTS` accepts a file
+with one or more **concatenated** PEM certificates. Build a combined bundle
+— `cat openshell-ca.pem service-ca.crt > combined.pem` — and point
+`NODE_EXTRA_CA_CERTS` at the union, never at a file containing only the new
+CA. Confirmed live: with the combined bundle, `POST /v1/chat/completions`
+through the gateway → MaaS returned `HTTP 200` (no regression), and the
+`mlflow-openclaw` plugin's `fetch()` to RHOAI MLflow got past the TLS layer
+for the first time (see constraint #4d for the *next* blocker this
+uncovered — the fix here was necessary but not sufficient on its own).
+
+**Scripts affected**: `scripts/launch-openclaw.sh` (builds
+`.combined-ca-bundle.pem` in the sandbox workspace and points
+`NODE_EXTRA_CA_CERTS` at it whenever `--rhoai-mlflow` is passed).
+
+## 4d. `tls: skip` Policy Endpoints Require an *Exact* Hostname String Match — FQDN vs. Short Service Name Silently Defeats It
+
+**Constraint**: the sandbox proxy's `CONNECT`-tunnel handler matches the
+requested destination host against the exact string configured in
+`policies/openclaw-sandbox.yaml`'s `host:` field — no DNS-equivalence or
+suffix matching. If application code builds the URL with a *different but
+equivalent* hostname (e.g. the FQDN `<svc>.<ns>.svc.cluster.local` instead
+of the short 3-label Kubernetes Service DNS form `<svc>.<ns>.svc` that the
+policy is keyed on), the `CONNECT` request never matches that policy entry
+(so `tls: skip`, or any other setting on it, never applies) and falls
+through to default-deny.
+
+**Failure mode**: `curl: (56) CONNECT tunnel failed, response 403` (or, from
+Node's `fetch()`, `TypeError: fetch failed` with
+`cause: RequestAbortedError [AbortError]: Proxy response (403) !== 200 when
+HTTP Tunneling`) — **looks exactly like the TLS-trust failures in
+constraints #4b/#4c** from the client's point of view (curl/Node report both
+as connection failures), even though the actual cause has nothing to do with
+TLS, certificates, tokens, or RBAC — all of which can be (and, in the
+incident this was found in, were) completely correct.
+
+**How it was found**: reproduced with a byte-identical request pair, only
+the hostname changed:
+
+```bash
+# Matches policies/openclaw-sandbox.yaml's host: "mlflow.redhat-ods-applications.svc" → 200
+curl --cacert ca.crt -H "Authorization: Bearer $TOKEN" -H "X-MLFLOW-WORKSPACE: openshell" \
+  "https://mlflow.redhat-ods-applications.svc:8443/api/2.0/mlflow/experiments/get-by-name?experiment_name=openclaw-tracing"
+
+# Same cert, same token, same header — but FQDN doesn't match the policy's host string → 403
+curl --cacert ca.crt -H "Authorization: Bearer $TOKEN" -H "X-MLFLOW-WORKSPACE: openshell" \
+  "https://mlflow.redhat-ods-applications.svc.cluster.local:8443/api/2.0/mlflow/experiments/get-by-name?experiment_name=openclaw-tracing"
+```
+
+**Fix**: always build service URLs for anything that has to pass through the
+sandbox proxy using the exact hostname string configured in
+`policies/openclaw-sandbox.yaml` — in this project's case, the short
+`<svc>.<ns>.svc` form (no `.cluster.local` suffix). `scripts/wire-rhoai-mlflow-tracing.sh`'s `RHOAI_MLFLOW_SVC_URL` was fixed to build the short
+form; it feeds `RHOAI_MLFLOW_TRACKING_URI` in `.rendered/rhoai-mlflow/wiring.env`, which is what both `scripts/launch-openclaw.sh` (gateway's
+`openclaw.json` `trackingUri`) and `scripts/prompt-trace-linker.js`
+(`MLFLOW_URL`) consume — so both sides of the wiring were fixed by this one
+change. This constraint generalizes beyond MLflow: **any future `tls: skip`
+(or other per-host) policy entry must be referenced by the exact same
+hostname string everywhere in application code**, not just an
+IP/DNS-equivalent one.
+
+**Scripts affected**: `scripts/wire-rhoai-mlflow-tracing.sh`
+(`RHOAI_MLFLOW_SVC_URL`).
+
+## 4e. `npm install` of a Specific Package/Version Can Be Denied by an Undocumented OpenShell Policy (open, not root-caused)
+
+**Constraint**: requesting a *specific* npm package/version
+(`@mlflow/core@0.3.0`, via an `overrides` entry — see constraint #4b) failed
+with:
+
+```
+npm error code E403
+npm error 403 403 Forbidden - GET https://registry.npmjs.org/@mlflow%2fcore - policy_denied
+```
+
+The same package name (`@mlflow/core`, resolving to `0.2.0`) was fetched
+successfully moments earlier as a transitive dependency of
+`@mlflow/mlflow-openclaw@0.2.0-rc.0`'s normal install. `policies/openclaw-sandbox.yaml` has **no** npm/registry-related entries at all — this repo does
+not configure this behavior, so the denial must come from OpenShell's own
+base sandbox policy (default npm registry allowlisting) or some other
+supply-chain control outside this project's configuration surface.
+
+**Not root-caused this session** — the mechanism (package-specific?
+version-specific? some kind of pinning/allowlist tied to what was resolved
+at sandbox-creation time?) is unknown. Flagged here so a future session
+doesn't have to rediscover the symptom from scratch. See constraint #4b for
+the fix this was blocking and the fallback options if it stays unresolved.
+
+**Scripts affected**: none — investigation only, change was reverted.
+
 ## 5. Plugins — SDK Compatibility
 
 **Constraint**: `@mlflow/mlflow-openclaw@0.2.0-rc.0` imports two modules that
@@ -214,29 +404,39 @@ using the Keycloak admin API during deployment.
    since ADR-0016, it deploys `oauth-proxy` with OpenShift-native OAuth and
    no longer depends on Keycloak at all. Keycloak is still deployed earlier
    in the sequence purely because the CLI/gRPC OIDC path (`configure-oidc.sh`,
-   step 5 below) still needs it as a JWKS-serving issuer.
-4. `launch-openclaw.sh` needs MLflow for prompt seeding and the provider to
-   already exist for model routing.
+   step 7 below) still needs it as a JWKS-serving issuer.
+4. RHOAI + MLflow (`deploy-rhoai-mlflow.sh`) MUST run BEFORE OpenShell —
+   the `mlflow-integration` ClusterRole and RHOAI namespace it binds RBAC to
+   must already exist when OpenShell's sandbox SA is created. Wiring
+   (`wire-rhoai-mlflow-tracing.sh`) MUST run AFTER OpenShell — it binds RBAC
+   to the `openshell-sandbox` ServiceAccount, which OpenShell creates.
+5. `launch-openclaw.sh` needs the RHOAI MLflow wiring facts
+   (`.rendered/rhoai-mlflow/wiring.env`) for prompt seeding/fetching and the
+   provider to already exist for model routing.
 
 **Why**: Each service has dependencies on the previous ones. The wrong order
 causes cascading authentication or "not found" failures.
 
 **Failure mode**: Various — `helm upgrade` fails, provider creation fails with
 "missing authorization header", oauth-proxy has no backend, OpenClaw can't
-reach the model provider.
+reach the model provider, RBAC binding fails ("service account not found").
 
-**Workaround**: Correct deploy order in `crc-lifecycle.sh cmd_deploy()`:
+**Workaround**: Correct deploy order in `crc-lifecycle.sh cmd_deploy()` (RHOAI
++ MLflow is unconditional since Phase 12/[ADR-0018](adrs/ADR-0018-rhoai-mlflow-sole-backend.md) — it is no longer gated behind `--with-obs`, which now only
+controls the separate Tempo/OTel Collector infrastructure stack):
 1. `bootstrap-ocp.sh` — namespace, SCCs, secrets
 2. `deploy-keycloak.sh` — OIDC issuer available (CLI/gRPC path only, see #3 above)
-3. `deploy-observability.sh` — MLflow + Tempo + OTel + prompt seeding
-4. `deploy-openshell.sh` with `WITH_OIDC=false` — Helm install without OIDC
+3. `deploy-observability.sh` — Tempo + OTel Collector (infra logs/metrics only, `--with-obs`)
+4. `deploy-rhoai-mlflow.sh` — RHOAI operator + minimal MLflow-only DataScienceCluster (unconditional)
+5. `deploy-openshell.sh` with `WITH_OIDC=false` — Helm install without OIDC
    (the pod would block on the missing `openshell-oidc-ca` ConfigMap otherwise)
-5. `configure-oidc.sh` — creates OIDC CA ConfigMap + Helm upgrade with OIDC + obtain token
-6. `create_provider` — now has OIDC token
-7. `deploy-oauth2-proxy.sh` — needs OpenShell only (OpenShift-native OAuth, ADR-0016)
-8. `launch-openclaw.sh` — everything ready
+6. `wire-rhoai-mlflow-tracing.sh` — RBAC, SA token, experiment, CA, prompt seeding (unconditional)
+7. `configure-oidc.sh` — creates OIDC CA ConfigMap + Helm upgrade with OIDC + obtain token
+8. `create_provider` — now has OIDC token
+9. `deploy-oauth2-proxy.sh` — needs OpenShell only (OpenShift-native OAuth, ADR-0016)
+10. `launch-openclaw.sh` — everything ready
 
-**Scripts affected**: `scripts/crc-lifecycle.sh`, `scripts/deploy-openshell.sh`, `scripts/common.sh`
+**Scripts affected**: `scripts/crc-lifecycle.sh`, `scripts/deploy-openshell.sh`, `scripts/deploy-rhoai-mlflow.sh`, `scripts/wire-rhoai-mlflow-tracing.sh`, `scripts/common.sh`
 
 ## 11. Network Namespace — Process Start Location
 
@@ -424,7 +624,21 @@ required). Relevant upstream files: `crates/openshell-supervisor-network/src/l7/
 
 ---
 
-## Constraint #12: MLflow Artifact URI Scheme
+## Constraint #12: MLflow Artifact URI Scheme (OBSOLETE — standalone MLflow removed)
+
+**Status**: This constraint applied only to the standalone
+`ghcr.io/mlflow/mlflow` deployment (`manifests/observability/mlflow.yaml`),
+which was removed entirely — see
+`docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md`. RHOAI-managed MLflow (the
+sole backend now) is operator-provisioned with its own artifact-store
+configuration (backed by RHOAI's own storage, not a bare
+`--default-artifact-root=/mlflow/artifacts` local-filesystem flag this repo
+controlled) and was never observed to hit this specific `Invalid URL`
+failure mode during the Phase 12 validation — span hierarchy came through
+correctly in the real trace captured there. Kept below verbatim as a
+historical record in case a similar artifact-URI-scheme class of bug ever
+resurfaces against RHOAI MLflow; **`manifests/observability/mlflow.yaml`, the
+file this fix pointed at, no longer exists.**
 
 **Problem**: The `@mlflow/core` JS client expects trace artifact locations to use
 the `mlflow-artifacts://` URI scheme (e.g. `mlflow-artifacts:/0/traces/tr-.../artifacts`).
@@ -599,3 +813,125 @@ regression.
 
 **Scripts affected**: None (informational finding from validation testing,
 no code change required). Relevant file: `scripts/verify.sh` (Layer 7b).
+
+## 17. `verify.sh` Layer 5b Check 4 False Positive — `gateway.reload.mode=off` Makes the chatCompletions Toggle a No-Op
+
+**Context**: Found while live-validating the standalone-MLflow-removal
+migration (`docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md`) on the current
+OpenClaw build (`2026.7.1`). Layer 5b Check 4 (`scripts/verify.sh`)
+temporarily flips `gateway.http.endpoints.chatCompletions.enabled` to `true`
+on disk, immediately sends a real chat completion request over that
+endpoint, then restores it to `false` — relying on the assumption
+documented in constraint #15 ("the route handler reads the config file live
+at request time"). Check 5 (the actual MLflow trace-recency poll) then
+consistently reported the latest trace as stale, even right after a fresh
+`launch-openclaw.sh` relaunch with no other activity.
+
+**Root cause, confirmed live with a manual, unwrapped `curl -v`**: the
+running gateway process's `openclaw.log` shows
+`gateway.reload.mode=off` on every config-file write — Check 4's toggle
+write is detected but explicitly **not** applied to the running process
+(`[reload] config change detected; evaluating reload (...)` immediately
+followed by `[reload] config reload disabled (gateway.reload.mode=off)`).
+A direct, verbose `curl` to `/v1/chat/completions` immediately after the
+toggle write returns a real `HTTP 404 Not Found` — the endpoint truly never
+gets registered on the running process, contradicting constraint #15's
+"live per-request read" theory for this OpenClaw version. Only a full
+gateway process restart (which re-reads `openclaw.json` from disk at
+startup, same as any other config value) picks up the change.
+
+**Why Check 4 still reports a false PASS**: `sandbox_run` (the wrapper
+Check 4 uses) runs commands through a PTY, and per constraint #15's own
+prior finding, a PTY **echoes the input command text back before
+executing it**. Check 4's own curl command line contains the literal
+strings `Content-Type` and `VERIFY_OK` (in `-H 'Content-Type:
+application/json'` and the test message `"Reply with exactly: VERIFY_OK"`).
+Check 4's success grep (`grep -qi "choices\|content\|VERIFY_OK"`) matches
+against that **echoed input**, not the real (404) response body — so it
+reports "Gateway LLM request completed (model responded)" even though no
+request ever actually reached the model through this path. Check 5, which
+queries RHOAI MLflow's real trace API directly (no PTY echo involved), is
+the one giving the *correct* signal — its `FAIL` here is real, just not
+caused by anything wrong with the RHOAI MLflow wiring itself.
+
+**Confirmed NOT an RHOAI MLflow regression**: the `mlflow-openclaw` plugin
+loads and initializes correctly on every fresh gateway start
+(`[plugins] mlflow: exporting traces to https://mlflow.redhat-ods-applications.svc:8443 (experiment=1)`), and a real trace from an
+earlier, successful validation (`tr-692adb65bddad6913a4ddfdd93929028`, see
+ADR-0017's "Resolution" section) is still queryable via the real API with
+full input/output content — Layer 8's "MLflow native traces" and "MLflow
+trace content" checks (`scripts/verify.sh`) both pass. The gap is purely in
+Check 4/5's synthetic-request mechanism, which would fail identically
+regardless of which MLflow backend (standalone or RHOAI) sat behind the
+plugin — it's a `gateway.reload.mode` / PTY-echo interaction, unrelated to
+the backend migration this session performed.
+
+**Not fixed in this session**: a real fix requires either (a) restarting
+the gateway process after the config toggle (adds meaningful complexity/
+risk to `verify.sh`'s process-management logic for a synthetic test path),
+or (b) finding a different way to exercise a real chat turn without
+touching `gateway.http.endpoints.*` at all (e.g. driving the WebSocket path
+the same way Playwright/Layer 9 already does, which is unaffected by this
+bug). Flagged as a known follow-up rather than patched here, to avoid
+scope creep on top of the standalone-MLflow-removal migration.
+
+**Scripts affected**: `scripts/verify.sh` (Layer 5b Checks 4/5) — no code
+change made; this entry documents the finding for whoever picks up the
+follow-up. Relevant OpenClaw internals: `gateway.reload.mode` config,
+`src/gateway/config-reload-plan.ts`.
+
+## 18. `openshell` CLI OIDC Token Refresh Fails on CRC — Self-Signed Router CA Not in System Trust Store
+
+**Context**: Found live during a fully fresh `crc-lifecycle.sh full --fresh`
+run (delete VM, recreate, redeploy everything). `scripts/verify.sh` and
+`scripts/smoke-test-e2e.sh`, run a few minutes after
+`scripts/configure-oidc.sh` (Phase 7) completed, both failed with a cascade
+of confusing errors: `Sandbox 'openclaw-gw' not found`, `Expected sandbox
+user, got unexpected identity`, `SECURITY: github.com should be blocked by
+proxy` (false — the proxy check itself never ran), etc. — none of which were
+real regressions; the sandbox was confirmed still `Ready` via
+`openshell sandbox list` once the actual bug (below) was worked around.
+
+**Root cause**: `scripts/configure-oidc.sh` (Phase 7) switches the gateway's
+CLI auth mode from mTLS to OIDC and mints a short-lived access token +
+refresh token from Keycloak, stored in
+`~/.config/openshell/gateways/<name>/oidc_token.json`. The access token
+expires after ~5 minutes. On every subsequent `openshell` CLI invocation
+past that window, the CLI tries to use its refresh token against the OIDC
+issuer (`https://keycloak-<ns>-keycloak.apps-crc.testing/realms/openshell/...`)
+— but CRC's router uses a self-signed wildcard cert (`CN=*.apps-crc.testing`,
+issued by `ingress-operator@...`) that is **not** in the host's system CA
+trust store (`crc setup` only trusts the API server's own CA for `oc`/
+`kubectl`, not the router's wildcard cert used by every `apps-crc.testing`
+Route). The CLI's Rust HTTP client (`reqwest`/`rustls`) enforces real
+certificate validation and fails the refresh call with a generic
+`error sending request for url (...)`, then falls back to the already-
+expired access token, producing `invalid token: ExpiredSignature` on every
+gateway API call — which callers surface as unrelated-looking failures
+(sandbox "not found", identity mismatches, etc.) because the CLI command
+itself errored out before doing anything.
+
+**Confirmed via manual repro**: `curl` (default, no `-k`) against the same
+Keycloak discovery URL shows `SSL certificate OpenSSL verify result:
+self-signed certificate in certificate chain (19)`; `curl -k` succeeds
+(HTTP 200) — confirming a pure TLS-trust gap, not a network/DNS issue or an
+actually-expired/invalid token chain.
+
+**Fix**: the `openshell` CLI has a documented, purpose-built flag for
+exactly this — `--gateway-insecure` / `OPENSHELL_GATEWAY_INSECURE=true`
+("Skip TLS certificate verification for gateway connections"). Setting the
+env var (boolean string `true`, not `1` — the CLI's arg parser rejects `1`
+with `invalid value '1' for '--gateway-insecure'`) immediately fixed both
+the OIDC refresh and the downstream "sandbox not found" symptoms in the
+same shell session. `scripts/common.sh`'s `detect_environment()` now
+exports `OPENSHELL_GATEWAY_INSECURE=true` whenever `CRC_MODE=true` (same
+place/rationale as the pre-existing `CURL_OPTS="-k"` for CRC), so every
+script that sources `common.sh` and calls `detect_environment` (which is
+effectively all of them) picks this up automatically for any `openshell`
+CLI calls made afterward in the same process. Not set on AWS OCP — real,
+trusted certs there, so the CLI's default strict verification is correct
+and should stay on.
+
+**Scripts affected**: `scripts/common.sh` (`detect_environment()`) — fixed.
+No changes needed in `scripts/verify.sh` or `scripts/smoke-test-e2e.sh`
+themselves; they inherit the env var by sourcing `common.sh`.

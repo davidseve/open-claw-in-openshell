@@ -17,8 +17,8 @@ Supports both AWS OCP clusters and local CRC (CodeReady Containers) for developm
 | Keycloak | `24.0` | `quay.io/keycloak/keycloak:24.0` |
 | Tempo | `2.7.2` | `grafana/tempo:2.7.2` |
 | OTel Collector | `0.121.0` | `otel/opentelemetry-collector-contrib:0.121.0` |
-| MLflow | `v3.10.1` | `ghcr.io/mlflow/mlflow:v3.10.1` (RHOAI 3.4 GA aligned) |
-| RHOAI operator (Phase 12, `charts/rhoai/`) | `stable-3.4` channel, `rhods-operator.3.4.2` | `redhat-operators` catalog, `installPlanApproval: Manual` |
+| RHOAI operator (`charts/rhoai/`) | `stable-3.4` channel, `rhods-operator.3.4.2` | `redhat-operators` catalog, `installPlanApproval: Manual` |
+| RHOAI-managed MLflow | RHOAI 3.4 GA-aligned | via `mlflowoperator: Managed` DSC component — sole tracing/prompt-registry backend, see [ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md) |
 
 ## Environment Support
 
@@ -189,11 +189,11 @@ https://keycloak-openshell-keycloak.<APPS_DOMAIN>/admin (admin/admin)
 
 ## Phase 8: Agent Observability (OpenTelemetry + Tempo + MLflow)
 
-**Status: COMPLETE** — Decision: [ADR-0014](docs/adrs/ADR-0014-agent-observability.md)
+**Status: COMPLETE, MLflow backend superseded by Phase 12b/[ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)** — Decision: [ADR-0014](docs/adrs/ADR-0014-agent-observability.md)
 
-Run: `./scripts/deploy-observability.sh`
+Run: `./scripts/deploy-observability.sh` (now Tempo + OTel Collector only — see Phase 12b)
 
-- [x] Deploy Tempo, OTel Collector, MLflow v3.10.1 (RHOAI 3.4 aligned)
+- [x] Deploy Tempo, OTel Collector, MLflow v3.10.1 (RHOAI 3.4 aligned) — **the standalone MLflow deployment was later removed entirely (Phase 12b); only Tempo/OTel Collector remain from this list**
 - [x] Dual-pipeline tracing: diagnostics-otel → Tempo, mlflow-openclaw → MLflow
 - [x] Rich hierarchical traces in MLflow (AGENT → LLM spans with inputs/outputs)
 - [x] HTTP proxy bootstrap for sandbox OTel export
@@ -201,7 +201,7 @@ Run: `./scripts/deploy-observability.sh`
 - [x] `@mlflow/core` artifact URI patch for containerized MLflow
 - [x] Verification added to `scripts/verify.sh` (Layer 8)
 
-Access: `https://mlflow-observability.<APPS_DOMAIN>/`
+Access (historical, standalone MLflow — removed): ~~`https://mlflow-observability.<APPS_DOMAIN>/`~~. Current MLflow UI is RHOAI's Route in `redhat-ods-applications` — see Phase 12b.
 
 ### Phase 8 cleanup (low priority)
 
@@ -210,7 +210,7 @@ Access: `https://mlflow-observability.<APPS_DOMAIN>/`
 
 ## Phase 8b: System Prompts via MLflow Prompt Registry
 
-**Status: COMPLETE** — Decision: [ADR-0015](docs/adrs/ADR-0015-mlflow-prompt-registry.md)
+**Status: COMPLETE, backend superseded by Phase 12b/[ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)** (mechanism below is unchanged — only the MLflow instance it talks to changed) — Decision: [ADR-0015](docs/adrs/ADR-0015-mlflow-prompt-registry.md)
 
 Run: `./scripts/seed-mlflow-prompts.sh` (initial seed), then `./scripts/launch-openclaw.sh` (fetches at launch)
 
@@ -222,7 +222,7 @@ Run: `./scripts/seed-mlflow-prompts.sh` (initial seed), then `./scripts/launch-o
 - [x] Create `scripts/prompt-trace-linker.js` sidecar to tag each trace with versions (Layer 3: per-trace)
 - [x] Protect prompt files with `root:root chmod 444` (agent cannot modify)
 - [x] Integrate prompt fetch into `scripts/launch-openclaw.sh` (between workspace setup and gateway start)
-- [x] Integrate initial seed into `scripts/deploy-observability.sh` (after MLflow deploy)
+- [x] Integrate initial seed into `scripts/deploy-observability.sh` (after MLflow deploy) — **moved to `scripts/wire-rhoai-mlflow-tracing.sh` in Phase 12b, since `deploy-observability.sh` no longer deploys MLflow**
 - [x] Write `.prompt-versions.json` manifest for local audit
 - [x] ADR-0015 documenting decision, traceability strategy, and Chat Sessions integration path
 
@@ -230,7 +230,7 @@ Run: `./scripts/seed-mlflow-prompts.sh` (initial seed), then `./scripts/launch-o
 
 | Task | Command |
 |------|---------|
-| Edit prompts | Edit `prompts/*.md` or use MLflow UI at `https://mlflow-observability.<APPS_DOMAIN>/` |
+| Edit prompts | Edit `prompts/*.md` or use MLflow UI at RHOAI's MLflow Route (`oc get route mlflow -n redhat-ods-applications`) |
 | Register/update in MLflow | `./scripts/seed-mlflow-prompts.sh` |
 | Deploy to sandbox | `./scripts/launch-openclaw.sh` (fetches automatically) |
 | Rollback | Change `@production` alias in MLflow UI to a previous version, then relaunch |
@@ -295,54 +295,77 @@ The original plan for this section ("Map Keycloak roles to OpenClaw operator sco
 - [ ] Switch to `enforcement: enforce` after validation
 - [ ] Implement credential rotation procedure
 
-## Phase 12 (future): Migrate to RHOAI-managed MLflow
+## Phase 12: Migrate to RHOAI-managed MLflow
 
-Objective: Replace standalone MLflow (observability namespace) with RHOAI's shared MLflow instance while preserving the rich `@mlflow/mlflow-openclaw` plugin traces.
+**Status: COMPLETE** — Objective: Replace standalone MLflow (observability namespace) with RHOAI's shared MLflow instance while preserving the rich `@mlflow/mlflow-openclaw` plugin traces.
 
 Reference: [agentic-starter-kits mlflow-tracing overlay](https://github.com/red-hat-data-services/agentic-starter-kits/blob/main/agents/openclaw/deployment/docs/mlflow-tracing.md)
 
-### Environment scope: AWS for the combined stack, CRC as a standalone-only experiment
+### Environment scope: from CRC-as-standalone-experiment to sole backend everywhere
 
-Decision: **[ADR-0017](docs/adrs/ADR-0017-rhoai-mlflow-scope.md)** — empirically tested (not just inferred from Red Hat's documented 32 CPU/128 GiB single-node minimum) on this project's CRC dev laptop on 2026-07-24:
+Decision history: **[ADR-0017](docs/adrs/ADR-0017-rhoai-mlflow-scope.md)** (empirical CRC validation + original opt-in scope, 2026-07-24) → **[ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)** (full migration decision, 2026-07-25). Summary:
 - RHOAI + a minimal MLflow-only `DataScienceCluster` **alone** fits comfortably on a 16 vCPU / 40 GiB CRC VM (host stayed at 18 GiB free out of 62 GiB total).
-- Combined with the rest of the OpenShell + OpenClaw stack, host free memory dropped to 11 GiB and swap engaged — functionally fine (no crashes, no pod evictions) but below the safety margin this project reserves for keeping a shared dev laptop's Cursor session responsive.
-- **Result**: `charts/rhoai/` (operators + platform + database + mlflow, trimmed from `agentops-example` to only `mlflowoperator: Managed`) and `scripts/deploy-rhoai-mlflow.sh` exist and work, but are **not** wired into `crc-lifecycle.sh`'s combined `deploy`/`full` commands. On CRC, run `deploy-rhoai-mlflow.sh` standalone only, never alongside the full stack for long. On AWS it's unconstrained — see `deploy-full-aws` skill's new "Phase 9b" step.
-- The `mlflow-openclaw` plugin transport (tasks below) stays pointed at the standalone MLflow (ADR-0014) by default on both environments until this actually runs against AWS.
+- Combined with the rest of the OpenShell + OpenClaw stack, host free memory drops to ~11 GiB and swap engages — functionally fine (no crashes, no pod evictions) but below this project's usual safety margin. **This is now an accepted trade-off**, not a reason to keep two backends (ADR-0018).
+- All three real integration blockers found while wiring the `mlflow-openclaw` plugin to RHOAI MLflow (Node-side TLS trust conflict with the OpenShell sandbox proxy, a hostname-matching bug in the `tls: skip` policy, and the pinned SDK missing the `X-MLFLOW-WORKSPACE` header) were root-caused and fixed for real — see ADR-0017's "Follow-up"/"Resolution" sections and `docs/constraints.md` #4b-#4e.
+- End-to-end validated live: a real chat message produced a real trace in RHOAI MLflow, picked up and tagged by `prompt-trace-linker.js` on its next poll cycle, with the MaaS chat path unaffected throughout.
+- **Result**: standalone MLflow was removed entirely (see Phase 12b below); RHOAI-managed MLflow (`charts/rhoai/`) is the sole tracing/prompt-registry backend on every environment, wired unconditionally into `crc-lifecycle.sh`.
 
 ### Architecture change
 
-Current (dev):
+Before (removed):
 - MLflow `ghcr.io/mlflow/mlflow:v3.10.1` in `observability` ns, plain HTTP port 5000
 - `mlflow-openclaw` plugin connects directly without auth
 
-Target (production):
+Now (sole backend, all environments):
 - RHOAI MLflow in `redhat-ods-applications`, TLS on port 8443
-- ServiceAccount bearer token auth (pod SA token)
-- Workspace isolation via `X-MLFLOW-WORKSPACE` header
-- Service CA TLS (`/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`)
+- ServiceAccount bearer token auth (declarative Secret, `charts/rhoai/mlflow/templates/openclaw-integration-rbac.yaml`)
+- Workspace isolation via `X-MLFLOW-WORKSPACE` header (source-patched into the pinned `@mlflow/core@0.2.0` client — see `docs/constraints.md` #4b)
+- Service CA TLS (`openshift-service-ca.crt`, combined with OpenShell's own proxy CA into one bundle — `docs/constraints.md` #4c)
 
 ### Key difference from starter-kit approach
 
-The starter-kit uses an OTel Collector sidecar to forward `diagnostics-otel` spans to RHOAI MLflow. We keep `mlflow-openclaw` for richer traces (full chat I/O, AGENT/LLM hierarchy) and only need to update the plugin's transport layer to add:
-1. Bearer token injection (SA token from mounted secret)
-2. TLS CA bundle for service-to-service communication
-3. `X-MLFLOW-WORKSPACE` header for namespace isolation
+The starter-kit uses an OTel Collector sidecar to forward `diagnostics-otel` spans to RHOAI MLflow. We keep `mlflow-openclaw` for richer traces (full chat I/O, AGENT/LLM hierarchy) instead, with the plugin's transport layer patched (not just configured) to add:
+1. Bearer token injection (SA token from a declarative Secret)
+2. TLS CA bundle for service-to-service communication (combined-bundle fix)
+3. `X-MLFLOW-WORKSPACE` header for namespace isolation (source patch, since the pinned SDK version doesn't send it)
 
 ### Tasks
 
 - [x] Vendor minimal RHOAI Helm charts (`charts/rhoai/{operators,platform,database,mlflow}` + `Makefile`, trimmed from `agentops-example`, only `mlflowoperator: Managed`)
 - [x] Create `scripts/deploy-rhoai-mlflow.sh` (secret generation via `openssl rand`, no plaintext DB password committed)
-- [x] Empirically validate resource fit on CRC (Stage 1: alone — pass; Stage 2: combined with full stack — functional pass, resource-budget fail; see ADR-0017)
-- [ ] Create `openclaw-tracing` ServiceAccount with `mlflow-integration` ClusterRole binding (AWS)
-- [ ] Configure `mlflow-openclaw` plugin with RHOAI endpoint (`https://mlflow.redhat-ods-applications.svc.cluster.local:8443`), gated by `CRC_MODE` so CRC keeps using standalone MLflow
-- [ ] Add bearer token auth to plugin config (or env var `MLFLOW_TRACKING_TOKEN`)
-- [ ] Add TLS CA config (service-ca.crt mount)
-- [ ] Add `X-MLFLOW-WORKSPACE` header (namespace)
-- [ ] Create experiment in RHOAI MLflow workspace
-- [ ] Update network policy: allow egress to `mlflow.redhat-ods-applications.svc:8443`
-- [ ] Verify prompt-trace-linker.js works with RHOAI MLflow auth
-- [ ] Remove standalone MLflow deployment from observability namespace (AWS only — CRC keeps it per ADR-0017)
-- [ ] Update ADR-0014 with production migration notes
+- [x] Empirically validate resource fit on CRC (Stage 1: alone — pass; Stage 2: combined with full stack — functional pass, resource-budget accepted as trade-off; see ADR-0017/ADR-0018)
+- [x] Declarative RBAC: `openclaw-tracing` RoleBinding to `mlflow-integration` ClusterRole (`charts/rhoai/mlflow/templates/openclaw-integration-rbac.yaml`)
+- [x] Configure `mlflow-openclaw` plugin with RHOAI endpoint (`https://mlflow.redhat-ods-applications.svc:8443` — short-form hostname, required for the `tls: skip` policy match)
+- [x] Add bearer token auth to plugin config via `MLFLOW_TRACKING_TOKEN` env var (declarative SA token Secret)
+- [x] Add TLS CA config (`service-ca.crt`, combined with OpenShell's proxy CA bundle)
+- [x] Add `X-MLFLOW-WORKSPACE` header (source patch on `@mlflow/core`, `scripts/launch-openclaw.sh` Step 7)
+- [x] Create experiment in RHOAI MLflow workspace (declarative Helm hook Job, `charts/rhoai/mlflow/templates/openclaw-integration-experiment-job.yaml`)
+- [x] Update network policy: allow egress to `mlflow.redhat-ods-applications.svc:8443` (`policies/openclaw-sandbox.yaml`, `tls: skip`)
+- [x] Verify prompt-trace-linker.js works with RHOAI MLflow auth
+- [x] Remove standalone MLflow deployment entirely, all environments (Phase 12b)
+- [x] ADR-0014, ADR-0015 marked Superseded (MLflow half); ADR-0018 created with the full decision
+
+## Phase 12b: Remove Standalone MLflow
+
+**Status: COMPLETE** — Decision: [ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)
+
+Objective: once Phase 12 proved RHOAI MLflow works end-to-end, remove every reference to the standalone `ghcr.io/mlflow/mlflow` deployment — no code, docs, or scripts should suggest it ever existed as an active option, while preserving every mechanism that sends traces or references prompts.
+
+- [x] Delete `manifests/observability/mlflow.yaml[.tpl]`; strip MLflow deploy/config steps from `scripts/deploy-observability.sh` (now Tempo + OTel Collector only)
+- [x] `scripts/common.sh`: remove the `mlflow.yaml.tpl` render call
+- [x] `policies/openclaw-sandbox.yaml`: remove the old `mlflow_direct` (plain-HTTP) policy block; rename `rhoai_mlflow_direct` → `mlflow_direct`
+- [x] `config/openclaw.json[.tpl]`: point `trackingUri` at RHOAI's endpoint
+- [x] `scripts/seed-mlflow-prompts.sh`, `scripts/fetch-prompts-from-mlflow.sh`: add Bearer token + `X-MLFLOW-WORKSPACE` + CA auth support, default URL to RHOAI's endpoint
+- [x] `scripts/wire-rhoai-mlflow-tracing.sh`: drop "opt-in experiment" framing; call `seed-mlflow-prompts.sh` at the end (moved from the removed standalone deploy step)
+- [x] `scripts/crc-lifecycle.sh`: make `deploy-rhoai-mlflow.sh` + `wire-rhoai-mlflow-tracing.sh` unconditional steps in `cmd_deploy`/`cmd_full`
+- [x] `scripts/launch-openclaw.sh`: make RHOAI MLflow wiring unconditional (drop the `--rhoai-mlflow` flag)
+- [x] `scripts/test-tracing.sh`, `scripts/smoke-test-e2e.sh`, `scripts/verify.sh`: point all MLflow checks at RHOAI's Route/namespace with proper auth; drop SQLite-specific introspection (RHOAI's MLflow runs on Postgres, no local DB file to open)
+- [x] ADR-0014, ADR-0015 marked Superseded; ADR-0017 scope-decision section updated; ADR-0018 created
+- [x] `ROADMAP.md`: this section, plus closing out Phase 12 and marking 13.3 obsolete
+- [x] `docs/constraints.md`: constraint #4b marked Resolved with the real fix
+- [x] `docs/constraints.md`: constraint #12 and other standalone-MLflow-specific references reviewed; constraint #10 (deploy ordering) updated for the new mandatory RHOAI phases; new constraint #17 documents an unrelated live-testing finding (verify.sh's synthetic chatCompletions test is a pre-existing false-positive, not an RHOAI MLflow regression)
+- [x] `README.md` + skills (`deploy-full-aws`, `deploy-full-crc`, `crc-local-dev`, `monitor-deployment`) updated to remove standalone MLflow references; CRC sizing bumped to 16 vCPU/40 GiB (RHOAI-validated, `scripts/crc-lifecycle.sh`)
+- [x] `prompts/TOOLS.md` (and any other prompt file referencing the MLflow endpoint) updated
 
 ## Phase 13 (future): Security Hardening — Auth Simplification + MLflow Auth
 
@@ -375,7 +398,10 @@ Evaluate switching from `auth.mode: "trusted-proxy"` to `auth.mode: "token"` (th
 
 ### 13.3 Securize MLflow with basic-auth + sandbox read-only policy
 
-Remediates HIGH-3 (MLflow deployed without authentication):
+**Status: OBSOLETE — superseded by [Phase 12b](#phase-12b-remove-standalone-mlflow)/[ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md).** This item remediated HIGH-3 ("MLflow deployed without authentication") for the standalone `ghcr.io/mlflow/mlflow` deployment, which was removed entirely. RHOAI-managed MLflow (the sole backend now) was never unauthenticated to begin with — it requires a ServiceAccount Bearer token + `X-MLFLOW-WORKSPACE` header via `self_subject_access_review` RBAC from day one, so HIGH-3 no longer applies. No basic-auth work is needed or planned.
+
+<details>
+<summary>Original plan (kept for history, not actioned)</summary>
 
 - [ ] Add `--app-name basic-auth` to MLflow deployment manifest
 - [ ] Generate MLflow credentials and store in Kubernetes Secret
@@ -384,6 +410,8 @@ Remediates HIGH-3 (MLflow deployed without authentication):
 - [ ] Restrict sandbox policy `mlflow_direct` to read-only (only `GET`/`HEAD` methods from sandbox)
 - [ ] Update `seed-mlflow-prompts.sh` and `fetch-prompts-from-mlflow.sh` with basic-auth credentials
 - [ ] Add MLflow auth verification to `verify.sh`
+
+</details>
 
 ### 13.4 Review: plaintext MaaS API key on disk
 

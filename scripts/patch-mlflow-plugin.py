@@ -39,3 +39,46 @@ if 'definePluginEntry' in content:
     print('index.ts patched')
 else:
     print('index.ts already patched')
+
+# Backport of mlflow/mlflow#23927 for the pinned @mlflow/core@0.2.0 (see the
+# comment above this heredoc, and constraint #4b in docs/constraints.md).
+# createOssAuth()'s headersProvider builds Content-Type/Authorization but
+# never X-MLFLOW-WORKSPACE — RHOAI-managed MLflow (ADR-0017) rejects every
+# request without it once workspaces are enabled, even with valid auth.
+CORE_AUTH = '/sandbox/workspace/.openclaw/extensions/mlflow-openclaw/node_modules/@mlflow/core/dist/auth/index.js'
+with open(CORE_AUTH, 'r') as f:
+    content = f.read()
+if 'X-MLFLOW-WORKSPACE' in content:
+    print('@mlflow/core auth/index.js already patched')
+else:
+    old = """    const headersProvider = async () => {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authHeader) {
+            headers['Authorization'] = authHeader;
+        }
+        return headers;
+    };"""
+    new = """    const headersProvider = async () => {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authHeader) {
+            headers['Authorization'] = authHeader;
+        }
+        // Backport of mlflow/mlflow#23927 (upstream fix landed in
+        // @mlflow/core@0.3.0; this plugin is pinned to 0.2.0 — see
+        // docs/constraints.md #4b). Required by RHOAI-managed MLflow
+        // whenever workspaces are enabled (docs/adrs/ADR-0017-rhoai-mlflow-scope.md).
+        const workspace = options.workspace || process.env.MLFLOW_WORKSPACE;
+        if (workspace) {
+            headers['X-MLFLOW-WORKSPACE'] = workspace;
+        }
+        return headers;
+    };"""
+    if old not in content:
+        raise SystemExit(
+            '@mlflow/core auth/index.js: expected headersProvider block not found '
+            '(package version drift?) — refusing to patch blindly. Inspect ' + CORE_AUTH
+        )
+    content = content.replace(old, new)
+    with open(CORE_AUTH, 'w') as f:
+        f.write(content)
+    print('@mlflow/core auth/index.js patched (X-MLFLOW-WORKSPACE backport)')

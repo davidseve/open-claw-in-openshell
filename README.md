@@ -93,6 +93,10 @@ The OpenClaw gateway uses `auth.mode: trusted-proxy` instead of a static token. 
 
 ## Quick start
 
+The easiest way to run all of this in the right order is
+`./scripts/crc-lifecycle.sh full` (see `./scripts/crc-lifecycle.sh --help`).
+The individual steps it orchestrates, for reference or manual/partial runs:
+
 ```bash
 # 1. Prerequisites (namespace, Agent Sandbox operator, SCC, JWT secret)
 ./scripts/bootstrap-ocp.sh
@@ -100,23 +104,36 @@ The OpenClaw gateway uses `auth.mode: trusted-proxy` instead of a static token. 
 # 2. Secrets: copy template and set MAAS_API_KEY
 cp secrets/secrets.template.env secrets/secrets.env
 
-# 3. Deploy OpenShell gateway + Route + MaaS provider
+# 3. Deploy RHOAI operator + a minimal MLflow-only DataScienceCluster — the
+#    sole tracing/prompt-registry backend for this project (see
+#    docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md). MUST run before
+#    OpenShell (the mlflow-integration ClusterRole/namespace it wires RBAC to
+#    must already exist).
+./scripts/deploy-rhoai-mlflow.sh
+
+# 4. Deploy OpenShell gateway + Route + MaaS provider
 ./scripts/deploy-openshell.sh
 
-# 4. Keycloak OIDC + OCP federation (CLI/gRPC gateway auth only, see ADR-0016)
+# 5. Wire RHOAI MLflow tracing: RBAC, SA token, experiment, CA staging, and
+#    initial prompt seeding. MUST run after OpenShell (binds RBAC to the
+#    openshell-sandbox ServiceAccount it creates).
+./scripts/wire-rhoai-mlflow-tracing.sh
+
+# 6. Keycloak OIDC + OCP federation (CLI/gRPC gateway auth only, see ADR-0016)
 ./scripts/deploy-keycloak.sh
 ./scripts/configure-oidc.sh
 
-# 5. oauth-proxy for browser SSO (OpenShift-native OAuth, no Keycloak)
+# 7. oauth-proxy for browser SSO (OpenShift-native OAuth, no Keycloak)
 ./scripts/deploy-oauth2-proxy.sh
 
-# 6. Launch OpenClaw sandbox, policy, Control UI Route
+# 8. Launch OpenClaw sandbox, policy, Control UI Route
 ./scripts/launch-openclaw.sh
 
-# 7. Deploy observability stack (Tempo, OTel Collector, MLflow)
+# 9. Deploy infrastructure observability (Tempo, OTel Collector — logs/metrics
+#    only; agent traces go exclusively to RHOAI MLflow from step 3/5 above)
 ./scripts/deploy-observability.sh
 
-# 8. Verify everything (infra → gateway → sandbox → security → OIDC → observability → UI)
+# 10. Verify everything (infra → gateway → sandbox → security → OIDC → RHOAI MLflow → observability → UI)
 ./scripts/verify.sh
 ```
 
@@ -133,13 +150,25 @@ Teardown: `./scripts/teardown.sh`
 The same scripts work on CRC. The `APPS_DOMAIN` is auto-detected (`apps-crc.testing` for CRC, configurable for AWS). All templates are rendered via `__APPS_DOMAIN__` placeholders.
 
 ```bash
-# Start CRC with enough resources
-crc start -c 6 -m 16384 -d 60
+# Start CRC with enough resources — RHOAI (mandatory, ADR-0018) needs more
+# than the pre-RHOAI baseline; 16 vCPU / 40 GiB is what's been empirically
+# validated to fit the full stack, see docs/adrs/ADR-0017-rhoai-mlflow-scope.md
+crc config set cpus 16
+crc config set memory 40960
+crc config set disk-size 100
+crc start
 eval $(crc oc-env)
 oc login -u kubeadmin -p $(crc console --credentials | grep kubeadmin | awk -F"'" '{print $2}')
 
-# Then follow the same quick start steps above
+# Then follow the same quick start steps above (or just run
+# ./scripts/crc-lifecycle.sh full)
 ```
+
+**Resource note (CRC only)**: running RHOAI+MLflow together with the rest of
+the OpenClaw-in-OpenShell stack on a shared dev laptop can drop host-available
+memory to ~11 GiB and engage swap — functionally fine (no crashes/evictions
+observed), but tight. This is an accepted trade-off, not a bug — see
+[ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)'s "Consequences".
 
 ## Browser access
 
@@ -160,9 +189,10 @@ the only Kubernetes-level entry point onto the Control UI.
 | Path | Purpose |
 |------|---------|
 | `charts/openshell/values-ocp.yaml.tpl` | Helm overrides template (OIDC, PKI SANs, no GPU) |
-| `config/openclaw.json.tpl` | OpenClaw config template (trusted-proxy auth, MaaS provider) |
-| `policies/openclaw-sandbox.yaml` | Sandbox FS + network policy (MaaS allow) |
-| `manifests/` | Routes, Keycloak (CLI/gRPC OIDC only), oauth-proxy (browser OAuth), observability, Agent Sandbox pin |
+| `charts/rhoai/` | RHOAI operator + minimal MLflow-only DataScienceCluster — sole tracing/prompt-registry backend ([ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)) |
+| `config/openclaw.json.tpl` | OpenClaw config template (trusted-proxy auth, MaaS provider, RHOAI MLflow tracing) |
+| `policies/openclaw-sandbox.yaml` | Sandbox FS + network policy (MaaS allow, RHOAI MLflow `tls: skip`) |
+| `manifests/` | Routes, Keycloak (CLI/gRPC OIDC only), oauth-proxy (browser OAuth), infra observability (Tempo/OTel), Agent Sandbox pin |
 | `scripts/` | Bootstrap → deploy → launch → verify → teardown |
 | `tests/` | Playwright E2E tests (UI + sandbox security) with OIDC auth |
 | `docs/adrs/` | Architecture Decision Records |

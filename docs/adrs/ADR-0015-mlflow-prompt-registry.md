@@ -1,7 +1,15 @@
 # ADR-0015: System Prompts via MLflow Prompt Registry
 
 ## Status
-Accepted
+**Backend superseded by [ADR-0018](ADR-0018-rhoai-mlflow-sole-backend.md)**:
+the standalone MLflow deployment this ADR was written against (`observability`
+namespace, plain HTTP, no auth) was fully removed and replaced by
+RHOAI-managed MLflow. The mechanism/design described below — Prompt Registry
+API, `@production` alias, versioned fetch into the sandbox, read-only
+lockdown, trace-tag linking — is **unchanged and still Accepted**; only the
+tracking URI and the addition of Bearer token + `X-MLFLOW-WORKSPACE` auth
+changed (see `scripts/seed-mlflow-prompts.sh` / `scripts/fetch-prompts-from-mlflow.sh`). Kept as-is below for historical record of the original design
+rationale — do not edit the content past this point.
 
 ## Context
 

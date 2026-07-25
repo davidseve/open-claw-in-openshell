@@ -75,9 +75,43 @@
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
+# ─── RHOAI MLflow wiring (mandatory) ─────────────────────────────────────────
+# Points the mlflow-openclaw plugin's tracing transport at RHOAI-managed
+# MLflow (charts/rhoai/) — the sole tracing backend for this project (see
+# docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md; the standalone
+# ghcr.io/mlflow/mlflow deployment this used to be optional against was
+# removed entirely). Requires scripts/wire-rhoai-mlflow-tracing.sh to have
+# already run successfully (RBAC, SA token, experiment, CA all staged in
+# .rendered/rhoai-mlflow/). Declarative in the sense that the plugin config
+# and gateway env vars are set once at initial sandbox launch, from files on
+# disk — no live hot-patch of a running sandbox afterwards.
 check_openshell_cli
 detect_environment
 render_all_templates
+
+step "Loading RHOAI MLflow wiring facts"
+RHOAI_WIRING="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
+if [[ ! -f "$RHOAI_WIRING" ]]; then
+  error "RHOAI wiring facts not found: ${RHOAI_WIRING}"
+  error "Run ./scripts/deploy-rhoai-mlflow.sh then ./scripts/wire-rhoai-mlflow-tracing.sh first."
+  exit 1
+fi
+set -a
+source "$RHOAI_WIRING"
+set +a
+python3 -c "
+import json
+path = '${RENDERED_DIR}/openclaw.json'
+with open(path) as f:
+    d = json.load(f)
+cfg = d['plugins']['entries']['mlflow-openclaw']['config']
+cfg['trackingUri'] = '${RHOAI_MLFLOW_TRACKING_URI}'
+cfg['experimentId'] = '${RHOAI_MLFLOW_EXPERIMENT_ID}'
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+print('mlflow-openclaw config patched: trackingUri=${RHOAI_MLFLOW_TRACKING_URI} experimentId=${RHOAI_MLFLOW_EXPERIMENT_ID}')
+"
+pass "Rendered openclaw.json now points at RHOAI MLflow (workspace=${RHOAI_MLFLOW_WORKSPACE})"
 
 # ─── Step 1: Create sandbox ─────────────────────────────────────────────────
 # The sandbox runs the OpenClaw gateway inside OpenShell's isolated container.
@@ -162,10 +196,48 @@ SANDBOX_GID=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- id -g sandbox 
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- chown -R "${SANDBOX_UID}:${SANDBOX_GID}" /sandbox/workspace
 info "Config at /sandbox/workspace/.openclaw/openclaw.json"
 
+# RHOAI MLflow mode: stage the openshift-service-ca.crt bundle inside the
+# sandbox workspace so the mlflow-openclaw plugin's Node process (not the
+# proxy — see `tls: skip` in policies/openclaw-sandbox.yaml) can validate
+# RHOAI MLflow's service-ca-signed certificate during its own TLS handshake.
+#
+# Validated live (2026-07-25, see docs/adrs/ADR-0017-rhoai-mlflow-scope.md):
+# a plain CA file with only RHOAI's service-ca is not enough for the gateway
+# process specifically, because OpenShell's own sandbox runtime ALSO sets
+# NODE_EXTRA_CA_CERTS on that process (pointing at
+# /etc/openshell-tls/openshell-ca.pem — the CA that signs the sandbox proxy's
+# own MITM certs for every endpoint that ISN'T tls:skip, e.g. maas_inference).
+# NODE_EXTRA_CA_CERTS is a single-value env var: overwriting it with only the
+# RHOAI CA (as an earlier attempt in this file did) makes Node stop trusting
+# the proxy's MITM cert, which breaks the MaaS provider's own HTTPS call in
+# the SAME process (`Proxy response (403) !== 200 when HTTP Tunneling`).
+# Fix: concatenate OpenShell's own openshell-ca.pem with RHOAI's
+# service-ca.crt into one PEM bundle (NODE_EXTRA_CA_CERTS accepts multiple
+# concatenated certs) and point NODE_EXTRA_CA_CERTS at the union instead of
+# replacing it — confirmed live to keep both MaaS chat and the RHOAI MLflow
+# TLS handshake working from the same gateway process.
+RHOAI_MLFLOW_SANDBOX_CA="/sandbox/workspace/.rhoai-mlflow-ca.crt"
+RHOAI_MLFLOW_COMBINED_CA="/sandbox/workspace/.combined-ca-bundle.pem"
+step "Staging RHOAI MLflow CA bundle in sandbox workspace"
+oc -n "$NAMESPACE" cp "${RHOAI_MLFLOW_CA_FILE}" \
+  "${SANDBOX_NAME}:${RHOAI_MLFLOW_SANDBOX_CA}" -c agent
+oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- \
+  chown "${SANDBOX_UID}:${SANDBOX_GID}" "$RHOAI_MLFLOW_SANDBOX_CA"
+info "CA bundle staged at ${RHOAI_MLFLOW_SANDBOX_CA}"
+
+step "Building combined CA bundle (OpenShell proxy CA + RHOAI service-ca)"
+oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c "
+  cat /etc/openshell-tls/openshell-ca.pem ${RHOAI_MLFLOW_SANDBOX_CA} > ${RHOAI_MLFLOW_COMBINED_CA}
+  chown ${SANDBOX_UID}:${SANDBOX_GID} ${RHOAI_MLFLOW_COMBINED_CA}
+"
+info "Combined bundle staged at ${RHOAI_MLFLOW_COMBINED_CA}"
+
 # ─── Step 4: Fetch system prompts from MLflow ────────────────────────────────
 # Prompts are versioned in MLflow Prompt Registry. fetch-prompts-from-mlflow.sh
 # downloads them with @production alias, writes .prompt-versions.json manifest,
 # and the files are then locked (root-owned, chmod 444) so the agent can't modify them.
+# RHOAI MLflow requires Bearer token + X-MLFLOW-WORKSPACE + CA validation on
+# every request (same as the plugin/linker — see docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md); passed through as env vars the script reads.
 step "Fetching system prompts from MLflow Prompt Registry"
 oc -n "$NAMESPACE" cp "${PROJECT_DIR}/scripts/fetch-prompts-from-mlflow.sh" \
   "${SANDBOX_NAME}:/tmp/fetch-prompts-from-mlflow.sh" -c agent 2>/dev/null || true
@@ -174,7 +246,7 @@ oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- chmod +x /tmp/fetch-prompts-
 MLFLOW_EXP_ID=$(python3 -c "import json; d=json.load(open('${RENDERED_DIR}/openclaw.json')); print(d.get('plugins',{}).get('entries',{}).get('mlflow-openclaw',{}).get('config',{}).get('experimentId','0'))" 2>/dev/null || echo "0")
 
 FETCH_OUTPUT=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- \
-  bash -c "MLFLOW_EXPERIMENT_ID=${MLFLOW_EXP_ID} /tmp/fetch-prompts-from-mlflow.sh" 2>&1 || true)
+  bash -c "MLFLOW_URL='${RHOAI_MLFLOW_TRACKING_URI}' MLFLOW_EXPERIMENT_ID=${MLFLOW_EXP_ID} MLFLOW_TRACKING_TOKEN='${RHOAI_MLFLOW_SA_TOKEN}' MLFLOW_WORKSPACE='${RHOAI_MLFLOW_WORKSPACE}' MLFLOW_TRACKING_SERVER_CERT_PATH='${RHOAI_MLFLOW_SANDBOX_CA}' /tmp/fetch-prompts-from-mlflow.sh" 2>&1 || true)
 echo "$FETCH_OUTPUT" | while IFS= read -r line; do info "$line"; done
 
 FETCHED_COUNT=$(echo "$FETCH_OUTPUT" | grep -c "^\[OK\]" || true)
@@ -237,9 +309,17 @@ fi
 
 # ─── Step 7: Patch plugin for OpenClaw 2026.7.1 compatibility ────────────────
 # @mlflow/mlflow-openclaw@0.2.0-rc.0 was built for a newer OpenClaw SDK.
-# Two incompatibilities must be patched (see constraint #5):
-#   1. service.ts imports diagnostics-otel → replaced with no-op
-#   2. index.ts uses definePluginEntry() → replaced with plain object export
+# Three incompatibilities/gaps must be patched:
+#   1. service.ts imports diagnostics-otel → replaced with no-op (constraint #5)
+#   2. index.ts uses definePluginEntry() → replaced with plain object export (constraint #5)
+#   3. @mlflow/core@0.2.0's createOssAuth() never sends X-MLFLOW-WORKSPACE →
+#      backported from the real fix (mlflow/mlflow#23927, landed upstream in
+#      @mlflow/core@0.3.0) directly onto the installed 0.2.0 dist file
+#      (constraint #4b). An npm `overrides` bump to 0.3.0 was tried first and
+#      rejected by an OpenShell sandbox policy (`403 policy_denied` on that
+#      specific registry fetch, not root-caused — constraint #4e); patching
+#      the already-installed file sidesteps the registry entirely, same
+#      category of fix as #1/#2 above.
 # The patch script is idempotent (checks before patching).
 step "Patching mlflow-openclaw plugin for compatibility"
 PATCH_SCRIPT="${PROJECT_DIR}/scripts/patch-mlflow-plugin.py"
@@ -285,6 +365,49 @@ if 'definePluginEntry' in content:
     print('index.ts patched')
 else:
     print('index.ts already patched')
+
+# Backport of mlflow/mlflow#23927 for the pinned @mlflow/core@0.2.0 (see the
+# comment above this heredoc, and constraint #4b in docs/constraints.md).
+# createOssAuth()'s headersProvider builds Content-Type/Authorization but
+# never X-MLFLOW-WORKSPACE — RHOAI-managed MLflow (ADR-0017) rejects every
+# request without it once workspaces are enabled, even with valid auth.
+CORE_AUTH = '/sandbox/workspace/.openclaw/extensions/mlflow-openclaw/node_modules/@mlflow/core/dist/auth/index.js'
+with open(CORE_AUTH, 'r') as f:
+    content = f.read()
+if 'X-MLFLOW-WORKSPACE' in content:
+    print('@mlflow/core auth/index.js already patched')
+else:
+    old = """    const headersProvider = async () => {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authHeader) {
+            headers['Authorization'] = authHeader;
+        }
+        return headers;
+    };"""
+    new = """    const headersProvider = async () => {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authHeader) {
+            headers['Authorization'] = authHeader;
+        }
+        // Backport of mlflow/mlflow#23927 (upstream fix landed in
+        // @mlflow/core@0.3.0; this plugin is pinned to 0.2.0 — see
+        // docs/constraints.md #4b). Required by RHOAI-managed MLflow
+        // whenever workspaces are enabled (docs/adrs/ADR-0017-rhoai-mlflow-scope.md).
+        const workspace = options.workspace || process.env.MLFLOW_WORKSPACE;
+        if (workspace) {
+            headers['X-MLFLOW-WORKSPACE'] = workspace;
+        }
+        return headers;
+    };"""
+    if old not in content:
+        raise SystemExit(
+            '@mlflow/core auth/index.js: expected headersProvider block not found '
+            '(package version drift?) — refusing to patch blindly. Inspect ' + CORE_AUTH
+        )
+    content = content.replace(old, new)
+    with open(CORE_AUTH, 'w') as f:
+        f.write(content)
+    print('@mlflow/core auth/index.js patched (X-MLFLOW-WORKSPACE backport)')
 PYEOF
 
 oc -n "$NAMESPACE" cp "$PATCH_SCRIPT" "${SANDBOX_NAME}:/tmp/patch-mlflow-plugin.py" -c agent
@@ -361,11 +484,43 @@ echo "CLEANUP_DONE"
 ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 
 # Step 9b: Start gateway (openshell sandbox exec --no-tty = sandbox namespace)
+# RHOAI MLflow needs the Bearer token / workspace header / CA path the
+# mlflow-openclaw plugin's transport requires (see constraint list at top of
+# this file and docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md). These are
+# set at initial gateway start, not hot-patched into a running process
+# afterwards.
+#
+# NODE_EXTRA_CA_CERTS points at the COMBINED bundle built above (OpenShell's
+# own proxy CA + RHOAI's service-ca), not just RHOAI's alone — see the
+# comment above RHOAI_MLFLOW_COMBINED_CA for why the combined form is
+# required (validated live 2026-07-25). MLFLOW_TRACKING_SERVER_CERT_PATH is
+# passed too for the exporters that DO read it (none currently in
+# @mlflow/core@0.2.0 — kept for forward compat and parity with the linker's
+# env below, harmless no-op either way).
+RHOAI_MLFLOW_GW_ENV=(
+  --env "MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}"
+  --env "MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}"
+  --env "NODE_EXTRA_CA_CERTS=${RHOAI_MLFLOW_COMBINED_CA}"
+  --env "MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}"
+)
+# The prompt-trace-linker sidecar reaches RHOAI MLflow via /usr/bin/curl
+# (constraint #8), not Node fetch — curl's --cacert has no effect on the
+# gateway's MaaS calls, so this side of the wiring is NOT subject to the
+# limitation above. prompt-trace-linker.js sends Authorization/
+# X-MLFLOW-WORKSPACE headers and --cacert whenever these env vars are present.
+LINKER_MLFLOW_URL="${RHOAI_MLFLOW_TRACKING_URI}"
+RHOAI_MLFLOW_LINKER_ENV=(
+  --env "MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}"
+  --env "MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}"
+  --env "MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}"
+)
+
 openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 25 \
   --env HOME=/sandbox/workspace \
   --env OTEL_TRACES_EXPORTER=none \
   --env OTEL_LOGS_EXPORTER=none \
   --env OTEL_METRICS_EXPORTER=none \
+  "${RHOAI_MLFLOW_GW_ENV[@]}" \
   -- bash -c '
     nohup openclaw gateway run > /sandbox/workspace/openclaw.log 2>&1 &
     disown
@@ -377,8 +532,9 @@ openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 25 \
 # Step 9c: Start trace linker (openshell sandbox exec --no-tty = sandbox namespace)
 openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 15 \
   --env MLFLOW_EXPERIMENT_ID="${MLFLOW_EXP_ID}" \
-  --env MLFLOW_URL=http://mlflow.observability.svc:5000 \
+  --env MLFLOW_URL="${LINKER_MLFLOW_URL}" \
   --env OPENCLAW_WORKSPACE_DIR=/sandbox/workspace \
+  "${RHOAI_MLFLOW_LINKER_ENV[@]}" \
   -- bash -c '
     nohup node /tmp/prompt-trace-linker.js > /sandbox/workspace/linker.log 2>&1 &
     disown
@@ -427,15 +583,18 @@ openshell service expose "$SANDBOX_NAME" 18789 openclaw-ui 2>/dev/null \
   || info "Service may already be exposed"
 
 # ─── Summary ────────────────────────────────────────────────────────────────
+RHOAI_MLFLOW_ROUTE=$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
 step "OpenClaw launch complete"
 echo ""
 info "Control UI (via oauth-proxy): https://openclaw-gw--openclaw-ui.${APPS_DOMAIN}/"
 info "  Login: any OCP cluster identity (OpenShift-native OAuth, ADR-0016)"
 echo ""
 info "Observability:"
-info "  - mlflow-openclaw plugin: traces → MLflow experiment ${MLFLOW_EXP_ID}"
+info "  - mlflow-openclaw plugin: traces → RHOAI MLflow, workspace '${RHOAI_MLFLOW_WORKSPACE}', experiment ${MLFLOW_EXP_ID}"
 info "  - prompt-trace-linker: tags traces with prompt versions (via curl)"
-info "  - MLflow UI: https://mlflow-observability.${APPS_DOMAIN}/"
+if [[ -n "$RHOAI_MLFLOW_ROUTE" ]]; then
+  info "  - MLflow UI: https://${RHOAI_MLFLOW_ROUTE}/ (Bearer token required for API; UI login per RHOAI's own auth)"
+fi
 echo ""
 info "System prompts: MLflow Prompt Registry (@production alias)"
 info "Security: trusted-proxy auth, tools.deny, Landlock, read-only prompts"

@@ -114,6 +114,19 @@ detect_environment() {
   if [[ "$CRC_MODE" == "true" ]]; then
     info "CRC mode active (single-node local cluster)"
     CURL_OPTS="-k"
+    # CRC's router uses a self-signed wildcard cert (*.apps-crc.testing,
+    # issued by ingress-operator) that isn't in the system CA trust store —
+    # `crc setup` only trusts the API server's CA, not the router's. Without
+    # this, the openshell CLI's own HTTPS client (used for OIDC token
+    # refresh against Keycloak once configure-oidc.sh switches auth_mode to
+    # "oidc") fails with a generic "error sending request for url", silently
+    # falls back to the (already-expired) access token, and every
+    # subsequent `openshell` command fails with "invalid token:
+    # ExpiredSignature" — surfacing downstream as misleading "sandbox not
+    # found" / "unexpected identity" failures in verify.sh/smoke tests, even
+    # though the sandbox is still Ready. Found live during a fresh
+    # `crc-lifecycle.sh full --fresh` run. Not needed on AWS OCP (real certs).
+    export OPENSHELL_GATEWAY_INSECURE=true
   fi
   export CURL_OPTS
 }
@@ -181,9 +194,6 @@ render_all_templates() {
   render_template \
     "${PROJECT_DIR}/manifests/oauth2-proxy/deployment.yaml.tpl" \
     "${RENDERED_DIR}/oauth2-proxy/deployment.yaml"
-  render_template \
-    "${PROJECT_DIR}/manifests/observability/mlflow.yaml.tpl" \
-    "${RENDERED_DIR}/observability/mlflow.yaml"
   info "Templates rendered to ${RENDERED_DIR}/ (APPS_DOMAIN=${APPS_DOMAIN})"
 }
 

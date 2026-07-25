@@ -38,7 +38,7 @@
       "mlflow-openclaw": {
         "enabled": true,
         "config": {
-          "trackingUri": "http://mlflow.observability.svc:5000",
+          "trackingUri": "https://mlflow.redhat-ods-applications.svc:8443",
           "experimentId": "0"
         },
         "hooks": {

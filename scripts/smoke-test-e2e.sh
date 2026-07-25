@@ -3,7 +3,12 @@
 # then verify that exactly one trace is created in MLflow with prompt tags.
 #
 # Designed to run from the host after full deployment.
-# Requires: openshell CLI authenticated, MLflow route accessible.
+# Requires: openshell CLI authenticated, RHOAI MLflow route accessible.
+#
+# RHOAI-managed MLflow is the sole tracing/prompt-registry backend for this
+# project (docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md) — every request
+# needs a Bearer token + X-MLFLOW-WORKSPACE header, sourced from
+# scripts/wire-rhoai-mlflow-tracing.sh's output (.rendered/rhoai-mlflow/wiring.env).
 #
 # Usage:
 #   ./scripts/smoke-test-e2e.sh
@@ -17,14 +22,23 @@ source "$(dirname "$0")/common.sh"
 detect_environment
 
 SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw}"
-OBS_NAMESPACE="${OBS_NAMESPACE:-observability}"
-MLFLOW_HOST=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+RHOAI_NS="redhat-ods-applications"
+MLFLOW_HOST=$(oc get route mlflow -n "$RHOAI_NS" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
 MLFLOW_EXT_URL="https://${MLFLOW_HOST}"
 
 if [[ -z "$MLFLOW_HOST" ]]; then
-  error "MLflow route not found in namespace $OBS_NAMESPACE"
+  error "MLflow route not found in namespace $RHOAI_NS — run scripts/deploy-rhoai-mlflow.sh first"
   exit 1
 fi
+
+RHOAI_WIRING="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
+if [[ ! -f "$RHOAI_WIRING" ]]; then
+  error "RHOAI wiring facts not found: ${RHOAI_WIRING} — run scripts/wire-rhoai-mlflow-tracing.sh first"
+  exit 1
+fi
+set -a; source "$RHOAI_WIRING"; set +a
+AUTH_HEADERS=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
+EXP_ID="${RHOAI_MLFLOW_EXPERIMENT_ID}"
 
 if ! command -v openshell &>/dev/null; then
   error "openshell CLI not found"
@@ -33,8 +47,8 @@ fi
 
 step "Smoke Test E2E: send message and verify trace"
 
-TRACE_COUNT_BEFORE=$(curl -sf $CURL_OPTS \
-  "${MLFLOW_EXT_URL}/api/2.0/mlflow/traces?experiment_ids=0&max_results=200" 2>/dev/null \
+TRACE_COUNT_BEFORE=$(curl -sf $CURL_OPTS "${AUTH_HEADERS[@]}" \
+  "${MLFLOW_EXT_URL}/api/2.0/mlflow/traces?experiment_ids=${EXP_ID}&max_results=200" 2>/dev/null \
   | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('traces',[])))" 2>/dev/null || echo "0")
 info "Traces before test: $TRACE_COUNT_BEFORE"
 
@@ -64,8 +78,8 @@ fi
 
 step "Checking for new traces in MLflow"
 
-TRACES_AFTER=$(curl -sf $CURL_OPTS \
-  "${MLFLOW_EXT_URL}/api/2.0/mlflow/traces?experiment_ids=0&max_results=200" 2>/dev/null || echo "")
+TRACES_AFTER=$(curl -sf $CURL_OPTS "${AUTH_HEADERS[@]}" \
+  "${MLFLOW_EXT_URL}/api/2.0/mlflow/traces?experiment_ids=${EXP_ID}&max_results=200" 2>/dev/null || echo "")
 
 if [[ -z "$TRACES_AFTER" ]]; then
   fail "Could not query MLflow traces API"

@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
-# Phase 8: Deploy observability stack for agent tracing.
+# Phase 8: Deploy the infrastructure-observability stack (Tempo + OTel
+# Collector) — logs and metrics only, no traces (see ADR-0014 Problem 8 /
+# OTEL_TRACES_EXPORTER=none: agent traces have always gone exclusively
+# through the mlflow-openclaw plugin, never through this pipeline).
 #
 # Components (standalone, no operator dependency):
-#   - Grafana Tempo (trace storage, local backend)
+#   - Grafana Tempo (trace storage, local backend — kept for potential future
+#     infrastructure-level tracing; currently receives no traffic since
+#     OTEL_TRACES_EXPORTER=none)
 #   - OpenTelemetry Collector (OTLP receiver → Tempo + spanmetrics)
-#   - MLflow Tracking Server (SQLite + PVC)
+#
+# Agent traces (rich AGENT/LLM hierarchy, full I/O) go to RHOAI-managed
+# MLflow instead — see scripts/deploy-rhoai-mlflow.sh,
+# scripts/wire-rhoai-mlflow-tracing.sh, and
+# docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md. The standalone
+# ghcr.io/mlflow/mlflow deployment this script used to provision here was
+# removed entirely (no plain-HTTP, no-auth fallback left in this project).
 #
 # Prerequisites:
 #   - OCP cluster access
@@ -41,89 +52,7 @@ oc -n "$OBS_NAMESPACE" rollout status deployment/otel-collector --timeout=120s 2
   && pass "OTel Collector deployment ready" \
   || fail "OTel Collector deployment not ready"
 
-# ── Step 4: Deploy MLflow ─────────────────────────────────────────────────────
-
-step "Deploying MLflow Tracking Server"
-oc apply -f "${RENDERED_DIR}/observability/mlflow.yaml"
-
-oc -n "$OBS_NAMESPACE" rollout status deployment/mlflow --timeout=120s 2>/dev/null \
-  && pass "MLflow deployment ready" \
-  || fail "MLflow deployment not ready"
-
-# ── Step 4b: Create MLflow experiment for agent traces ────────────────────
-
-step "Creating MLflow experiment for agent traces"
-
-MLFLOW_INTERNAL="http://mlflow.${OBS_NAMESPACE}.svc:5000"
-
-retries=0
-while [[ $retries -lt 10 ]]; do
-  EXP_RESP=$(oc -n "$OBS_NAMESPACE" exec deployment/mlflow -- \
-    python3 -c "
-import urllib.request, urllib.error, json
-try:
-    req = urllib.request.Request('http://localhost:5000/api/2.0/mlflow/experiments/get-by-name?experiment_name=openclaw-agent-traces')
-    with urllib.request.urlopen(req, timeout=5) as r:
-        data = json.loads(r.read())
-        print('EXISTS:' + data['experiment']['experiment_id'])
-except urllib.error.HTTPError:
-    req = urllib.request.Request('http://localhost:5000/api/2.0/mlflow/experiments/create',
-        data=json.dumps({'name': 'openclaw-agent-traces'}).encode(),
-        headers={'Content-Type': 'application/json'}, method='POST')
-    with urllib.request.urlopen(req, timeout=5) as r:
-        data = json.loads(r.read())
-        print('CREATED:' + data['experiment_id'])
-except Exception as e:
-    print('ERROR:' + str(e))
-" 2>/dev/null || echo "ERROR:exec-failed")
-
-  if echo "$EXP_RESP" | grep -qE "EXISTS:|CREATED:"; then
-    EXP_ID=$(echo "$EXP_RESP" | grep -oE "(EXISTS|CREATED):[0-9]+" | cut -d: -f2)
-    pass "MLflow experiment 'openclaw-agent-traces' ready (id=${EXP_ID})"
-    break
-  fi
-  sleep 3
-  retries=$((retries + 1))
-done
-
-if [[ $retries -ge 10 ]]; then
-  warn "Could not create MLflow experiment, using default (id=0)"
-  EXP_ID="0"
-fi
-
-# ── Step 4b2: Fix artifact URI scheme (constraint #12) ───────────────────────
-# MLflow's JS client (@mlflow/core) requires mlflow-artifacts:// URIs to upload
-# trace data (span hierarchy, tool calls). Without --serve-artifacts and the
-# correct URI scheme, traces appear in the UI with only raw JSON input/output
-# and no span timeline. See docs/constraints.md #12.
-
-step "Ensuring MLflow artifact URI scheme (mlflow-artifacts:/)"
-oc -n "$OBS_NAMESPACE" exec deployment/mlflow -- python3 -c "
-import sqlite3
-conn = sqlite3.connect('/mlflow/mlflow.db')
-c = conn.cursor()
-c.execute(\"\"\"UPDATE experiments SET artifact_location = 'mlflow-artifacts:/' || experiment_id
-              WHERE artifact_location LIKE '/mlflow/artifacts/%'\"\"\")
-exp_fixed = c.rowcount
-c.execute(\"\"\"UPDATE trace_tags
-              SET value = REPLACE(value, '/mlflow/artifacts/', 'mlflow-artifacts:/')
-              WHERE key = 'mlflow.artifactLocation' AND value LIKE '/mlflow/artifacts/%'\"\"\")
-tag_fixed = c.rowcount
-conn.commit()
-conn.close()
-print(f'experiments={exp_fixed} traces={tag_fixed}')
-" 2>/dev/null && pass "Artifact URI scheme verified" \
-  || warn "Could not verify artifact URI scheme (non-blocking)"
-
-# ── Step 4c: Seed system prompts into MLflow Prompt Registry ─────────────────
-
-step "Seeding system prompts into MLflow Prompt Registry"
-MLFLOW_ROUTE=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
-MLFLOW_URL="https://${MLFLOW_ROUTE}" "${PROJECT_DIR}/scripts/seed-mlflow-prompts.sh" \
-  && pass "System prompts seeded into MLflow" \
-  || warn "Could not seed prompts (MLflow may not be fully ready; run scripts/seed-mlflow-prompts.sh manually)"
-
-# ── Step 5: Update sandbox network policy ─────────────────────────────────────
+# ── Step 4: Verify sandbox network policy ─────────────────────────────────────
 
 step "Checking sandbox network policy for observability endpoints"
 
@@ -134,27 +63,7 @@ else
   warn "Network policy does not include observability endpoints — update policies/openclaw-sandbox.yaml"
 fi
 
-# ── Step 6: Configure OpenClaw for tracing ────────────────────────────────────
-
-step "Configuring sandbox with OTEL environment variables"
-
-COLLECTOR_SVC="otel-collector.${OBS_NAMESPACE}.svc"
-MLFLOW_SVC="mlflow.${OBS_NAMESPACE}.svc"
-
-export OPENSHELL_GATEWAY_INSECURE=true
-printf 'cat > /sandbox/workspace/.env << '"'"'EOF'"'"'
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://'"${COLLECTOR_SVC}"':4318
-export OTEL_SERVICE_NAME=openclaw-agent
-export OTEL_TRACES_EXPORTER=otlp
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export MLFLOW_TRACKING_URI=http://'"${MLFLOW_SVC}"':5000
-EOF
-exit
-' | timeout 15 openshell sandbox connect openclaw-gw 2>&1 | grep -v "WARN\|TLS" || true
-
-pass "OTEL env vars written to sandbox workspace"
-
-# ── Step 7: Verify pipeline ───────────────────────────────────────────────────
+# ── Step 5: Verify pipeline ───────────────────────────────────────────────────
 
 step "Verifying trace pipeline (send test trace)"
 
@@ -192,14 +101,12 @@ fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
-MLFLOW_ROUTE=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
-
 step "Phase 8 deployment complete"
 echo ""
 info "Components:"
 info "  Tempo:          tempo.${OBS_NAMESPACE}.svc:3200 (query), :4317 (OTLP gRPC)"
 info "  OTel Collector: otel-collector.${OBS_NAMESPACE}.svc:4317 (gRPC), :4318 (HTTP)"
-info "  MLflow:         https://${MLFLOW_ROUTE}"
+info "  Agent traces:   RHOAI MLflow (run scripts/deploy-rhoai-mlflow.sh + scripts/wire-rhoai-mlflow-tracing.sh — see crc-lifecycle.sh, wired in automatically)"
 echo ""
 info "Query traces:"
 info "  oc -n ${OBS_NAMESPACE} exec deployment/tempo -- wget -qO- 'http://localhost:3200/api/search?limit=5'"

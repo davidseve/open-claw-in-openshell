@@ -165,11 +165,26 @@ else
   warn "Trace contains ${SPAN_COUNT} spans (expected 4)"
 fi
 
-# Check MLflow
-step "Verifying MLflow accessibility"
-MLFLOW_HOST=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null)
-MLFLOW_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://${MLFLOW_HOST}/health" 2>/dev/null || echo "000")
+# Check RHOAI MLflow (sole tracing/prompt-registry backend — see
+# docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md). Requires a Bearer token +
+# X-MLFLOW-WORKSPACE header (workspaces are always enabled on RHOAI's MLflow
+# operator), sourced from scripts/wire-rhoai-mlflow-tracing.sh's output.
+step "Verifying RHOAI MLflow accessibility"
+MLFLOW_HOST=$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null)
+RHOAI_WIRING="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
+AUTH_HEADERS=()
+if [[ -f "$RHOAI_WIRING" ]]; then
+  set -a; source "$RHOAI_WIRING"; set +a
+  AUTH_HEADERS=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
+else
+  warn "RHOAI wiring facts not found (${RHOAI_WIRING}) — MLflow checks below will likely 400/401. Run scripts/wire-rhoai-mlflow-tracing.sh first."
+fi
 
+# RHOAI-managed MLflow doesn't expose the bare, unauthenticated `/health`
+# path the old standalone deployment had (confirmed live: 404 with or
+# without auth) — use a real, authenticated API call as the health signal.
+MLFLOW_CODE=$(curl -sk "${AUTH_HEADERS[@]}" -o /dev/null -w '%{http_code}' \
+  "https://${MLFLOW_HOST}/api/2.0/mlflow/experiments/get-by-name?experiment_name=openclaw-tracing" 2>/dev/null || echo "000")
 if [[ "$MLFLOW_CODE" == "200" ]]; then
   pass "MLflow health OK at https://${MLFLOW_HOST}"
 else
@@ -177,7 +192,7 @@ else
 fi
 
 # Check MLflow experiments API
-EXPERIMENTS_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://${MLFLOW_HOST}/api/2.0/mlflow/experiments/search?max_results=1" 2>/dev/null || echo "000")
+EXPERIMENTS_CODE=$(curl -sk "${AUTH_HEADERS[@]}" -o /dev/null -w '%{http_code}' "https://${MLFLOW_HOST}/api/2.0/mlflow/experiments/search?max_results=1" 2>/dev/null || echo "000")
 if [[ "$EXPERIMENTS_CODE" == "200" ]]; then
   pass "MLflow API accessible (experiments endpoint)"
 else

@@ -31,9 +31,9 @@ This runs: `setup` -> `deploy` -> `verify` in sequence.
 ## Commands
 
 ```bash
-./scripts/crc-lifecycle.sh setup       # Configure CRC (12 vCPU, 24 GB RAM, 80 GB disk), run preflight, start VM, login
+./scripts/crc-lifecycle.sh setup       # Configure CRC (16 vCPU, 40 GB RAM, 100 GB disk — sized for RHOAI+MLflow, see ADR-0017/ADR-0018), run preflight, start VM, login
 ./scripts/crc-lifecycle.sh start       # Start existing CRC VM + oc login
-./scripts/crc-lifecycle.sh deploy      # Deploy full stack: bootstrap + openshell + openclaw
+./scripts/crc-lifecycle.sh deploy      # Deploy full stack: bootstrap + RHOAI/MLflow + openshell + openclaw
 ./scripts/crc-lifecycle.sh verify      # Run verification suite (all layers)
 ./scripts/crc-lifecycle.sh teardown    # Remove stack from CRC (keep VM)
 ./scripts/crc-lifecycle.sh stop        # Stop CRC VM (preserves state)
@@ -45,26 +45,32 @@ This runs: `setup` -> `deploy` -> `verify` in sequence.
 ### Optional Flags
 
 ```bash
-./scripts/crc-lifecycle.sh deploy --with-oidc    # Also deploy Keycloak OIDC (Phase 7)
-./scripts/crc-lifecycle.sh deploy --with-obs     # Also deploy observability stack (Phase 8)
+./scripts/crc-lifecycle.sh deploy --with-oidc    # Also deploy Keycloak OIDC
+./scripts/crc-lifecycle.sh deploy --with-obs     # Also deploy infra observability (Tempo/OTel Collector — logs/metrics only)
 ./scripts/crc-lifecycle.sh full                  # Full stack with everything (OIDC+obs by default)
-./scripts/crc-lifecycle.sh full --minimal        # Full stack without OIDC and observability
+./scripts/crc-lifecycle.sh full --minimal        # Full stack without OIDC and infra observability
 ./scripts/crc-lifecycle.sh full --fresh          # Delete existing VM and start from scratch
 ```
+
+RHOAI + MLflow (the sole tracing/prompt-registry backend, see
+[ADR-0018](../../docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)) are
+**not** behind `--with-obs` — they're deployed and wired unconditionally on
+every `deploy`/`full` run, on every environment.
 
 ## Architecture
 
 ```
 Laptop (Fedora, Intel Ultra 7, 64 GB RAM)
   ├── Host: crc CLI, oc, helm, openshell
-  └── CRC VM (12 vCPU, 24 GB RAM, OCP 4.20.5)
+  └── CRC VM (16 vCPU, 40 GB RAM, OCP 4.20.5)
        ├── namespace: openshell
        │    ├── OpenShell Gateway (StatefulSet)
        │    └── OpenClaw Sandbox (Pod)
-       ├── namespace: observability (opt-in)
+       ├── namespace: redhat-ods-applications (mandatory)
+       │    └── RHOAI-managed MLflow (sole tracing/prompt-registry backend)
+       ├── namespace: observability (opt-in, --with-obs)
        │    ├── OTel Collector
-       │    ├── Tempo
-       │    └── MLflow
+       │    └── Tempo
        └── Routes: *.apps-crc.testing
 ```
 
@@ -84,13 +90,13 @@ No CRC-specific config files exist. Same templates, same scripts, different doma
 Three differences, all isolated:
 
 1. **OLM operator**: CRC skips OLM subscription (single-node may lack catalog). CRDs are applied directly. Controlled by `CRC_MODE` in `bootstrap-ocp.sh`.
-2. **Keycloak/Observability**: Opt-in on CRC via `--with-oidc` / `--with-obs` flags. Always deployed on AWS.
-3. **RHOAI-managed MLflow (Phase 12)**: standalone-only experiment on CRC via `./scripts/deploy-rhoai-mlflow.sh`, run manually and never combined with the rest of the stack for long. Empirically tested (not just inferred from docs) — see [ADR-0017](../../docs/adrs/ADR-0017-rhoai-mlflow-scope.md): RHOAI + minimal MLflow alone fits fine on a 16 vCPU / 40 GiB CRC VM, but combined with the full OpenShell + OpenClaw stack it drops host free memory below this project's Cursor-safety floor (fine functionally, not fine for a shared dev laptop). Not wired into `crc-lifecycle.sh`'s `deploy`/`full` commands for this reason. AWS is the primary target for running it together with everything else — see `deploy-full-aws` skill.
+2. **Keycloak/infra observability**: Opt-in on CRC via `--with-oidc` / `--with-obs` flags. Always deployed on AWS.
+3. **RHOAI-managed MLflow**: mandatory on **both** CRC and AWS since [ADR-0018](../../docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md) — it is the sole tracing/prompt-registry backend, wired unconditionally by `crc-lifecycle.sh`'s `deploy`/`full` commands (not gated behind any flag). Empirically validated on CRC (not just inferred from docs) — see [ADR-0017](../../docs/adrs/ADR-0017-rhoai-mlflow-scope.md): RHOAI + minimal MLflow alone fits fine on a 16 vCPU / 40 GiB CRC VM; combined with the full OpenShell + OpenClaw stack, host free memory drops to ~11 GiB and swap engages — functionally fine (no crashes/evictions), but tight on a shared dev laptop. This is now an **accepted trade-off** (ADR-0018), not a reason to keep the two paths separate — there is no lightweight standalone-MLflow fallback anymore.
 
 ## Known Issues
 
 - **OIDC token TTL**: Default Keycloak access token lifespan is 300s (5 minutes). Increase to 1800s for long-running scripts like `verify.sh`. Deploy scripts handle this via the Keycloak admin API.
-- **Deploy order**: When `--with-oidc` is set, Keycloak and Observability must be deployed *before* OpenShell to ensure the OIDC issuer and MLflow are available when `configure-oidc.sh` and `seed-mlflow-prompts.sh` run.
+- **Deploy order**: RHOAI + MLflow must be deployed *before* OpenShell (the `mlflow-integration` ClusterRole/namespace it binds RBAC to must exist first); `wire-rhoai-mlflow-tracing.sh` (RBAC, SA token, experiment, prompt seeding) must run *after* OpenShell (binds to the `openshell-sandbox` SA it creates). When `--with-oidc` is set, Keycloak must also be deployed before `configure-oidc.sh` runs. See constraint #10 in `docs/constraints.md`.
 - **oauth-proxy (browser UI auth)**: Since ADR-0016, `deploy-oauth2-proxy.sh` deploys `oauth-proxy` (OpenShift fork, `-provider=openshift`) with a ServiceAccount-based OAuth client — no Keycloak client/secret involved. Keycloak's `openclaw-ui` client from the pre-ADR-0016 setup is retired.
 
 ## Troubleshooting

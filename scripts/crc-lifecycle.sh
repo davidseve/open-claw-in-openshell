@@ -17,8 +17,11 @@
 #   ./scripts/crc-lifecycle.sh status      # show CRC and cluster status
 #
 # Optional flags:
-#   --with-oidc    Deploy Keycloak OIDC (Phase 7)
-#   --with-obs     Deploy observability stack (Phase 8)
+#   --with-oidc    Deploy Keycloak OIDC
+#   --with-obs     Deploy infrastructure observability (Tempo, OTel Collector —
+#                  logs/metrics only). RHOAI MLflow (agent traces + prompt
+#                  registry) is unconditional, not gated by this flag — see
+#                  docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md.
 
 set -euo pipefail
 
@@ -73,10 +76,16 @@ crc_login() {
 cmd_setup() {
   require_crc_bin
 
+  # Sized for RHOAI + MLflow (mandatory on every deploy, ADR-0018) combined
+  # with the full OpenShell/OpenClaw stack — 16 vCPU / 40 GiB / 100 GiB is
+  # the configuration empirically validated to work on this project's dev
+  # laptop (see docs/adrs/ADR-0017-rhoai-mlflow-scope.md's Stage 1/2 results;
+  # host free memory drops to ~11 GiB combined, an accepted trade-off per
+  # ADR-0018). The pre-RHOAI baseline (12 vCPU / 24 GiB) is no longer enough.
   step "Configuring CRC VM resources"
-  "$CRC_BIN" config set cpus 12
-  "$CRC_BIN" config set memory 24576
-  "$CRC_BIN" config set disk-size 80
+  "$CRC_BIN" config set cpus 16
+  "$CRC_BIN" config set memory 40960
+  "$CRC_BIN" config set disk-size 100
   "$CRC_BIN" config set host-network-access true
   "$CRC_BIN" config set consent-telemetry yes
 
@@ -114,10 +123,17 @@ cmd_start() {
 
 cmd_deploy() {
   # Deploy order is critical — see docs/constraints.md #10:
-  #   1. bootstrap  2. keycloak  3. observability  4. openshell (install)
-  #   5. configure-oidc (helm upgrade + token)  6. provider (needs token)
-  #   7. oauth2-proxy  8. launch-openclaw
+  #   1. bootstrap  2. keycloak  3. observability (Tempo/OTel)
+  #   4. RHOAI + MLflow  5. openshell (install)  6. wire RHOAI MLflow tracing
+  #   7. configure-oidc (helm upgrade + token)  8. provider (needs token)
+  #   9. oauth2-proxy  10. launch-openclaw
   #
+  # RHOAI + MLflow (Phase 4) MUST run BEFORE OpenShell (Phase 5) so the
+  # mlflow-integration ClusterRole and RHOAI namespace exist; wiring (Phase 6)
+  # MUST run AFTER OpenShell so the openshell-sandbox SA it binds RBAC to
+  # already exists. RHOAI-managed MLflow is the sole tracing/prompt-registry
+  # backend for this project (docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)
+  # — these two phases are unconditional, not gated behind --with-obs.
   # configure-oidc MUST run AFTER deploy-openshell (needs existing helm release).
   # Provider creation MUST run AFTER configure-oidc (needs OIDC token).
   # oauth2-proxy MUST run AFTER keycloak + openshell (needs both).
@@ -136,22 +152,28 @@ cmd_deploy() {
   fi
 
   if [[ "$WITH_OBS" == "true" ]]; then
-    step "Phase 3: Deploying observability stack (Tempo, OTel, MLflow, prompts)"
+    step "Phase 3: Deploying infrastructure observability (Tempo, OTel Collector)"
     "${SCRIPT_DIR}/deploy-observability.sh"
   fi
 
-  # Phase 4: Install OpenShell WITHOUT OIDC. The pod needs the oidc-ca
-  # ConfigMap which doesn't exist yet. configure-oidc.sh (Phase 5) will
+  step "Phase 4: Deploy RHOAI + MLflow (sole tracing/prompt-registry backend)"
+  "${SCRIPT_DIR}/deploy-rhoai-mlflow.sh"
+
+  # Phase 5: Install OpenShell WITHOUT OIDC. The pod needs the oidc-ca
+  # ConfigMap which doesn't exist yet. configure-oidc.sh (Phase 7) will
   # create it and helm upgrade to enable OIDC.
-  step "Phase 4: Deploy OpenShell (install without OIDC)"
+  step "Phase 5: Deploy OpenShell (install without OIDC)"
   WITH_OIDC=false "${SCRIPT_DIR}/deploy-openshell.sh"
 
+  step "Phase 6: Wire RHOAI MLflow tracing (RBAC, SA token, experiment, CA, prompts)"
+  "${SCRIPT_DIR}/wire-rhoai-mlflow-tracing.sh"
+
   if [[ "$WITH_OIDC" == "true" ]]; then
-    step "Phase 5: Configure OIDC (create CA ConfigMap + helm upgrade + obtain token)"
+    step "Phase 7: Configure OIDC (create CA ConfigMap + helm upgrade + obtain token)"
     OPENSHELL_HEADLESS=1 KC_USER="${KC_USER:-admin}" KC_PASS="${KC_PASS:-admin}" \
       "${SCRIPT_DIR}/configure-oidc.sh"
 
-    step "Phase 5b: Create MaaS provider (needs OIDC token)"
+    step "Phase 7b: Create MaaS provider (needs OIDC token)"
     # Gateway may still be stabilizing after helm upgrade; retry up to 30s
     retries=0
     while ! create_provider 2>/dev/null; do
@@ -164,11 +186,11 @@ cmd_deploy() {
       sleep 5
     done
 
-    step "Phase 6: Deploy oauth-proxy (OpenShift-native OAuth UI auth, ADR-0016)"
+    step "Phase 8: Deploy oauth-proxy (OpenShift-native OAuth UI auth, ADR-0016)"
     "${SCRIPT_DIR}/deploy-oauth2-proxy.sh"
   fi
 
-  step "Phase 7: Launch OpenClaw in sandbox"
+  step "Phase 9: Launch OpenClaw in sandbox"
   "${SCRIPT_DIR}/launch-openclaw.sh"
 
   step "Deployment complete"
@@ -230,7 +252,7 @@ cmd_full() {
   step "Full lifecycle complete"
   info "CRC is running with OpenClaw-in-OpenShell deployed and verified."
   info "Control UI: https://openclaw-gw--openclaw-ui.$(get_apps_domain)/"
-  info "MLflow UI:  https://mlflow-observability.$(get_apps_domain)/"
+  info "MLflow UI:  https://$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo '<run: oc get route mlflow -n redhat-ods-applications>')/"
   info "Stop CRC:   ./scripts/crc-lifecycle.sh stop"
   info "Teardown:   ./scripts/crc-lifecycle.sh teardown"
   info "Delete VM:  ./scripts/crc-lifecycle.sh delete"
@@ -283,8 +305,9 @@ case "$COMMAND" in
     echo "  status     Show CRC and cluster status"
     echo ""
     echo "Flags:"
-    echo "  --with-oidc   Also deploy Keycloak OIDC (Phase 7)"
-    echo "  --with-obs    Also deploy observability stack (Phase 8)"
+    echo "  --with-oidc   Also deploy Keycloak OIDC"
+    echo "  --with-obs    Also deploy infrastructure observability (Tempo, OTel Collector)"
+    echo "                RHOAI MLflow (agent traces + prompts) always deploys, regardless of this flag"
     echo "  --minimal     Skip OIDC and observability in 'full' mode"
     echo "  --fresh       Delete existing CRC VM before setup (full reset)"
     ;;

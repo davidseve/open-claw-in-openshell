@@ -26,7 +26,7 @@
 #   Layer 5b: LLM connectivity (Node.js binary path, fetch(), proxy denials,
 #             end-to-end LLM request, MLflow trace generation)
 #   Layer 7b: External access (service route, oauth2-proxy OIDC)
-#   Layer 8:  Observability stack (Tempo, OTel Collector, MLflow)
+#   Layer 8:  Observability stack (Tempo, OTel Collector) + RHOAI MLflow
 #   Layer 8b: MLflow Prompt Registry (prompts, aliases, manifest, linker)
 #   Layer 9:  Control UI (Playwright tests)
 #
@@ -467,21 +467,26 @@ with open(CFG,\"w\") as f: json.dump(d,f,indent=2)
     fi
   fi
 
-  # Check 5: The LLM request above should have generated a trace in MLflow.
-  # If no trace appears within 300s, the mlflow-openclaw plugin is not loaded
-  # or not working. This is the ONLY reliable way to verify the full trace
-  # pipeline: gateway → plugin → MLflow. (See root cause #5 above)
+  # Check 5: The LLM request above should have generated a trace in RHOAI
+  # MLflow (the sole tracing backend — docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md). If no trace appears within 300s, the mlflow-openclaw plugin
+  # is not loaded or not working. This is the ONLY reliable way to verify the
+  # full trace pipeline: gateway → plugin → MLflow. (See root cause #5 above)
   #
   # The trace may take 15-30s to propagate (plugin → MLflow API → storage).
-  # We retry up to 6 times (90s total) before failing.
-  OBS_NAMESPACE="${OBS_NAMESPACE:-observability}"
-  MLFLOW_HOST_5B=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
-  if [[ -n "$MLFLOW_HOST_5B" ]]; then
+  # We retry up to 6 times (90s total) before failing. Requires a Bearer
+  # token + X-MLFLOW-WORKSPACE header (RHOAI MLflow always runs with
+  # --enable-workspaces), sourced from scripts/wire-rhoai-mlflow-tracing.sh's
+  # output.
+  RHOAI_WIRING_5B="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
+  MLFLOW_HOST_5B=$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+  if [[ -n "$MLFLOW_HOST_5B" && -f "$RHOAI_WIRING_5B" ]]; then
+    set -a; source "$RHOAI_WIRING_5B"; set +a
+    AUTH_HEADERS_5B=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
     MLFLOW_EXT_5B="https://${MLFLOW_HOST_5B}"
     TRACE_FOUND=false
     for attempt in 1 2 3 4 5 6; do
       sleep 15
-      RECENT_TRACE=$(curl -sf $CURL_OPTS "${MLFLOW_EXT_5B}/api/2.0/mlflow/traces?experiment_ids=0&max_results=1" 2>/dev/null | python3 -c "
+      RECENT_TRACE=$(curl -sf $CURL_OPTS "${AUTH_HEADERS_5B[@]}" "${MLFLOW_EXT_5B}/api/2.0/mlflow/traces?experiment_ids=${RHOAI_MLFLOW_EXPERIMENT_ID}&max_results=1" 2>/dev/null | python3 -c "
 import sys,json,time
 data = json.load(sys.stdin)
 traces = data.get('traces',[])
@@ -514,6 +519,8 @@ else:
         warn "Could not check trace recency"
       fi
     fi
+  else
+    warn "Skipping Check 5 (MLflow route or ${RHOAI_WIRING_5B} not found) — run scripts/deploy-rhoai-mlflow.sh + scripts/wire-rhoai-mlflow-tracing.sh first"
   fi
 
   # Restore chatCompletions to disabled now that Check 5's trace poll is
@@ -679,13 +686,19 @@ fi
 # =============================================================================
 # Layer 8: Observability Stack
 # =============================================================================
-# WHY: Verifies Tempo (trace storage), OTel Collector (trace ingestion),
-#   and MLflow (trace analysis UI). Also sends a test trace to verify
-#   the full pipeline: OTel Collector → Tempo → queryable via API.
-# HOW TO FIX: scripts/deploy-observability.sh
+# WHY: Verifies Tempo (trace storage) and OTel Collector (log/metric
+#   ingestion) — infrastructure observability only (traces disabled here,
+#   OTEL_TRACES_EXPORTER=none, see ADR-0014 Problem 8). Also verifies
+#   RHOAI MLflow (agent traces + prompt registry — the sole tracing backend,
+#   docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md), in a separate
+#   namespace/operator lifecycle from Tempo/OTel. Sends a test trace to
+#   verify the Tempo pipeline: OTel Collector → Tempo → queryable via API.
+# HOW TO FIX: scripts/deploy-observability.sh (Tempo/OTel),
+#   scripts/deploy-rhoai-mlflow.sh + scripts/wire-rhoai-mlflow-tracing.sh (MLflow)
 step "Layer 8: Observability Stack"
 
 OBS_NAMESPACE="observability"
+RHOAI_NS="redhat-ods-applications"
 
 if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
   pass "Observability namespace exists"
@@ -703,24 +716,48 @@ if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
   else
     fail "OTel Collector pod not ready"
   fi
+else
+  warn "Observability namespace not found, skipping Tempo/OTel checks"
+fi
 
-  MLFLOW_READY=$(oc -n "$OBS_NAMESPACE" get pods -l app=mlflow -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+# RHOAI MLflow checks live outside the `if oc get ns observability` guard —
+# separate namespace (redhat-ods-applications), separate operator lifecycle.
+RHOAI_WIRING_8="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
+if oc get ns "$RHOAI_NS" &>/dev/null; then
+  pass "RHOAI namespace exists"
+
+  MLFLOW_READY=$(oc -n "$RHOAI_NS" get pods -l app=mlflow -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
   if [[ "$MLFLOW_READY" == "true" ]]; then
     pass "MLflow pod running and ready"
   else
     fail "MLflow pod not ready"
   fi
 
-  MLFLOW_HOST=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+  MLFLOW_HOST=$(oc get route mlflow -n "$RHOAI_NS" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+  AUTH_HEADERS_8=()
+  if [[ -f "$RHOAI_WIRING_8" ]]; then
+    set -a; source "$RHOAI_WIRING_8"; set +a
+    AUTH_HEADERS_8=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
+  else
+    warn "RHOAI wiring facts not found (${RHOAI_WIRING_8}) — API checks below will likely fail auth"
+  fi
   if [[ -n "$MLFLOW_HOST" ]]; then
-    MLFLOW_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://${MLFLOW_HOST}/health" 2>/dev/null || echo "000")
+    # RHOAI-managed MLflow doesn't expose the bare, unauthenticated `/health`
+    # path the old standalone deployment had — confirmed live (404, with or
+    # without auth headers). Use a real, authenticated MLflow REST API call
+    # instead as the health signal (same endpoint scripts/wire-rhoai-mlflow-
+    # tracing.sh uses to check for the experiment).
+    MLFLOW_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "${AUTH_HEADERS_8[@]}" \
+      "https://${MLFLOW_HOST}/api/2.0/mlflow/experiments/get-by-name?experiment_name=openclaw-tracing" 2>/dev/null || echo "000")
     if [[ "$MLFLOW_CODE" == "200" ]]; then
       pass "MLflow health endpoint OK (https://${MLFLOW_HOST})"
     else
       fail "MLflow health returned HTTP ${MLFLOW_CODE}"
     fi
   fi
+fi
 
+if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
   # Send a test trace through the OTel pipeline to verify it's working
   oc -n "$OBS_NAMESPACE" port-forward svc/otel-collector 24318:4318 &>/dev/null &
   TRACE_PF_PID=$!
@@ -753,80 +790,46 @@ if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
     warn "Trace pipeline: trace not yet visible in Tempo (may need more time)"
   fi
 
-  # Verify MLflow has traces from the mlflow-openclaw plugin
-  MLFLOW_TRACES=$(oc -n "$OBS_NAMESPACE" exec deployment/mlflow -- \
-    python3 -c "
-import urllib.request, json
-try:
-    req = urllib.request.Request('http://localhost:5000/api/2.0/mlflow/traces?experiment_ids=0&max_results=5')
-    with urllib.request.urlopen(req, timeout=10) as r:
-        data = json.loads(r.read())
-        traces = data.get('traces', [])
-        print('COUNT:' + str(len(traces)))
-except Exception as e:
-    print('ERROR:' + str(e))
-" 2>/dev/null || echo "ERROR:exec-failed")
-
-  if echo "$MLFLOW_TRACES" | grep -qE "COUNT:[1-9]"; then
-    TRACE_COUNT=$(echo "$MLFLOW_TRACES" | grep -oE "COUNT:[0-9]+" | cut -d: -f2)
-    pass "MLflow native traces: ${TRACE_COUNT} trace(s) in Traces tab"
-  elif echo "$MLFLOW_TRACES" | grep -q "COUNT:0"; then
-    warn "MLflow native traces: no traces yet (send a message via UI first)"
-  else
-    warn "MLflow native traces: could not query traces API (${MLFLOW_TRACES})"
-  fi
-
-  # Verify trace quality: session/user metadata in span artifacts
-  MLFLOW_TRACE_QUALITY=$(oc -n "$OBS_NAMESPACE" exec deployment/mlflow -- \
-    python3 -c "
-import sqlite3, os, json
-conn = sqlite3.connect('/mlflow/mlflow.db')
-c = conn.cursor()
-rows = c.execute('SELECT request_id FROM trace_info ORDER BY timestamp_ms DESC LIMIT 5').fetchall()
-sessions = 0; users = 0; total_spans = 0
-for r in rows:
-    art = f'/mlflow/artifacts/0/traces/{r[0]}/artifacts/traces.json'
-    if os.path.exists(art):
-        with open(art) as f:
-            data = json.load(f)
-        spans = data.get('spans', [])
-        total_spans += len(spans)
-        if spans:
-            attrs = spans[0].get('attributes', {})
-            if attrs.get('mlflow.trace.session'):
-                sessions += 1
-            if attrs.get('mlflow.trace.user'):
-                users += 1
-print(f'SESSIONS:{sessions}')
-print(f'USERS:{users}')
-print(f'SPANS:{total_spans}')
-conn.close()
-" 2>/dev/null || echo "ERROR:exec-failed")
-
-  if echo "$MLFLOW_TRACE_QUALITY" | grep -qE "SESSIONS:[1-9]"; then
-    pass "MLflow trace attribute: mlflow.trace.session present in artifacts"
-  elif echo "$MLFLOW_TRACE_QUALITY" | grep -q "SESSIONS:0"; then
-    warn "MLflow trace attribute: mlflow.trace.session missing in artifacts"
-  else
-    warn "MLflow trace quality: could not query (${MLFLOW_TRACE_QUALITY})"
-  fi
-
-  if echo "$MLFLOW_TRACE_QUALITY" | grep -qE "USERS:[1-9]"; then
-    pass "MLflow trace attribute: mlflow.trace.user present in artifacts"
-  elif echo "$MLFLOW_TRACE_QUALITY" | grep -q "USERS:0"; then
-    warn "MLflow trace attribute: mlflow.trace.user missing in artifacts"
-  else
-    warn "MLflow trace quality: could not query"
-  fi
-
-  if echo "$MLFLOW_TRACE_QUALITY" | grep -qE "SPANS:[1-9]"; then
-    SPAN_COUNT=$(echo "$MLFLOW_TRACE_QUALITY" | grep -oE "SPANS:[0-9]+" | cut -d: -f2)
-    pass "MLflow trace spans: ${SPAN_COUNT} span(s) across traces (AGENT + LLM hierarchy)"
-  elif echo "$MLFLOW_TRACE_QUALITY" | grep -q "SPANS:0"; then
-    warn "MLflow trace spans: no spans found in artifacts"
-  fi
 else
   warn "Observability namespace not found — run scripts/deploy-observability.sh"
+fi
+
+# Verify RHOAI MLflow has rich traces from the mlflow-openclaw plugin. Via
+# REST (with auth), not a direct sqlite3/mlflow.db exec like the old
+# standalone-MLflow check used — RHOAI's operator-managed MLflow runs on a
+# Postgres backend behind its own pod, so there's no local sqlite file to
+# open. The deep session/user/span-count artifact introspection the old
+# check did is dropped rather than reimplemented against the artifacts API
+# right now (that instrumentation was always a soft `warn`-only check on a
+# known accepted limitation — ADR-0014 Problem 9 — not a hard pass/fail
+# gate); traceInputs/traceOutputs presence below is a lighter but still
+# meaningful substitute, empirically confirmed to be populated end-to-end
+# (docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md).
+if [[ -n "${MLFLOW_HOST:-}" && ${#AUTH_HEADERS_8[@]} -gt 0 ]]; then
+  MLFLOW_TRACES=$(curl -sk "${AUTH_HEADERS_8[@]}" \
+    "https://${MLFLOW_HOST}/api/2.0/mlflow/traces?experiment_ids=${RHOAI_MLFLOW_EXPERIMENT_ID:-0}&max_results=5" 2>/dev/null || echo "")
+
+  TRACE_COUNT=$(echo "$MLFLOW_TRACES" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('traces',[])))" 2>/dev/null || echo "")
+  if [[ "$TRACE_COUNT" =~ ^[1-9] ]]; then
+    pass "MLflow native traces: ${TRACE_COUNT} trace(s) in Traces tab"
+  elif [[ "$TRACE_COUNT" == "0" ]]; then
+    warn "MLflow native traces: no traces yet (send a message via UI first)"
+  else
+    warn "MLflow native traces: could not query traces API"
+  fi
+
+  RICH_CONTENT=$(echo "$MLFLOW_TRACES" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+traces = data.get('traces', [])
+rich = sum(1 for t in traces if any(m.get('key') == 'mlflow.traceInputs' for m in t.get('request_metadata', [])))
+print(rich)
+" 2>/dev/null || echo "")
+  if [[ "$RICH_CONTENT" =~ ^[1-9] ]]; then
+    pass "MLflow trace content: ${RICH_CONTENT} trace(s) with full input/output (mlflow.traceInputs)"
+  elif [[ -n "$RICH_CONTENT" ]]; then
+    warn "MLflow trace content: no traces with mlflow.traceInputs found yet"
+  fi
 fi
 
 # =============================================================================
@@ -846,13 +849,19 @@ fi
 #   Linker not running: launch-openclaw.sh (restarts linker)
 step "Layer 8b: MLflow Prompt Registry"
 
-OBS_NAMESPACE="${OBS_NAMESPACE:-observability}"
-MLFLOW_INT_URL="http://mlflow.${OBS_NAMESPACE}.svc:5000"
+RHOAI_NS="${RHOAI_NS:-redhat-ods-applications}"
 PROMPT_NAMES=(AGENTS SOUL TOOLS IDENTITY USER HEARTBEAT BOOTSTRAP)
 PROMPT_PREFIX="openclaw-system"
 
-if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
-  MLFLOW_HOST=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+RHOAI_WIRING_8B="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
+AUTH_HEADERS_8B=()
+if [[ -f "$RHOAI_WIRING_8B" ]]; then
+  set -a; source "$RHOAI_WIRING_8B"; set +a
+  AUTH_HEADERS_8B=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
+fi
+
+if oc get ns "$RHOAI_NS" &>/dev/null; then
+  MLFLOW_HOST=$(oc get route mlflow -n "$RHOAI_NS" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
   if [[ -n "$MLFLOW_HOST" ]]; then
     MLFLOW_EXT_URL="https://${MLFLOW_HOST}"
 
@@ -861,7 +870,7 @@ if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
     for pname in "${PROMPT_NAMES[@]}"; do
       fq="${PROMPT_PREFIX}.${pname}"
       encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${fq}', safe=''))" 2>/dev/null || echo "$fq")
-      MODEL_RESP=$(curl -sf $CURL_OPTS "${MLFLOW_EXT_URL}/api/2.0/mlflow/registered-models/get?name=${encoded}" 2>/dev/null || echo "")
+      MODEL_RESP=$(curl -sf $CURL_OPTS "${AUTH_HEADERS_8B[@]}" "${MLFLOW_EXT_URL}/api/2.0/mlflow/registered-models/get?name=${encoded}" 2>/dev/null || echo "")
       if [[ -n "$MODEL_RESP" ]] && echo "$MODEL_RESP" | python3 -c "import sys,json; json.load(sys.stdin)['registered_model']" &>/dev/null; then
         REGISTERED=$((REGISTERED + 1))
         if echo "$MODEL_RESP" | python3 -c "
@@ -950,7 +959,7 @@ sys.exit(0 if found else 1)
 
     # Verify traces have prompt tags
     if [[ -n "${MLFLOW_HOST:-}" ]]; then
-      TAGGED_CHECK=$(curl -sf $CURL_OPTS "${MLFLOW_EXT_URL}/api/2.0/mlflow/traces?experiment_ids=0&max_results=5" 2>/dev/null || echo "")
+      TAGGED_CHECK=$(curl -sf $CURL_OPTS "${AUTH_HEADERS_8B[@]}" "${MLFLOW_EXT_URL}/api/2.0/mlflow/traces?experiment_ids=${RHOAI_MLFLOW_EXPERIMENT_ID:-0}&max_results=5" 2>/dev/null || echo "")
       if [[ -n "$TAGGED_CHECK" ]]; then
         # mlflow.linkedPrompts populates the "Prompt" column in MLflow UI
         TAGGED_COUNT=$(echo "$TAGGED_CHECK" | python3 -c "
@@ -985,7 +994,7 @@ print(tagged)
     warn "openshell CLI not available, skipping sandbox prompt checks"
   fi
 else
-  warn "Observability namespace not found, skipping MLflow Prompt Registry checks"
+  warn "RHOAI namespace not found, skipping MLflow Prompt Registry checks"
 fi
 
 # =============================================================================
@@ -1009,6 +1018,17 @@ if command -v npx &>/dev/null && [[ -d "${TEST_DIR}/node_modules/@playwright" ]]
   OAUTH_ROUTE="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
   OPENCLAW_BASE_URL="https://${OAUTH_ROUTE}"
   info "Using oauth-proxy route for Playwright: ${OPENCLAW_BASE_URL}"
+
+  # `npm install` only fetches the @playwright/test package, not the actual
+  # browser binaries (a separate, larger download) — a fresh clone/environment
+  # (or a fresh Cursor sandbox cache) can have the former without the latter,
+  # which fails Playwright with "Executable doesn't exist" rather than
+  # skipping gracefully like the `[[ -d node_modules/@playwright ]]` check
+  # above intends. `playwright install` is idempotent and fast (a version
+  # check only, no re-download) when the browser is already present, so it's
+  # safe/cheap to always run before `playwright test` instead of trying to
+  # detect browser presence ourselves.
+  (cd "$TEST_DIR" && npx playwright install chromium) 2>&1 | tail -5
 
   export OPENCLAW_BASE_URL
   if (cd "$TEST_DIR" && npx playwright test) 2>&1; then
