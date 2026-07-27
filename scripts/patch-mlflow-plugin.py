@@ -40,8 +40,8 @@ if 'definePluginEntry' in content:
 else:
     print('index.ts already patched')
 
-# Backport of mlflow/mlflow#23927 for the pinned @mlflow/core@0.2.0 (see the
-# comment above this heredoc, and constraint #4b in docs/constraints.md).
+# Backport of mlflow/mlflow#23927 for the pinned @mlflow/core@0.2.0 (see
+# constraint #4b in docs/constraints.md).
 # createOssAuth()'s headersProvider builds Content-Type/Authorization but
 # never X-MLFLOW-WORKSPACE — RHOAI-managed MLflow (ADR-0017) rejects every
 # request without it once workspaces are enabled, even with valid auth.

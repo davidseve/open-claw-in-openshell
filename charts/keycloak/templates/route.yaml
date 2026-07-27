@@ -2,9 +2,9 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: keycloak
-  namespace: openshell-keycloak
+  namespace: {{ .Values.namespace }}
 spec:
-  host: keycloak-openshell-keycloak.apps.ocp.sandbox315.opentlc.com
+  host: keycloak-{{ .Values.namespace }}.{{ .Values.appsDomain }}
   to:
     kind: Service
     name: keycloak

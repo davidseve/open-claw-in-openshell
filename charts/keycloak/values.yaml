@@ -1,0 +1,28 @@
+# See docs/constraints.md and AGENTS.md: use __APPS_DOMAIN__-style
+# placeholders in manifests, never hardcode cluster domains. This chart takes
+# it as a values-driven input instead — scripts/deploy-keycloak.sh passes it
+# with --set at deploy time (common.sh's detect_environment()).
+appsDomain: ""
+
+namespace: openshell-keycloak
+
+image: quay.io/keycloak/keycloak:24.0
+
+admin:
+  user: admin
+  password: admin
+
+# OAuthClient secret Keycloak uses to broker OCP identities (identity
+# provider "openshift" in the realm config below). Never commit a real value
+# (AGENTS.md) — left blank here on purpose. scripts/deploy-keycloak.sh
+# generates/loads this via common.sh's ensure_secret_var() (secrets/secrets.env)
+# and injects it with `helm --set-string brokerSecret=...`.
+brokerSecret: ""
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi

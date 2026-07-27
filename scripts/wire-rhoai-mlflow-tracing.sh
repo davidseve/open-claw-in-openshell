@@ -167,7 +167,7 @@ else
   exit 1
 fi
 
-step "Writing wiring facts for scripts/launch-openclaw.sh --rhoai-mlflow"
+step "Writing wiring facts for scripts/launch-openclaw.sh"
 cat > "${OUT_DIR}/wiring.env" <<EOF
 RHOAI_MLFLOW_TRACKING_URI=${RHOAI_MLFLOW_SVC_URL}
 RHOAI_MLFLOW_EXPERIMENT_ID=${EXPERIMENT_ID}
@@ -185,9 +185,9 @@ step "Seeding system prompts into MLflow Prompt Registry"
 # already auto-detects that Route when MLFLOW_URL is unset.
 MLFLOW_TRACKING_TOKEN="${SA_TOKEN}" \
 MLFLOW_WORKSPACE="${WORKSPACE}" \
-  "${SCRIPT_DIR}/seed-mlflow-prompts.sh" \
+  "${SCRIPT_DIR}/prompt-registry/seed-mlflow-prompts.sh" \
   && pass "System prompts seeded into RHOAI MLflow" \
-  || warn "Could not seed prompts (run scripts/seed-mlflow-prompts.sh manually — see its usage comment for the required env vars)"
+  || warn "Could not seed prompts (run scripts/prompt-registry/seed-mlflow-prompts.sh manually — see its usage comment for the required env vars)"
 
 step "wire-rhoai-mlflow-tracing.sh complete"
 info "Next: ./scripts/launch-openclaw.sh"

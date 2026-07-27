@@ -17,11 +17,17 @@
 #   ./scripts/crc-lifecycle.sh status      # show CRC and cluster status
 #
 # Optional flags:
-#   --with-oidc    Deploy Keycloak OIDC
-#   --with-obs     Deploy infrastructure observability (Tempo, OTel Collector —
-#                  logs/metrics only). RHOAI MLflow (agent traces + prompt
-#                  registry) is unconditional, not gated by this flag — see
-#                  docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md.
+#   --with-oidc    deploy: Deploy Keycloak OIDC. teardown: also remove Keycloak.
+#   --with-obs     deploy: Deploy infrastructure observability (Tempo, OTel
+#                  Collector — logs/metrics only). RHOAI MLflow (agent traces
+#                  + prompt registry) is unconditional, not gated by this
+#                  flag — see docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md.
+#                  teardown: also remove the observability namespace.
+#
+# `teardown` also accepts scripts/teardown.sh's own --with-rhoai-mlflow /
+# --all flags directly (not wired through crc-lifecycle.sh's flag parser
+# since RHOAI is unconditional on deploy) — call the script directly for
+# those: ./scripts/teardown.sh --all
 
 set -euo pipefail
 
@@ -205,7 +211,10 @@ cmd_verify() {
 cmd_teardown() {
   detect_environment
   render_all_templates
-  "${SCRIPT_DIR}/teardown.sh"
+  local teardown_flags=()
+  [[ "$WITH_OIDC" == "true" ]] && teardown_flags+=(--with-oidc)
+  [[ "$WITH_OBS" == "true" ]] && teardown_flags+=(--with-obs)
+  "${SCRIPT_DIR}/teardown.sh" "${teardown_flags[@]}"
 }
 
 cmd_stop() {
@@ -241,11 +250,9 @@ cmd_full() {
   cmd_setup
   cmd_deploy   # includes all phases: keycloak, obs, openshell, oidc, provider, oauth2-proxy, openclaw
 
-  if [[ -x "${SCRIPT_DIR}/smoke-test-e2e.sh" ]]; then
-    step "Running smoke test"
-    "${SCRIPT_DIR}/smoke-test-e2e.sh" || warn "Smoke test had warnings (non-fatal)"
-  fi
-
+  # verify.sh (full profile, the default) covers everything a separate
+  # smoke-test-e2e.sh used to check (chat -> trace -> prompt tags) via its
+  # own Layer 8/8b/9 — no need for a second script here.
   cmd_verify
 
   echo ""

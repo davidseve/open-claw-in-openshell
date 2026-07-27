@@ -8,8 +8,14 @@ RHOAI-managed MLflow. The mechanism/design described below — Prompt Registry
 API, `@production` alias, versioned fetch into the sandbox, read-only
 lockdown, trace-tag linking — is **unchanged and still Accepted**; only the
 tracking URI and the addition of Bearer token + `X-MLFLOW-WORKSPACE` auth
-changed (see `scripts/seed-mlflow-prompts.sh` / `scripts/fetch-prompts-from-mlflow.sh`). Kept as-is below for historical record of the original design
-rationale — do not edit the content past this point.
+changed. All the code implementing this ADR now lives together in
+`scripts/prompt-registry/` (`seed-mlflow-prompts.sh`,
+`fetch-prompts-from-mlflow.sh`, `prompt-trace-linker.js`) with its own
+`README.md` explaining what it does and how to remove it entirely if this
+subsystem is ever judged not worth its operational cost — see that README
+before touching any of the paths mentioned below, they've moved. Kept as-is
+below for historical record of the original design rationale — do not edit
+the content past this point.
 
 ## Context
 

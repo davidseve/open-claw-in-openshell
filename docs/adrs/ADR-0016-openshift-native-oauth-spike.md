@@ -224,9 +224,12 @@ The browser UI path described above was cut over to production:
    `.cursor/skills/` deploy/monitor docs were updated to describe the new
    flow and to stop describing Keycloak as part of the browser auth path.
 
-Keycloak itself, `scripts/deploy-keycloak.sh`, `manifests/keycloak/`, and
-`secrets/.keycloak-broker-secret` were **not** removed — see "Remaining
-follow-up" below for why.
+Keycloak itself, `scripts/deploy-keycloak.sh`, and `manifests/keycloak/` were
+**not** removed — see "Remaining follow-up" below for why. (The broker
+secret's storage location later changed: `secrets/.keycloak-broker-secret`
+was a separate file at the time of this entry; it's now just
+`KC_BROKER_SECRET` in `secrets/secrets.env`, alongside every other generated
+secret, via `common.sh`'s `ensure_secret_var()`.)
 
 ## Decision record: Keycloak stays, scoped to the CLI/gRPC path (2026-07-23)
 

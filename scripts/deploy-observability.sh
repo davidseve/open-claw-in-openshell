@@ -25,32 +25,18 @@ source "$(dirname "$0")/common.sh"
 
 check_prereqs
 detect_environment
-render_all_templates
 OBS_NAMESPACE="observability"
 
-# ── Step 1: Create namespace ──────────────────────────────────────────────────
+# ── Step 1-3: Deploy (Helm) ────────────────────────────────────────────────────
+# --wait blocks until both Deployments' pods are Ready (Helm's own readiness
+# gate covers what separate `oc apply` + `rollout status` calls used to do).
 
-step "Creating observability namespace"
-oc apply -f "${PROJECT_DIR}/manifests/observability/namespace.yaml"
-pass "Namespace ${OBS_NAMESPACE} ready"
-
-# ── Step 2: Deploy Tempo ──────────────────────────────────────────────────────
-
-step "Deploying Tempo (trace storage)"
-oc apply -f "${PROJECT_DIR}/manifests/observability/tempo.yaml"
-
-oc -n "$OBS_NAMESPACE" rollout status deployment/tempo --timeout=120s 2>/dev/null \
-  && pass "Tempo deployment ready" \
-  || fail "Tempo deployment not ready"
-
-# ── Step 3: Deploy OTel Collector ─────────────────────────────────────────────
-
-step "Deploying OpenTelemetry Collector"
-oc apply -f "${PROJECT_DIR}/manifests/observability/otel-collector.yaml"
-
-oc -n "$OBS_NAMESPACE" rollout status deployment/otel-collector --timeout=120s 2>/dev/null \
-  && pass "OTel Collector deployment ready" \
-  || fail "OTel Collector deployment not ready"
+step "Deploying infrastructure observability (Tempo + OTel Collector, Helm)"
+helm upgrade --install observability "${PROJECT_DIR}/charts/observability" \
+  --namespace "$OBS_NAMESPACE" --create-namespace \
+  --set namespace="${OBS_NAMESPACE}" \
+  --wait --timeout 180s
+pass "Tempo + OTel Collector deployments ready"
 
 # ── Step 4: Verify sandbox network policy ─────────────────────────────────────
 

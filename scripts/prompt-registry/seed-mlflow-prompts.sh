@@ -18,9 +18,9 @@
 #   MLFLOW_TRACKING_TOKEN="$RHOAI_MLFLOW_SA_TOKEN" \
 #   MLFLOW_WORKSPACE="$RHOAI_MLFLOW_WORKSPACE" \
 #   MLFLOW_TRACKING_SERVER_CERT_PATH="$RHOAI_MLFLOW_CA_FILE" \
-#     ./scripts/seed-mlflow-prompts.sh
+#     ./scripts/prompt-registry/seed-mlflow-prompts.sh
 set -euo pipefail
-source "$(dirname "$0")/common.sh"
+source "$(dirname "$0")/../common.sh"
 
 PROMPTS_DIR="${PROJECT_DIR}/prompts"
 PREFIX="openclaw-system"

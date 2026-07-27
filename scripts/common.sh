@@ -8,7 +8,7 @@ OPENSHELL_CHART_VERSION="${OPENSHELL_CHART_VERSION:-0.0.83}"
 SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw}"
 PROVIDER_NAME="${PROVIDER_NAME:-maas-litellm}"
 
-CRC_BIN="${CRC_BIN:-/home/dseveria/Applications/crc-linux-amd64/crc-linux-2.57.0-amd64/crc}"
+CRC_BIN="${CRC_BIN:-$(command -v crc || echo crc)}"
 CRC_MODE="${CRC_MODE:-false}"
 APPS_DOMAIN="${APPS_DOMAIN:-}"
 
@@ -185,15 +185,15 @@ render_all_templates() {
   render_template \
     "${PROJECT_DIR}/charts/openshell/values-ocp.yaml.tpl" \
     "${RENDERED_DIR}/values-ocp.yaml"
+  render_template \
+    "${PROJECT_DIR}/charts/openshell/values-ocp-no-oidc.yaml.tpl" \
+    "${RENDERED_DIR}/values-ocp-no-oidc.yaml"
   render_openclaw_config \
     "${PROJECT_DIR}/config/openclaw.json.tpl" \
     "${RENDERED_DIR}/openclaw.json"
-  render_template \
-    "${PROJECT_DIR}/manifests/oauth2-proxy/route.yaml.tpl" \
-    "${RENDERED_DIR}/oauth2-proxy/route.yaml"
-  render_template \
-    "${PROJECT_DIR}/manifests/oauth2-proxy/deployment.yaml.tpl" \
-    "${RENDERED_DIR}/oauth2-proxy/deployment.yaml"
+  # oauth2-proxy's manifests are now a Helm chart (charts/oauth2-proxy) —
+  # scripts/deploy-oauth2-proxy.sh passes APPS_DOMAIN via `helm --set`
+  # instead of rendering a .tpl here.
   info "Templates rendered to ${RENDERED_DIR}/ (APPS_DOMAIN=${APPS_DOMAIN})"
 }
 
@@ -239,6 +239,46 @@ wait_for_pod_ready() {
   local ns="$1" label="$2" timeout="${3:-120}"
   step "Waiting for pod ($label) to be ready (timeout: ${timeout}s)"
   oc -n "$ns" wait --for=condition=Ready pod -l "$label" --timeout="${timeout}s"
+}
+
+# ensure_secret_var <VAR_NAME> [openssl-rand args...] — idempotent secret
+# generation, used by every deploy script that needs a random secret
+# (Keycloak broker secret, MLflow DB password, oauth-proxy session secret).
+# If VAR_NAME is already set (e.g. exported by the caller) or already present
+# in secrets/secrets.env, reuses that value. Otherwise generates one with
+# `openssl rand` (default: -hex 32), appends VAR_NAME=value to
+# secrets/secrets.env so re-running the deploy script is idempotent, and
+# exports it. Requires secrets/secrets.env to already exist — only ever
+# appends, never creates the file (AGENTS.md: copy secrets.template.env to
+# secrets.env and fill in MAAS_API_KEY first, before any deploy phase runs).
+ensure_secret_var() {
+  local var_name="$1"; shift
+  local rand_args=("$@")
+  [[ ${#rand_args[@]} -eq 0 ]] && rand_args=(-hex 32)
+
+  local secrets_file="${PROJECT_DIR}/secrets/secrets.env"
+  if [[ ! -f "$secrets_file" ]]; then
+    error "Secrets file not found: $secrets_file"
+    error "Copy secrets/secrets.template.env to secrets/secrets.env and fill in MAAS_API_KEY first"
+    exit 1
+  fi
+
+  local current="${!var_name:-}"
+  if [[ -z "$current" ]]; then
+    set -a; source "$secrets_file"; set +a
+    current="${!var_name:-}"
+  fi
+
+  if [[ -z "$current" ]]; then
+    current=$(openssl rand "${rand_args[@]}")
+    echo "${var_name}=${current}" >>"$secrets_file"
+    info "Generated ${var_name} and appended to secrets/secrets.env"
+  else
+    info "Using existing ${var_name} from secrets/secrets.env"
+  fi
+
+  printf -v "$var_name" '%s' "$current"
+  export "${var_name?}"
 }
 
 load_secrets() {
@@ -287,42 +327,6 @@ create_provider() {
     --type generic \
     --credential "LITELLM_API_KEY=${MAAS_API_KEY}"
   info "Provider '$PROVIDER_NAME' created"
-}
-
-# Compare the committed config/openclaw.json reference snapshot against a
-# fresh render of config/openclaw.json.tpl (ignoring only the __APPS_DOMAIN__
-# placeholder, whose concrete value is detected from the snapshot itself so
-# the check works regardless of which environment last regenerated it).
-# openclaw.json is never written by any deploy script (launch-openclaw.sh /
-# deploy-oauth2-proxy.sh always render straight from .tpl into .rendered/),
-# so this snapshot only stays accurate if someone keeps it in sync by hand —
-# this check catches when they forget.
-check_config_snapshot_drift() {
-  local snapshot="${PROJECT_DIR}/config/openclaw.json"
-  local tpl="${PROJECT_DIR}/config/openclaw.json.tpl"
-  if [[ ! -f "$snapshot" ]]; then
-    warn "config/openclaw.json not found — skipping template drift check"
-    return 0
-  fi
-  # Anchored on the oauth-proxy Route hostname (openclaw-gw--openclaw-ui.*),
-  # not the old openclaw-ui.* direct-access hostname retired in ADR-0016 --
-  # that string no longer appears in openclaw.json's allowedOrigins.
-  local snapshot_domain
-  snapshot_domain=$(grep -oP 'https://openclaw-gw--openclaw-ui\.\K[^"]+' "$snapshot" | head -1)
-  if [[ -z "$snapshot_domain" ]]; then
-    warn "Could not detect APPS_DOMAIN from config/openclaw.json — skipping template drift check"
-    return 0
-  fi
-  local rendered="/tmp/.openclaw-json-drift-check.$$"
-  sed "s/__APPS_DOMAIN__/${snapshot_domain}/g" "$tpl" > "$rendered"
-  if diff -q "$snapshot" "$rendered" >/dev/null 2>&1; then
-    pass "config/openclaw.json matches config/openclaw.json.tpl (no drift)"
-  else
-    fail "config/openclaw.json has drifted from config/openclaw.json.tpl"
-    info "  Fix: sed \"s/__APPS_DOMAIN__/${snapshot_domain}/g\" config/openclaw.json.tpl > config/openclaw.json"
-    diff -u "$snapshot" "$rendered" 2>/dev/null | while IFS= read -r line; do info "  $line"; done
-  fi
-  rm -f "$rendered"
 }
 
 get_apps_domain() {

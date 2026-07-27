@@ -172,7 +172,7 @@ const headersProvider = async () => {
 **Confirmed live**: with this patch plus the fixes in constraints #4c and
 #4d, a real chat turn produced a real trace, verified by querying RHOAI
 MLflow's traces API directly (`request_id: tr-692adb65bddad6913a4ddfdd93929028`, `status: OK`, real input/output content) —
-and `scripts/prompt-trace-linker.js` tagged it on its very next poll cycle.
+and `scripts/prompt-registry/prompt-trace-linker.js` tagged it on its very next poll cycle.
 Full pipeline (gateway → RHOAI MLflow trace → linker tag) works end-to-end,
 with `HTTP 200` MaaS chat throughout (no regression). See
 `docs/adrs/ADR-0017-rhoai-mlflow-scope.md`'s 2026-07-25 "Resolution" section.
@@ -217,8 +217,9 @@ for the first time (see constraint #4d for the *next* blocker this
 uncovered — the fix here was necessary but not sufficient on its own).
 
 **Scripts affected**: `scripts/launch-openclaw.sh` (builds
-`.combined-ca-bundle.pem` in the sandbox workspace and points
-`NODE_EXTRA_CA_CERTS` at it whenever `--rhoai-mlflow` is passed).
+`.combined-ca-bundle.pem` in the sandbox workspace and always points
+`NODE_EXTRA_CA_CERTS` at it — RHOAI MLflow wiring is unconditional, see
+ADR-0018).
 
 ## 4d. `tls: skip` Policy Endpoints Require an *Exact* Hostname String Match — FQDN vs. Short Service Name Silently Defeats It
 
@@ -259,7 +260,7 @@ sandbox proxy using the exact hostname string configured in
 `policies/openclaw-sandbox.yaml` — in this project's case, the short
 `<svc>.<ns>.svc` form (no `.cluster.local` suffix). `scripts/wire-rhoai-mlflow-tracing.sh`'s `RHOAI_MLFLOW_SVC_URL` was fixed to build the short
 form; it feeds `RHOAI_MLFLOW_TRACKING_URI` in `.rendered/rhoai-mlflow/wiring.env`, which is what both `scripts/launch-openclaw.sh` (gateway's
-`openclaw.json` `trackingUri`) and `scripts/prompt-trace-linker.js`
+`openclaw.json` `trackingUri`) and `scripts/prompt-registry/prompt-trace-linker.js`
 (`MLFLOW_URL`) consume — so both sides of the wiring were fixed by this one
 change. This constraint generalizes beyond MLflow: **any future `tls: skip`
 (or other per-host) policy entry must be referenced by the exact same
@@ -374,7 +375,7 @@ in MLflow but never get prompt tags.
 **Workaround**: `prompt-trace-linker.js` uses `child_process.execFileSync('/usr/bin/curl', ...)`
 for all HTTP requests instead of `fetch()`.
 
-**Scripts affected**: `scripts/prompt-trace-linker.js`
+**Scripts affected**: `scripts/prompt-registry/prompt-trace-linker.js`
 
 ## 9. OIDC Token TTL
 
@@ -935,3 +936,120 @@ and should stay on.
 **Scripts affected**: `scripts/common.sh` (`detect_environment()`) — fixed.
 No changes needed in `scripts/verify.sh` or `scripts/smoke-test-e2e.sh`
 themselves; they inherit the env var by sourcing `common.sh`.
+
+## 19. `openshell status` Fails mTLS Handshake for Several Minutes After `helm upgrade` of the OpenShell Chart
+
+**Context**: Found while re-running `scripts/deploy-openshell.sh` repeatedly
+against an already-deployed CRC cluster (i.e. `helm upgrade` on an existing
+`openshell` release, not a fresh `helm install`) while validating the
+Helm-chart-conversion simplification work. Immediately after "Registering
+gateway with CLI (mTLS)", `openshell status` failed with:
+
+```
+Error:   × client error (SendRequest)
+  ├─▶ connection error
+  ╰─▶ received fatal alert: CertificateRequired
+```
+
+**Confirmed NOT a cert/config problem**: the gateway pod's own logs show the
+server side of the same failure (`TLS handshake failed: error=peer sent no
+certificates`), i.e. the client is not presenting its certificate at all —
+but the exact same `ca.crt`/`tls.crt`/`tls.key` files, tested standalone with
+`openssl s_client -cert ... -key ... -CAfile ...` against the same Route the
+entire time, complete a full mTLS handshake successfully
+(`Verify return code: 0 (ok)`). The pod never restarts (`RESTARTS: 0`,
+`startTime` unchanged) and the PKI secrets' `resourceVersion` is unchanged
+across the `helm upgrade` (the PKI init job only runs once, on first
+install) — ruling out a real cert mismatch or secret rotation.
+
+**Timing is not attempt-count-driven, it's wall-clock-driven, and highly
+variable**: retrying `openshell status` in a tight loop (every 5s) fails
+identically for the *entire* duration of the loop regardless of budget
+(reproduced failing for a full 5 minutes / 60 attempts in one run, and a
+full 6 minutes / 72 attempts in another, later, run against the exact same
+never-restarted pod), then succeeds within roughly a minute of the loop
+giving up and exiting — with zero code or state changes in between. This
+was re-confirmed with a completely hands-off run (no concurrent
+`openshell`/`oc` commands from the operator) to rule out self-inflicted
+interference from concurrent CLI invocations sharing `~/.config/openshell/`
+state; the delay is real, observed in the 10s–7min range across different
+runs on the same host, and does not shrink or grow monotonically with the
+number of prior `helm upgrade` cycles (the pod itself never restarts across
+any of them — `RESTARTS: 0`, same `startTime` throughout). Most likely
+explanation: contention/scheduling delay on a single dev box running the
+full stack (RHOAI, MLflow, Keycloak, Observability, OpenShell) simultaneously
+delays whatever periodic task on the server side is responsible for the
+underlying reload, rather than a fixed timer — but this remains unconfirmed.
+
+**Likely root cause: host-level memory pressure, not an application bug**.
+While chasing this live, `free -h` on the host showed severe pressure during
+the failures — well under 1 GiB truly free RAM and 6+ GiB of swap in active
+use, on a host running a 42 GiB CRC VM (`qemu-system-x86_64` alone at ~34 GiB
+RSS) alongside a normal heavy desktop session (browser, IDE). A guest VM
+under host-side memory contention/swapping sees essentially random, large
+latency spikes injected into arbitrary guest operations (scheduling, network
+I/O, crypto) with no visible cause from inside the guest — which fully
+explains symptoms that otherwise look inexplicable: identical inputs
+(same cert files, same pod, `openssl s_client` proving the certs and route
+are fine) producing wildly different outcomes (10s to 8+ min) purely as a
+function of wall-clock timing, worsening across a session of many repeated
+`helm upgrade` cycles (each one growing the guest's own memory footprint via
+release history, extra API objects, etc. on an already-tight host). A closed
+-source `openshell` binary bug remains possible but is unconfirmed and, given
+this evidence, less likely than host resource starvation as the primary
+driver. Practical implication: if you hit this, check host `free -h`/swap
+before assuming a code regression — closing memory-heavy host applications
+(browser tabs, etc.) or giving the CRC VM less RAM may resolve it outright.
+
+**Only ever observed after `helm upgrade`, not fresh `helm install`**: the
+very first install (revision 1) on a truly fresh CRC VM hit a different,
+much milder race ("client error (Canceled) / connection was not ready") that
+resolves within seconds. The multi-minute "CertificateRequired" variant only
+showed up once the same `openshell` Helm release had already been installed
+and was being re-applied (`helm upgrade`) — i.e. normal single-shot
+`crc-lifecycle.sh full --fresh` runs are less likely to hit the slow path,
+but repeated `deploy`/re-deploy cycles against a live cluster will.
+
+**Restarting the gateway pod was tried and did not prove reliably faster**:
+forcing a pod restart (`oc delete pod -l app.kubernetes.io/name=openshell`)
+recovered near-instantly in one trial, but in two subsequent trials the
+freshly-restarted pod (confirmed via a new pod IP and reset age) still
+failed for the entire length of a post-restart retry window (60s and then
+2 minutes, tried separately) before eventually recovering — no better than
+just waiting on the original pod. Not pursued further as a mitigation.
+
+**The real trigger turned out to be the `gateway remove`+`add` re-
+registration itself, not passive readiness**: across many repeated trials,
+a bare `openshell status` against an *already-registered, undisturbed*
+gateway succeeded near-instantly essentially every single time (including
+right after long stretches where a script's post-`remove`+`add` retry loop
+had just failed for 5-10+ minutes) — while re-running `gateway remove ocp`
+followed immediately by `gateway add` before checking status was the
+unreliable step. This finally unblocked full end-to-end validation: with
+the gateway left registered from an earlier attempt, Phases 6-9 and a full
+`verify.sh` run (54 passed, 0 failed, 5 expected warnings, all 15
+Playwright tests green including live E2E chat and security checks)
+completed cleanly on the first try, no further mTLS issues at all.
+
+**Fix**: `scripts/deploy-openshell.sh` now only touches the local mTLS cert
+cache and calls `gateway remove`+`add` when `openshell status` isn't already
+succeeding against the existing registration (skipping unnecessary churn on
+repeat `deploy` runs against an unchanged Route — the status check happens
+*before* any cert files are touched, since unconditionally rewriting them
+first, even with identical content, invalidates the CLI's cached client.p12
+and defeats the skip). When re-registration genuinely is needed (fresh
+install, or the gateway actually dropped), it retries `openshell status`
+with a bounded budget (40 attempts, 20s apart — ~13 minutes) before treating
+it as fatal. Re-validated live on this host under sustained heavy memory
+pressure (<1.5 GiB free, 7+ GiB/8 GiB swap in use throughout): even with the
+skip-if-connected optimization working correctly, the gateway was observed
+dropping and needing a fresh remove+add multiple times across one
+multi-phase deploy run, twice exhausting a 20-attempt/6.5-minute budget
+before succeeding seconds after the script gave up — hence the wider
+40-attempt budget.
+
+**Scripts affected**: `scripts/deploy-openshell.sh` — fixed (skip
+unnecessary re-registration + retry loop). Flagged as a known upstream-
+`openshell`-CLI/server quirk (the remaining first-install case) rather than
+something fully fixable in this repo; a real fix for that residual case
+would need to come from the `openshell` project itself.

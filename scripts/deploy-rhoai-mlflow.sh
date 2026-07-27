@@ -18,10 +18,9 @@
 # an accepted, deliberate trade-off (no lightweight standalone-MLflow
 # fallback exists anymore) — see ADR-0018's "Consequences" section.
 #
-# Secrets: never commits a plaintext DB password to git (AGENTS.md). If
-# MLFLOW_DB_PASSWORD isn't already in secrets/secrets.env, generates one with
-# `openssl rand` and appends it there for idempotency (same pattern as
-# scripts/deploy-keycloak.sh / scripts/deploy-oauth2-proxy.sh).
+# Secrets: never commits a plaintext DB password to git (AGENTS.md). Uses
+# common.sh's ensure_secret_var() — same idempotent helper as
+# scripts/deploy-keycloak.sh / scripts/deploy-oauth2-proxy.sh.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
@@ -37,22 +36,7 @@ if [[ "$CRC_MODE" == "true" ]]; then
 fi
 
 step "Ensuring MLFLOW_DB_PASSWORD secret exists"
-SECRETS_FILE="${PROJECT_DIR}/secrets/secrets.env"
-if [[ ! -f "$SECRETS_FILE" ]]; then
-  error "Secrets file not found: $SECRETS_FILE"
-  error "Copy secrets/secrets.template.env to secrets/secrets.env and fill in MAAS_API_KEY first"
-  exit 1
-fi
-set -a
-source "$SECRETS_FILE"
-set +a
-if [[ -z "${MLFLOW_DB_PASSWORD:-}" ]]; then
-  MLFLOW_DB_PASSWORD=$(openssl rand -hex 24)
-  echo "MLFLOW_DB_PASSWORD=${MLFLOW_DB_PASSWORD}" >>"$SECRETS_FILE"
-  info "Generated MLFLOW_DB_PASSWORD and appended to secrets/secrets.env"
-else
-  info "Using existing MLFLOW_DB_PASSWORD from secrets/secrets.env"
-fi
+ensure_secret_var MLFLOW_DB_PASSWORD -hex 24
 
 step "Deploying minimal RHOAI + MLflow stack (charts/rhoai)"
 info "installPlanApproval is Manual - charts/rhoai/Makefile's wait-operators target"

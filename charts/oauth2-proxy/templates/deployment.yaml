@@ -5,7 +5,7 @@
 # Keycloak broker required for this path. See ADR-0016.
 #
 # `--pass-host-header=true` + the public Route hostname
-# (openclaw-gw--openclaw-ui.__APPS_DOMAIN__, matching OpenShell's
+# (openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}, matching OpenShell's
 # {sandbox}--{service} routing pattern) work around a real bug in this
 # fork's WebSocket reverse proxy: `NewWebSocketOrRestReverseProxy` in
 # oauthproxy.go never applies `setProxyUpstreamHostHeader` to the
@@ -18,11 +18,29 @@
 # hostname *equal* the upstream's expected Host sidesteps the bug for both
 # HTTP and WebSocket traffic instead of depending on host rewriting at all.
 # See ADR-0016 "WebSocket login failure" section.
+{{- /*
+The public Route (openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}, see
+route.yaml) points at THIS Deployment's Service, not at the `openshell`
+Service anymore -- so --upstream can no longer resolve that hostname through
+the Route without looping back into this same Deployment. A hostAlias below
+makes the hostname resolve straight to the `openshell` Service's ClusterIP
+instead, so --upstream still dials the real OpenShell gateway while keeping
+the same Host/SNI value that both the gateway's routing and its self-signed
+cert's wildcard SAN expect. Resolved declaratively here via Helm's `lookup`
+function (requires a live cluster connection — not available under `helm
+template`/`--dry-run`, only real `helm upgrade --install` runs, which is all
+scripts/deploy-oauth2-proxy.sh ever does) instead of a `sed -i` on a
+rendered manifest.
+*/}}
+{{- $openshellSvc := lookup "v1" "Service" .Values.namespace "openshell" }}
+{{- if not $openshellSvc }}
+{{- fail (printf "Service 'openshell' not found in namespace '%s' — deploy OpenShell first (scripts/deploy-openshell.sh)" .Values.namespace) }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: oauth-proxy
-  namespace: openshell
+  namespace: {{ .Values.namespace }}
   labels:
     app: oauth-proxy
 spec:
@@ -36,27 +54,17 @@ spec:
         app: oauth-proxy
     spec:
       serviceAccountName: openclaw-ui-oauth-proxy
-      # The public Route (openclaw-gw--openclaw-ui.__APPS_DOMAIN__, see
-      # route.yaml.tpl) now points at THIS Service, not at the `openshell`
-      # Service anymore -- so --upstream can no longer resolve that hostname
-      # through the Route without looping back into this same Deployment.
-      # This hostAlias makes the hostname resolve straight to the `openshell`
-      # Service's ClusterIP instead, so --upstream still dials the real
-      # OpenShell gateway while keeping the same Host/SNI value that both the
-      # gateway's routing and its self-signed cert's wildcard SAN expect.
-      # __OPENSHELL_GW_CLUSTER_IP__ is substituted at deploy time (see
-      # scripts/deploy-oauth2-proxy.sh) since the ClusterIP is dynamic.
       hostAliases:
-        - ip: __OPENSHELL_GW_CLUSTER_IP__
+        - ip: {{ $openshellSvc.spec.clusterIP }}
           hostnames:
-            - openclaw-gw--openclaw-ui.__APPS_DOMAIN__
+            - openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}
       containers:
         - name: oauth-proxy
-          image: registry.redhat.io/openshift4/ose-oauth-proxy:latest
+          image: {{ .Values.image }}
           args:
             - --provider=openshift
             - --openshift-service-account=openclaw-ui-oauth-proxy
-            # Explicit :8080 is required: the hostAlias below sends this
+            # Explicit :8080 is required: the hostAlias above sends this
             # hostname straight to the `openshell` Service's ClusterIP,
             # bypassing the Route/router that used to supply the implicit
             # :443. The Service's only listener is `grpc` on 8080 (a
@@ -65,7 +73,7 @@ spec:
             # explicit port oauth-proxy dials 10.x.x.x:443, which nothing
             # listens on, and every proxied request (including WebSocket
             # upgrades) hangs until it times out.
-            - --upstream=https://openclaw-gw--openclaw-ui.__APPS_DOMAIN__:8080
+            - --upstream=https://openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}:8080
             - --ssl-insecure-skip-verify=true
             - --upstream-ca=/etc/openshell/ca.crt
             - --https-address=:8443

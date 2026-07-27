@@ -188,7 +188,7 @@ step "Copying config to writable workspace"
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/state
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/agents
 oc -n "$NAMESPACE" cp "${RENDERED_DIR}/openclaw.json" \
-  "${SANDBOX_NAME}:/sandbox/workspace/.openclaw/openclaw.json" -c agent 2>/dev/null || true
+  "${SANDBOX_NAME}:/sandbox/workspace/.openclaw/openclaw.json" -c agent
 
 # Fix ownership so sandbox user can read the config
 SANDBOX_UID=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- id -u sandbox 2>/dev/null || echo "1000")
@@ -239,8 +239,8 @@ info "Combined bundle staged at ${RHOAI_MLFLOW_COMBINED_CA}"
 # RHOAI MLflow requires Bearer token + X-MLFLOW-WORKSPACE + CA validation on
 # every request (same as the plugin/linker — see docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md); passed through as env vars the script reads.
 step "Fetching system prompts from MLflow Prompt Registry"
-oc -n "$NAMESPACE" cp "${PROJECT_DIR}/scripts/fetch-prompts-from-mlflow.sh" \
-  "${SANDBOX_NAME}:/tmp/fetch-prompts-from-mlflow.sh" -c agent 2>/dev/null || true
+oc -n "$NAMESPACE" cp "${PROJECT_DIR}/scripts/prompt-registry/fetch-prompts-from-mlflow.sh" \
+  "${SANDBOX_NAME}:/tmp/fetch-prompts-from-mlflow.sh" -c agent
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- chmod +x /tmp/fetch-prompts-from-mlflow.sh
 
 MLFLOW_EXP_ID=$(python3 -c "import json; d=json.load(open('${RENDERED_DIR}/openclaw.json')); print(d.get('plugins',{}).get('entries',{}).get('mlflow-openclaw',{}).get('config',{}).get('experimentId','0'))" 2>/dev/null || echo "0")
@@ -266,8 +266,8 @@ fi
 # for HTTP because Node.js fetch() is blocked by the proxy for the same
 # binary-resolution reason as constraint #3.
 step "Installing prompt trace linker sidecar"
-oc -n "$NAMESPACE" cp "${PROJECT_DIR}/scripts/prompt-trace-linker.js" \
-  "${SANDBOX_NAME}:/tmp/prompt-trace-linker.js" -c agent 2>/dev/null || true
+oc -n "$NAMESPACE" cp "${PROJECT_DIR}/scripts/prompt-registry/prompt-trace-linker.js" \
+  "${SANDBOX_NAME}:/tmp/prompt-trace-linker.js" -c agent
 
 # ─── Step 6: Install mlflow-openclaw plugin ──────────────────────────────────
 # This plugin hooks into OpenClaw's agent lifecycle events and creates MLflow
@@ -320,97 +320,12 @@ fi
 #      specific registry fetch, not root-caused — constraint #4e); patching
 #      the already-installed file sidesteps the registry entirely, same
 #      category of fix as #1/#2 above.
-# The patch script is idempotent (checks before patching).
+# The patch script is idempotent (checks before patching) and lives at
+# scripts/patch-mlflow-plugin.py — versioned in the repo as the single
+# source of truth, copied into the sandbox as-is (no regeneration here).
 step "Patching mlflow-openclaw plugin for compatibility"
-PATCH_SCRIPT="${PROJECT_DIR}/scripts/patch-mlflow-plugin.py"
-cat > "$PATCH_SCRIPT" << 'PYEOF'
-import re
-
-PKG = '/sandbox/workspace/.openclaw/extensions/mlflow-openclaw/node_modules/@mlflow/mlflow-openclaw'
-
-SVC = PKG + '/src/service.ts'
-with open(SVC, 'r') as f:
-    content = f.read()
-if 'diagnostics-otel' in content:
-    old_import = re.compile(
-        r"import\s*\{[^}]*onDiagnosticEvent[^}]*\}\s*from\s*['\"]openclaw/plugin-sdk/diagnostics-otel['\"];",
-        re.DOTALL
-    )
-    replacement = ('// diagnostics-otel replaced with no-op (not available in OpenClaw 2026.7.1)\n'
-                   'const onDiagnosticEvent = (fn: any) => (() => {});\n'
-                   'type DiagnosticEventPayload = any;')
-    content = old_import.sub(replacement, content)
-    with open(SVC, 'w') as f:
-        f.write(content)
-    print('service.ts patched')
-else:
-    print('service.ts already patched')
-
-IDX = PKG + '/index.ts'
-with open(IDX, 'r') as f:
-    content = f.read()
-if 'definePluginEntry' in content:
-    content = content.replace(
-        "import { definePluginEntry, type OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';",
-        '// definePluginEntry replaced for OpenClaw 2026.7.1 compat'
-    )
-    content = re.sub(r'export\s+default\s+definePluginEntry\(\{', 'const mlflowPlugin = ({', content)
-    content = content.replace('OpenClawPluginApi', 'any')
-    if not content.rstrip().endswith('export default mlflowPlugin;'):
-        content = content.rstrip()
-        if content.endswith('});'):
-            content = content[:-3] + '});\nexport default mlflowPlugin;\n'
-    with open(IDX, 'w') as f:
-        f.write(content)
-    print('index.ts patched')
-else:
-    print('index.ts already patched')
-
-# Backport of mlflow/mlflow#23927 for the pinned @mlflow/core@0.2.0 (see the
-# comment above this heredoc, and constraint #4b in docs/constraints.md).
-# createOssAuth()'s headersProvider builds Content-Type/Authorization but
-# never X-MLFLOW-WORKSPACE — RHOAI-managed MLflow (ADR-0017) rejects every
-# request without it once workspaces are enabled, even with valid auth.
-CORE_AUTH = '/sandbox/workspace/.openclaw/extensions/mlflow-openclaw/node_modules/@mlflow/core/dist/auth/index.js'
-with open(CORE_AUTH, 'r') as f:
-    content = f.read()
-if 'X-MLFLOW-WORKSPACE' in content:
-    print('@mlflow/core auth/index.js already patched')
-else:
-    old = """    const headersProvider = async () => {
-        const headers = { 'Content-Type': 'application/json' };
-        if (authHeader) {
-            headers['Authorization'] = authHeader;
-        }
-        return headers;
-    };"""
-    new = """    const headersProvider = async () => {
-        const headers = { 'Content-Type': 'application/json' };
-        if (authHeader) {
-            headers['Authorization'] = authHeader;
-        }
-        // Backport of mlflow/mlflow#23927 (upstream fix landed in
-        // @mlflow/core@0.3.0; this plugin is pinned to 0.2.0 — see
-        // docs/constraints.md #4b). Required by RHOAI-managed MLflow
-        // whenever workspaces are enabled (docs/adrs/ADR-0017-rhoai-mlflow-scope.md).
-        const workspace = options.workspace || process.env.MLFLOW_WORKSPACE;
-        if (workspace) {
-            headers['X-MLFLOW-WORKSPACE'] = workspace;
-        }
-        return headers;
-    };"""
-    if old not in content:
-        raise SystemExit(
-            '@mlflow/core auth/index.js: expected headersProvider block not found '
-            '(package version drift?) — refusing to patch blindly. Inspect ' + CORE_AUTH
-        )
-    content = content.replace(old, new)
-    with open(CORE_AUTH, 'w') as f:
-        f.write(content)
-    print('@mlflow/core auth/index.js patched (X-MLFLOW-WORKSPACE backport)')
-PYEOF
-
-oc -n "$NAMESPACE" cp "$PATCH_SCRIPT" "${SANDBOX_NAME}:/tmp/patch-mlflow-plugin.py" -c agent
+oc -n "$NAMESPACE" cp "${PROJECT_DIR}/scripts/patch-mlflow-plugin.py" \
+  "${SANDBOX_NAME}:/tmp/patch-mlflow-plugin.py" -c agent
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- python3 /tmp/patch-mlflow-plugin.py 2>&1 \
   | while IFS= read -r line; do info "  $line"; done
 
@@ -428,9 +343,12 @@ info "Plugin installed and patched (root-owned)"
 # provisions directories. Order relative to Step 3's config copy therefore
 # does not matter for the config's contents.
 step "Initializing OpenClaw baseline config"
-oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
-  HOME=/sandbox/workspace openclaw setup --baseline --non-interactive --accept-risk 2>/dev/null || true
-' 2>&1 | tail -3 | while IFS= read -r line; do info "  $line"; done
+BASELINE_STATUS=0
+BASELINE_OUTPUT=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
+  HOME=/sandbox/workspace openclaw setup --baseline --non-interactive --accept-risk
+' 2>&1) || BASELINE_STATUS=$?
+echo "$BASELINE_OUTPUT" | tail -3 | while IFS= read -r line; do info "  $line"; done
+[[ $BASELINE_STATUS -ne 0 ]] && warn "openclaw setup --baseline exited non-zero ($BASELINE_STATUS) — see output above"
 
 # ─── Step 9: Start gateway and trace linker ──────────────────────────────────
 # CRITICAL CONSTRAINTS:

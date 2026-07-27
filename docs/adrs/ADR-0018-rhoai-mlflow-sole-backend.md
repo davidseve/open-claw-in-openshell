@@ -76,8 +76,10 @@ MLflow deployed and wired:
   lockdown, trace-tag linking) is **unchanged in design** — only its
   backend, tracking URI, and auth (Bearer token + `X-MLFLOW-WORKSPACE`
   header, TLS validated against `openshift-service-ca.crt`) changed.
-  `scripts/seed-mlflow-prompts.sh` and
-  `scripts/fetch-prompts-from-mlflow.sh` were updated accordingly.
+  `scripts/prompt-registry/seed-mlflow-prompts.sh` and
+  `scripts/prompt-registry/fetch-prompts-from-mlflow.sh` were updated
+  accordingly (later moved into `scripts/prompt-registry/` together with
+  `prompt-trace-linker.js` — see that directory's `README.md`).
 
 ### What did NOT change
 
@@ -141,10 +143,11 @@ MLflow deployed and wired:
 - **All prompt/trace-related scripts now require RHOAI MLflow's wiring
   facts to exist** (`.rendered/rhoai-mlflow/wiring.env`, produced by
   `scripts/wire-rhoai-mlflow-tracing.sh`) before they can authenticate —
-  `scripts/verify.sh`, `scripts/test-tracing.sh`, and
-  `scripts/smoke-test-e2e.sh` all degrade to `warn`/skip (not silent
-  false-pass) when that file is missing, rather than trying an
-  unauthenticated request that would just 401/400.
+  `scripts/verify.sh` and `scripts/test-tracing.sh` both degrade to
+  `warn`/skip (not silent false-pass) when that file is missing, rather
+  than trying an unauthenticated request that would just 401/400.
+  (`scripts/smoke-test-e2e.sh` was later removed — it duplicated
+  `verify.sh` Layer 8/8b/9; see the 2026-07-26 simplification pass.)
 - **Documentation and history**: [ADR-0014](ADR-0014-agent-observability.md) and [ADR-0015](ADR-0015-mlflow-prompt-registry.md) are marked
   Superseded (MLflow half only, for ADR-0014) but kept verbatim as
   historical record of the original design rationale — not deleted, per

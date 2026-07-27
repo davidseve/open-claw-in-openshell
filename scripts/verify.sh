@@ -15,6 +15,16 @@
 #   0 = all checks passed (warnings are informational)
 #   1 = at least one FAIL
 #
+# PROFILES (VERIFY_PROFILE env var):
+#   full  (default) — every check below, including the slow/deep ones
+#         (synthetic OTel->Tempo trace round-trip, MLflow Prompt Registry
+#         deep checks, Playwright browser UI test). What CI/`crc-lifecycle.sh
+#         full` runs.
+#   smoke — the fast, essential subset (infra/pods/routes/CLI/security/
+#         gateway health/LLM proxy connectivity) that finishes in seconds,
+#         for a quick "is anything obviously broken" check while iterating.
+#         Run with: VERIFY_PROFILE=smoke ./scripts/verify.sh
+#
 # VERIFICATION ARCHITECTURE:
 #
 #   Layer 1:  OCP infrastructure (CRDs, namespace, SCC, PKI secrets)
@@ -23,8 +33,9 @@
 #   Layer 3:  Sandbox existence and readiness
 #   Layer 4:  Security (user identity, egress blocking, Landlock, credentials)
 #   Layer 5:  OpenClaw gateway health (/health, config, chatCompletions)
-#   Layer 5b: LLM connectivity (Node.js binary path, fetch(), proxy denials,
-#             end-to-end LLM request, MLflow trace generation)
+#   Layer 5b: LLM connectivity (Node.js binary path, fetch(), proxy denials —
+#             see docs/constraints.md #17 for why the end-to-end chat +
+#             trace checks were removed; Layer 9 Playwright covers that path)
 #   Layer 7b: External access (service route, oauth2-proxy OIDC)
 #   Layer 8:  Observability stack (Tempo, OTel Collector) + RHOAI MLflow
 #   Layer 8b: MLflow Prompt Registry (prompts, aliases, manifest, linker)
@@ -36,8 +47,10 @@ source "$(dirname "$0")/common.sh"
 
 NAMESPACE="${NAMESPACE:-openshell}"
 SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw}"
+VERIFY_PROFILE="${VERIFY_PROFILE:-full}"
 
 detect_environment
+info "Verification profile: ${VERIFY_PROFILE} (set VERIFY_PROFILE=smoke for the fast subset)"
 
 # =============================================================================
 # Layer 1: OCP Infrastructure
@@ -78,16 +91,6 @@ for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
 done
 
 # =============================================================================
-# Layer 1a: Config template drift
-# =============================================================================
-# WHY: config/openclaw.json is a committed reference snapshot, but no deploy
-#   script writes to it (they render config/openclaw.json.tpl straight into
-#   .rendered/). It only stays accurate by hand-editing — this check catches
-#   when the snapshot and template have quietly diverged.
-step "Layer 1a: Config template drift (openclaw.json vs .tpl)"
-check_config_snapshot_drift
-
-# =============================================================================
 # Layer 1b: Keycloak OIDC
 # =============================================================================
 # WHY: All user-facing access (Control UI, CLI) goes through OIDC.
@@ -101,10 +104,12 @@ KC_ISSUER="https://keycloak-${KC_NAMESPACE}.${APPS_DOMAIN}/realms/openshell"
 if oc get ns "$KC_NAMESPACE" &>/dev/null; then
   pass "Keycloak namespace exists"
 
-  KC_PHASE=$(oc -n "$KC_NAMESPACE" get pods -l app=keycloak -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
-  [[ "$KC_PHASE" == "Running" ]] \
-    && pass "Keycloak pod Running" \
-    || warn "Keycloak pod phase: $KC_PHASE"
+  if oc -n "$KC_NAMESPACE" wait --for=condition=Ready pod -l app=keycloak --timeout=20s &>/dev/null; then
+    pass "Keycloak pod Running"
+  else
+    KC_PHASE=$(oc -n "$KC_NAMESPACE" get pods -l app=keycloak -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
+    warn "Keycloak pod phase: $KC_PHASE"
+  fi
 
   KC_DISCOVERY=$(curl -sk "${KC_ISSUER}/.well-known/openid-configuration" 2>/dev/null || true)
   if echo "$KC_DISCOVERY" | grep -q "jwks_uri"; then
@@ -128,10 +133,12 @@ fi
 # HOW TO FIX: scripts/deploy-openshell.sh
 step "Layer 2: OpenShell Gateway"
 
-PHASE=$(oc -n "$NAMESPACE" get pods -l app.kubernetes.io/name=openshell -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
-[[ "$PHASE" == "Running" ]] \
-  && pass "Gateway pod Running" \
-  || fail "Gateway pod phase: $PHASE"
+if oc -n "$NAMESPACE" wait --for=condition=Ready pod -l app.kubernetes.io/name=openshell --timeout=20s &>/dev/null; then
+  pass "Gateway pod Running"
+else
+  PHASE=$(oc -n "$NAMESPACE" get pods -l app.kubernetes.io/name=openshell -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
+  fail "Gateway pod phase: $PHASE"
+fi
 
 ROUTE_HOST=$(oc -n "$NAMESPACE" get route openshell-gw -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
 if [[ -n "$ROUTE_HOST" ]]; then
@@ -344,23 +351,20 @@ fi
 #      The proxy logs DENIED entries with the reason.
 #      => Check 3 looks for DENIED entries mentioning "maas".
 #
-#   4. End-to-end LLM request: The ultimate test — does the gateway actually
-#      get a response from the LLM model? This catches API key issues,
-#      model routing issues, and any other end-to-end problems.
-#      Method: temporarily enable chatCompletions, send a request, disable it.
-#      => Check 4 sends a real LLM request and checks for a model response.
-#
-#   5. Trace generation: After an LLM request, MLflow should have a new trace.
-#      If no trace appears, the mlflow-openclaw plugin isn't loaded or isn't
-#      working. This is the ONLY way to verify the plugin is actually active.
-#      => Check 5 verifies a trace was created within the last 300 seconds.
+# A real end-to-end chat request + MLflow trace check used to live here as
+# Checks 4-5, but were removed (docs/constraints.md #17): Check 4 toggled
+# `gateway.http.endpoints.chatCompletions.enabled` at runtime, which is a
+# no-op on the running gateway (`gateway.reload.mode=off`) — its "PASS" came
+# from a PTY echoing the curl command's own text, not a real model response,
+# while Check 5 (trace recency) then correctly but confusingly FAILed against
+# a request that never actually happened. Layer 9's Playwright test already
+# exercises a real chat turn over the WebSocket path (unaffected by this
+# bug) end-to-end, so that removal costs no real coverage.
 #
 # HOW TO FIX:
 #   Check 1 fail: oc exec $SANDBOX -c agent -- bash -c 'cp /usr/local/bin/node /usr/bin/node && rm -f /usr/local/bin/node'
 #   Check 2 fail: Verify no HTTP_PROXY/NODE_OPTIONS set. Check launch-openclaw.sh constraint #3.
 #   Check 3 fail: Review policies/openclaw-sandbox.yaml. Check `openshell logs openclaw-gw | grep DENIED`.
-#   Check 4 fail: Check API key injection in launch-openclaw.sh. Verify secrets/secrets.env has MAAS_API_KEY.
-#   Check 5 fail: Verify mlflow-openclaw plugin loaded. Check `oc exec $SANDBOX -c agent -- grep mlflow /sandbox/workspace/openclaw.log`.
 step "Layer 5b: LLM Connectivity"
 
 if command -v openshell &>/dev/null; then
@@ -410,129 +414,6 @@ HEREDOC
     fail "Sandbox proxy denied MaaS access ($DENY_COUNT entries). Latest: ${LATEST_DENY:0:120}"
   fi
 
-  # Check 4: Gateway can complete a REAL LLM request.
-  # This is the end-to-end test: config → gateway → proxy → MaaS → model.
-  # We temporarily enable chatCompletions, send a request, then disable it.
-  # chatCompletions is normally disabled (security: only WebSocket via UI).
-  # (See root cause #4 above)
-  sandbox_run 'python3 -c "
-import json
-CFG=\"/sandbox/workspace/.openclaw/openclaw.json\"
-with open(CFG) as f: d=json.load(f)
-d[\"gateway\"][\"http\"][\"endpoints\"][\"chatCompletions\"][\"enabled\"]=True
-with open(CFG,\"w\") as f: json.dump(d,f,indent=2)
-"' > /dev/null 2>&1 || true
-
-  GW_LLM=$(sandbox_run "curl -sf --max-time 45 -X POST http://127.0.0.1:18789/v1/chat/completions \
-    -H 'Content-Type: application/json' \
-    -H 'X-Forwarded-Email: verify@test.local' \
-    -H 'X-Forwarded-Proto: https' \
-    -H 'X-Forwarded-Host: openclaw-gw--openclaw-ui.${APPS_DOMAIN}' \
-    -d '{\"model\":\"openclaw\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: VERIFY_OK\"}],\"stream\":false,\"max_tokens\":20}' 2>&1; echo GW_LLM_EXIT:\$?" || true)
-
-  # NOTE on both the sleep below and deferring the chatCompletions.enabled=false
-  # restore until AFTER Check 5's trace-recency poll (not done here immediately
-  # after the request): `gateway.http.endpoints.*` has no dedicated hot-reload
-  # rule in OpenClaw's config-reload-plan.ts, so it falls through to the
-  # generic `gateway` prefix rule (kind: "restart") — writing this key
-  # restarts the entire gateway process (confirmed live: gateway.log shows
-  # "[reload] config change requires gateway restart" -> SIGUSR1 -> in-process
-  # restart). The gateway's own config-file watcher also detects our *enable*
-  # write above with several seconds of latency (it's not the live per-request
-  # read that let the completions call above succeed immediately), so a
-  # restart from enabling can land seconds after the request already
-  # returned. Either restart races the mlflow-openclaw plugin's async
-  # agent_end -> MLflow flush (queueMicrotask in service.ts): live testing
-  # showed the flush lands within ~1s of the LLM response in the absence of a
-  # restart, but a restart mid-flush drops the trace before it reaches
-  # MLflow, so Check 5 always found a stale trace. The sleep gives the flush
-  # a safety margin before either restart can hit; deferring the disable-write
-  # avoids adding a second, self-inflicted restart during Check 5's own poll.
-  # See docs/constraints.md #14 for the related L7 proxy failure-mode audit
-  # that surfaced this while investigating.
-  sleep 8
-
-  if echo "$GW_LLM" | grep -qi "choices\|content\|VERIFY_OK"; then
-    pass "Gateway LLM request completed (model responded)"
-  elif echo "$GW_LLM" | grep -qi "401\|authentication\|LiteLLM.*expected"; then
-    fail "Gateway LLM auth failed — API key not injected. Fix: check MAAS_API_KEY in secrets/secrets.env and re-run launch-openclaw.sh"
-  elif echo "$GW_LLM" | grep -qi "fetch failed\|Connection error\|timeout"; then
-    fail "Gateway LLM request failed — network error. Fix: check openshell logs openclaw-gw | grep DENIED"
-  else
-    RECENT_ERRORS=$(sandbox_run 'grep -c "fetch failed\|network connection error\|LLM request failed" /sandbox/workspace/openclaw.log 2>/dev/null || echo 0' || true)
-    if echo "$RECENT_ERRORS" | grep -qE "^0$|^[[:space:]]*0"; then
-      pass "No LLM connection errors in gateway log"
-    else
-      fail "Gateway has LLM connection errors in log"
-    fi
-  fi
-
-  # Check 5: The LLM request above should have generated a trace in RHOAI
-  # MLflow (the sole tracing backend — docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md). If no trace appears within 300s, the mlflow-openclaw plugin
-  # is not loaded or not working. This is the ONLY reliable way to verify the
-  # full trace pipeline: gateway → plugin → MLflow. (See root cause #5 above)
-  #
-  # The trace may take 15-30s to propagate (plugin → MLflow API → storage).
-  # We retry up to 6 times (90s total) before failing. Requires a Bearer
-  # token + X-MLFLOW-WORKSPACE header (RHOAI MLflow always runs with
-  # --enable-workspaces), sourced from scripts/wire-rhoai-mlflow-tracing.sh's
-  # output.
-  RHOAI_WIRING_5B="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
-  MLFLOW_HOST_5B=$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
-  if [[ -n "$MLFLOW_HOST_5B" && -f "$RHOAI_WIRING_5B" ]]; then
-    set -a; source "$RHOAI_WIRING_5B"; set +a
-    AUTH_HEADERS_5B=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
-    MLFLOW_EXT_5B="https://${MLFLOW_HOST_5B}"
-    TRACE_FOUND=false
-    for attempt in 1 2 3 4 5 6; do
-      sleep 15
-      RECENT_TRACE=$(curl -sf $CURL_OPTS "${AUTH_HEADERS_5B[@]}" "${MLFLOW_EXT_5B}/api/2.0/mlflow/traces?experiment_ids=${RHOAI_MLFLOW_EXPERIMENT_ID}&max_results=1" 2>/dev/null | python3 -c "
-import sys,json,time
-data = json.load(sys.stdin)
-traces = data.get('traces',[])
-if traces:
-    ts = traces[0].get('timestamp_ms',0)
-    age_s = (time.time()*1000 - ts) / 1000
-    print(f'AGE:{age_s:.0f}')
-else:
-    print('NO_TRACES')
-" 2>/dev/null || echo "ERROR")
-      if echo "$RECENT_TRACE" | grep -q "^AGE:"; then
-        TRACE_AGE=$(echo "$RECENT_TRACE" | tr -d '\r' | sed -n 's/^AGE://p')
-        if [[ "${TRACE_AGE%%.*}" -lt 300 ]]; then
-          pass "Latest MLflow trace is recent (${TRACE_AGE}s ago) — trace pipeline working"
-          TRACE_FOUND=true
-          break
-        fi
-      fi
-      if [[ $attempt -lt 6 ]]; then
-        info "Waiting for MLflow trace (attempt $attempt/6)..."
-      fi
-    done
-    if [[ "$TRACE_FOUND" != "true" ]]; then
-      if echo "$RECENT_TRACE" | grep -q "^AGE:"; then
-        TRACE_AGE=$(echo "$RECENT_TRACE" | tr -d '\r' | sed -n 's/^AGE://p')
-        fail "Latest MLflow trace is stale (${TRACE_AGE}s ago) — mlflow-openclaw plugin may not be loaded. Fix: check grep mlflow /sandbox/workspace/openclaw.log"
-      elif echo "$RECENT_TRACE" | grep -q "NO_TRACES"; then
-        fail "No traces in MLflow after 90s — mlflow-openclaw plugin not generating traces. Fix: re-run launch-openclaw.sh"
-      else
-        warn "Could not check trace recency"
-      fi
-    fi
-  else
-    warn "Skipping Check 5 (MLflow route or ${RHOAI_WIRING_5B} not found) — run scripts/deploy-rhoai-mlflow.sh + scripts/wire-rhoai-mlflow-tracing.sh first"
-  fi
-
-  # Restore chatCompletions to disabled now that Check 5's trace poll is
-  # done. Writing this key restarts the gateway (see NOTE above Check 4), so
-  # it must happen after — not before — we've finished waiting on the trace.
-  sandbox_run 'python3 -c "
-import json
-CFG=\"/sandbox/workspace/.openclaw/openclaw.json\"
-with open(CFG) as f: d=json.load(f)
-d[\"gateway\"][\"http\"][\"endpoints\"][\"chatCompletions\"][\"enabled\"]=False
-with open(CFG,\"w\") as f: json.dump(d,f,indent=2)
-"' > /dev/null 2>&1 || true
 else
   warn "openshell CLI not available, skipping LLM connectivity checks"
 fi
@@ -569,7 +450,7 @@ fi
 step "Layer 7b: oauth-proxy OpenShift-native OAuth UI Authentication"
 
 # Hostname must equal OpenShell's {sandbox}--{service} pattern -- see
-# manifests/oauth2-proxy/route.yaml.tpl for why (WebSocket Host-header bug
+# charts/oauth2-proxy/templates/route.yaml for why (WebSocket Host-header bug
 # in this oauth-proxy fork, ADR-0016).
 OAUTH_PROXY_HOST="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
 
@@ -703,15 +584,13 @@ RHOAI_NS="redhat-ods-applications"
 if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
   pass "Observability namespace exists"
 
-  TEMPO_READY=$(oc -n "$OBS_NAMESPACE" get pods -l app=tempo -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-  if [[ "$TEMPO_READY" == "true" ]]; then
+  if oc -n "$OBS_NAMESPACE" wait --for=condition=Ready pod -l app=tempo --timeout=20s &>/dev/null; then
     pass "Tempo pod running and ready"
   else
     fail "Tempo pod not ready"
   fi
 
-  COLLECTOR_READY=$(oc -n "$OBS_NAMESPACE" get pods -l app=otel-collector -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-  if [[ "$COLLECTOR_READY" == "true" ]]; then
+  if oc -n "$OBS_NAMESPACE" wait --for=condition=Ready pod -l app=otel-collector --timeout=20s &>/dev/null; then
     pass "OTel Collector pod running and ready"
   else
     fail "OTel Collector pod not ready"
@@ -726,8 +605,7 @@ RHOAI_WIRING_8="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
 if oc get ns "$RHOAI_NS" &>/dev/null; then
   pass "RHOAI namespace exists"
 
-  MLFLOW_READY=$(oc -n "$RHOAI_NS" get pods -l app=mlflow -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-  if [[ "$MLFLOW_READY" == "true" ]]; then
+  if oc -n "$RHOAI_NS" wait --for=condition=Ready pod -l app=mlflow --timeout=20s &>/dev/null; then
     pass "MLflow pod running and ready"
   else
     fail "MLflow pod not ready"
@@ -757,7 +635,9 @@ if oc get ns "$RHOAI_NS" &>/dev/null; then
   fi
 fi
 
-if oc get ns "$OBS_NAMESPACE" &>/dev/null; then
+if [[ "$VERIFY_PROFILE" != "full" ]]; then
+  info "Skipping synthetic OTel->Tempo trace round-trip (smoke profile) — diagnostic-only, see scripts/test-tracing.sh"
+elif oc get ns "$OBS_NAMESPACE" &>/dev/null; then
   # Send a test trace through the OTel pipeline to verify it's working
   oc -n "$OBS_NAMESPACE" port-forward svc/otel-collector 24318:4318 &>/dev/null &
   TRACE_PF_PID=$!
@@ -835,7 +715,9 @@ fi
 # =============================================================================
 # Layer 8b: MLflow Prompt Registry
 # =============================================================================
-# WHY: Verifies the full prompt management lifecycle:
+# WHY: Verifies the full prompt management lifecycle. See
+#   scripts/prompt-registry/README.md for what this subsystem is, how it
+#   works, and how to remove it if it's no longer worth the operational cost:
 #   1. Prompts are registered in MLflow (seed-mlflow-prompts.sh ran)
 #   2. @production aliases are set (controlled rollout)
 #   3. .prompt-versions.json manifest exists in sandbox (fetch ran)
@@ -844,7 +726,7 @@ fi
 #   6. Traces have mlflow.linkedPrompts tag (visible in MLflow "Prompt" column)
 #   7. Traces have prompt_versions custom tag (visible in trace detail view)
 # HOW TO FIX:
-#   Prompts not registered: scripts/seed-mlflow-prompts.sh
+#   Prompts not registered: scripts/prompt-registry/seed-mlflow-prompts.sh
 #   Manifest missing: launch-openclaw.sh (re-runs fetch)
 #   Linker not running: launch-openclaw.sh (restarts linker)
 step "Layer 8b: MLflow Prompt Registry"
@@ -860,7 +742,9 @@ if [[ -f "$RHOAI_WIRING_8B" ]]; then
   AUTH_HEADERS_8B=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
 fi
 
-if oc get ns "$RHOAI_NS" &>/dev/null; then
+if [[ "$VERIFY_PROFILE" != "full" ]]; then
+  info "Skipping MLflow Prompt Registry deep checks (smoke profile)"
+elif oc get ns "$RHOAI_NS" &>/dev/null; then
   MLFLOW_HOST=$(oc get route mlflow -n "$RHOAI_NS" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
   if [[ -n "$MLFLOW_HOST" ]]; then
     MLFLOW_EXT_URL="https://${MLFLOW_HOST}"
@@ -889,7 +773,7 @@ sys.exit(0 if found else 1)
     elif [[ $REGISTERED -gt 0 ]]; then
       warn "Only ${REGISTERED}/${#PROMPT_NAMES[@]} prompts registered in MLflow"
     else
-      fail "No prompts registered in MLflow — run scripts/seed-mlflow-prompts.sh"
+      fail "No prompts registered in MLflow — run scripts/prompt-registry/seed-mlflow-prompts.sh"
     fi
 
     if [[ $ALIASED -eq ${#PROMPT_NAMES[@]} ]]; then
@@ -1007,38 +891,42 @@ fi
 #   annotation, and the auth.setup.ts test file for URL/selector patterns.
 step "Layer 9: Control UI Validation (Playwright)"
 
-if command -v openshell &>/dev/null; then
-  openshell service list 2>/dev/null | grep -q "openclaw-ui\|web" \
-    && pass "Sandbox service registered with gateway" \
-    || warn "No sandbox service registered"
-fi
-
-TEST_DIR="${PROJECT_DIR}/tests"
-if command -v npx &>/dev/null && [[ -d "${TEST_DIR}/node_modules/@playwright" ]]; then
-  OAUTH_ROUTE="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
-  OPENCLAW_BASE_URL="https://${OAUTH_ROUTE}"
-  info "Using oauth-proxy route for Playwright: ${OPENCLAW_BASE_URL}"
-
-  # `npm install` only fetches the @playwright/test package, not the actual
-  # browser binaries (a separate, larger download) — a fresh clone/environment
-  # (or a fresh Cursor sandbox cache) can have the former without the latter,
-  # which fails Playwright with "Executable doesn't exist" rather than
-  # skipping gracefully like the `[[ -d node_modules/@playwright ]]` check
-  # above intends. `playwright install` is idempotent and fast (a version
-  # check only, no re-download) when the browser is already present, so it's
-  # safe/cheap to always run before `playwright test` instead of trying to
-  # detect browser presence ourselves.
-  (cd "$TEST_DIR" && npx playwright install chromium) 2>&1 | tail -5
-
-  export OPENCLAW_BASE_URL
-  if (cd "$TEST_DIR" && npx playwright test) 2>&1; then
-    pass "Playwright UI + security tests passed (OIDC flow)"
-  else
-    fail "Playwright tests failed"
-  fi
+if [[ "$VERIFY_PROFILE" != "full" ]]; then
+  info "Skipping Playwright browser UI test (smoke profile)"
 else
-  warn "Playwright not installed, skipping UI tests"
-  echo "    Install with: cd ${TEST_DIR} && npm install && npx playwright install chromium"
+  if command -v openshell &>/dev/null; then
+    openshell service list 2>/dev/null | grep -q "openclaw-ui\|web" \
+      && pass "Sandbox service registered with gateway" \
+      || warn "No sandbox service registered"
+  fi
+
+  TEST_DIR="${PROJECT_DIR}/tests"
+  if command -v npx &>/dev/null && [[ -d "${TEST_DIR}/node_modules/@playwright" ]]; then
+    OAUTH_ROUTE="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
+    OPENCLAW_BASE_URL="https://${OAUTH_ROUTE}"
+    info "Using oauth-proxy route for Playwright: ${OPENCLAW_BASE_URL}"
+
+    # `npm install` only fetches the @playwright/test package, not the actual
+    # browser binaries (a separate, larger download) — a fresh clone/environment
+    # (or a fresh Cursor sandbox cache) can have the former without the latter,
+    # which fails Playwright with "Executable doesn't exist" rather than
+    # skipping gracefully like the `[[ -d node_modules/@playwright ]]` check
+    # above intends. `playwright install` is idempotent and fast (a version
+    # check only, no re-download) when the browser is already present, so it's
+    # safe/cheap to always run before `playwright test` instead of trying to
+    # detect browser presence ourselves.
+    (cd "$TEST_DIR" && npx playwright install chromium) 2>&1 | tail -5
+
+    export OPENCLAW_BASE_URL
+    if (cd "$TEST_DIR" && npx playwright test) 2>&1; then
+      pass "Playwright UI + security tests passed (OIDC flow)"
+    else
+      fail "Playwright tests failed"
+    fi
+  else
+    warn "Playwright not installed, skipping UI tests"
+    echo "    Install with: cd ${TEST_DIR} && npm install && npx playwright install chromium"
+  fi
 fi
 
 # =============================================================================

@@ -1,21 +1,20 @@
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: tempo-data
-  namespace: observability
+  namespace: {{ .Values.namespace }}
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 5Gi
+      storage: {{ .Values.tempo.storageSize }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: tempo-config
-  namespace: observability
+  namespace: {{ .Values.namespace }}
 data:
   tempo.yaml: |
     stream_over_http_enabled: true
@@ -54,7 +53,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: tempo
-  namespace: observability
+  namespace: {{ .Values.namespace }}
   labels:
     app: tempo
 spec:
@@ -69,7 +68,7 @@ spec:
     spec:
       containers:
         - name: tempo
-          image: docker.io/grafana/tempo:2.7.2
+          image: {{ .Values.tempo.image }}
           args:
             - -config.file=/etc/tempo/tempo.yaml
           ports:
@@ -94,12 +93,7 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
           resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
+            {{- toYaml .Values.tempo.resources | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /etc/tempo
@@ -117,7 +111,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: tempo
-  namespace: observability
+  namespace: {{ .Values.namespace }}
   labels:
     app: tempo
 spec:

@@ -19,51 +19,41 @@ source "$(dirname "$0")/common.sh"
 
 check_prereqs
 detect_environment
-render_all_templates
+render_all_templates # needed for ${RENDERED_DIR}/openclaw.json in Step 3 below
 
 # Public hostname must equal OpenShell's {sandbox}--{service} service-routing
-# pattern -- see route.yaml.tpl and deployment.yaml.tpl for why (WebSocket
-# Host-header bug in this oauth-proxy fork, ADR-0016).
+# pattern -- see charts/oauth2-proxy/templates/route.yaml and deployment.yaml
+# for why (WebSocket Host-header bug in this oauth-proxy fork, ADR-0016).
 OAUTH_PROXY_ROUTE_HOST="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
 
-# The Route above now owns this hostname, so oauth-proxy's own --upstream
-# (which targets the same hostname, to reach the `openshell` Service) can no
-# longer resolve it through the Route without looping back into itself.
-# Resolve the `openshell` Service's ClusterIP and bake it into a hostAlias
-# in the rendered Deployment so --upstream dials the Service directly.
-step "Resolving openshell Service ClusterIP for oauth-proxy hostAlias"
-OPENSHELL_GW_CLUSTER_IP=$(oc -n "$NAMESPACE" get svc openshell -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
-if [[ -z "$OPENSHELL_GW_CLUSTER_IP" ]]; then
-  error "Could not resolve ClusterIP for Service 'openshell' in namespace $NAMESPACE"
-  exit 1
-fi
-info "openshell Service ClusterIP: ${OPENSHELL_GW_CLUSTER_IP}"
-sed -i "s/__OPENSHELL_GW_CLUSTER_IP__/${OPENSHELL_GW_CLUSTER_IP}/g" \
-  "${RENDERED_DIR}/oauth2-proxy/deployment.yaml"
+# ── Step 1: Session secret (Kubernetes Secret from host env var) ──────────────
+# Created out-of-band (not a Helm-templated resource) so it survives
+# `helm uninstall oauth2-proxy` -- it's meant to be a long-lived, idempotent
+# secret (secrets/secrets.env), not release-scoped chart state.
 
-# ── Step 1: Session secret ────────────────────────────────────────────────────
-
-step "Generating oauth-proxy session secret"
+step "Ensuring oauth-proxy session secret exists"
+ensure_secret_var OAUTH_PROXY_SESSION_SECRET -base64 32
 
 if oc -n "$NAMESPACE" get secret oauth-proxy-session-secret &>/dev/null; then
-  info "Secret oauth-proxy-session-secret already exists, leaving it in place"
+  info "Kubernetes Secret oauth-proxy-session-secret already exists, leaving it in place"
 else
   oc -n "$NAMESPACE" create secret generic oauth-proxy-session-secret \
-    --from-literal=session_secret="$(openssl rand -base64 32 | tr -d '\n' | head -c 32)"
-  info "Secret oauth-proxy-session-secret created"
+    --from-literal=session_secret="$(echo -n "$OAUTH_PROXY_SESSION_SECRET" | tr -d '\n' | head -c 32)"
+  info "Kubernetes Secret oauth-proxy-session-secret created"
 fi
 
-# ── Step 2: Apply manifests (SA, Service, Deployment, Route) ──────────────────
+# ── Step 2: Deploy (Helm) ──────────────────────────────────────────────────────
+# The `openshell` Service's ClusterIP (needed for the hostAlias workaround
+# described in charts/oauth2-proxy/templates/deployment.yaml) is resolved
+# declaratively inside the chart via Helm's `lookup` function -- no `sed -i`
+# on a rendered manifest needed anymore.
 
-step "Deploying oauth-proxy (OpenShift-native OAuth)"
-
-oc apply -f "${PROJECT_DIR}/manifests/oauth2-proxy/serviceaccount.yaml"
-oc apply -f "${PROJECT_DIR}/manifests/oauth2-proxy/service.yaml"
-oc apply -f "${RENDERED_DIR}/oauth2-proxy/deployment.yaml"
-oc apply -f "${RENDERED_DIR}/oauth2-proxy/route.yaml"
-
-step "Waiting for oauth-proxy to be ready"
-oc -n "$NAMESPACE" rollout status deployment/oauth-proxy --timeout=120s
+step "Deploying oauth-proxy (OpenShift-native OAuth, Helm)"
+helm upgrade --install oauth2-proxy "${PROJECT_DIR}/charts/oauth2-proxy" \
+  --namespace "$NAMESPACE" --create-namespace \
+  --set appsDomain="${APPS_DOMAIN}" \
+  --set namespace="${NAMESPACE}" \
+  --wait --timeout 120s
 pass "oauth-proxy deployment ready"
 
 # ── Step 3: Update OpenClaw config in sandbox ─────────────────────────────────
@@ -87,8 +77,7 @@ if [[ -n "$SANDBOX_POD" ]]; then
 
   pass "OpenClaw config updated to trusted-proxy mode"
 else
-  warn "Sandbox pod not found. Config will apply on next sandbox restart."
-  info "Config file updated at config/openclaw.json for future deployments."
+  warn "Sandbox pod not found. Re-run this script (or launch-openclaw.sh) once the sandbox exists."
 fi
 
 # ── Step 4: Verify ────────────────────────────────────────────────────────────

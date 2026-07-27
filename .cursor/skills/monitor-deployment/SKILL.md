@@ -11,12 +11,12 @@ Uses the Cursor `/loop` pattern with project-specific auto-repair logic.
 ## Trigger
 
 User says: `/monitor-deployment`, "monitor the deployment", "watch the cluster",
-"keep checking health", or similar. Also activated when `deploy-full-crc` or
-`deploy-full-aws` completes and the user asks to keep watching.
+"keep checking health", or similar. Also activated when the `deploy-full`
+skill completes and the user asks to keep watching.
 
 ## Prerequisites
 
-- Deployment completed (via `deploy-full-crc` or `deploy-full-aws`)
+- Deployment completed (via the `deploy-full` skill, CRC or AWS)
 - `oc whoami` succeeds (logged into the cluster)
 - `openshell status` succeeds (CLI connected to gateway)
 - `scripts/verify.sh` runs successfully at least once
@@ -275,7 +275,7 @@ On stop:
 
 
 
-## Interaction with deploy-full-crc / deploy-full-aws
+## Interaction with the deploy-full skill
 
 After a successful deploy, the user may say "now monitor it" or just `/monitor-deployment`.
 The agent should:

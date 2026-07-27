@@ -9,6 +9,16 @@ do not edit the content past this point; see ADR-0018 for the current
 architecture. The OTel/Tempo half (Pipeline 1, infrastructure logs/metrics)
 is **still Accepted and unaffected** by this migration.
 
+**Correction (2026-07-26)**: "Problem 1"'s solution below (`scripts/http-proxy-bootstrap.js`,
+loaded via `NODE_OPTIONS`) was tried and abandoned — it is **not** part of
+the current deployment. `launch-openclaw.sh` sets `OTEL_TRACES_EXPORTER=none`
+/ `OTEL_LOGS_EXPORTER=none` / `OTEL_METRICS_EXPORTER=none` unconditionally
+(constraint #7 in `docs/constraints.md`), so the agent process never attempts
+this OTLP export path at all today, and the bootstrap file has been deleted
+from the repo. Do not reintroduce `NODE_OPTIONS="--require http-proxy-bootstrap.js"`
+— see `docs/constraints.md` #3 for why it breaks the MaaS `fetch()` path.
+Treat "Problem 1" below as historical context only.
+
 Originally: Accepted (supersedes original ADR-0012 observability design)
 
 ## Context
