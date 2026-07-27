@@ -57,6 +57,17 @@
 #      doesn't export. Both must be patched with no-ops.
 #      => patch-mlflow-plugin.py handles this idempotently.
 #
+#   5b. NPM AFTER NODE UPGRADE: `n 22.22.3` installs a fresh npm CLI at
+#      /usr/local/lib/node_modules/npm but its bundled node_modules/ come up
+#      incomplete (missing graceful-fs and others) — `npm --version` /
+#      `npm init` then fail with MODULE_NOT_FOUND. The stock image's original
+#      npm at /usr/lib/node_modules/npm (paired with /usr/bin/node) has a
+#      complete node_modules/. Fix: after `n 22.22.3`, copy any missing
+#      packages from the old bundled npm into the new one
+#      (`cp -rn /usr/lib/node_modules/npm/node_modules/* /usr/local/lib/node_modules/npm/node_modules/`).
+#      Validated live (2026-07-27): `npm --version` works afterward and the
+#      mlflow-openclaw plugin install (Step 6) succeeds.
+#
 #   6. PROCESS MANAGEMENT: The gateway binary is called openclaw-gateway
 #      but resolves to /usr/bin/node via /proc/<pid>/exe. When killing,
 #      use `pgrep -f "openclaw\|node"` not just `pkill node`, because
@@ -168,8 +179,10 @@ else
   info "Current version: $CURRENT_VERSION — upgrading..."
   oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
     npm install -g n 2>/dev/null && n 22.22.3 2>/dev/null
+    # See constraint #5b: n leaves the new npm bundled deps incomplete.
+    cp -rn /usr/lib/node_modules/npm/node_modules/* /usr/local/lib/node_modules/npm/node_modules/ 2>/dev/null || true
     npm install -g openclaw@2026.7.1 2>/dev/null
-    echo "NODE=$(node --version) OPENCLAW=$(openclaw --version 2>&1 | grep -oP "\d+\.\d+\.\d+")"
+    echo "NODE=$(node --version) OPENCLAW=$(openclaw --version 2>&1 | grep -oP "\d+\.\d+\.\d+") NPM=$(npm --version 2>/dev/null || echo BROKEN)"
   ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 fi
 

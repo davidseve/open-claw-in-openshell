@@ -37,9 +37,11 @@
 #             see docs/constraints.md #17 for why the end-to-end chat +
 #             trace checks were removed; Layer 9 Playwright covers that path)
 #   Layer 7b: External access (service route, oauth2-proxy OIDC)
-#   Layer 8:  Observability stack (Tempo, OTel Collector) + RHOAI MLflow
+#   Layer 8:  Observability stack (Tempo, OTel Collector) + RHOAI MLflow infra
 #   Layer 8b: MLflow Prompt Registry (prompts, aliases, manifest, linker)
-#   Layer 9:  Control UI (Playwright tests)
+#   Layer 9:  Control UI (Playwright — OpenClaw chat E2E + security)
+#   Layer 10: MLflow traces + Prompt tags (API) and MLflow UI (Playwright)
+#             — runs AFTER Layer 9 so E2E chat traces exist first
 #
 # =============================================================================
 set -euo pipefail
@@ -674,43 +676,7 @@ else
   warn "Observability namespace not found — run scripts/deploy-observability.sh"
 fi
 
-# Verify RHOAI MLflow has rich traces from the mlflow-openclaw plugin. Via
-# REST (with auth), not a direct sqlite3/mlflow.db exec like the old
-# standalone-MLflow check used — RHOAI's operator-managed MLflow runs on a
-# Postgres backend behind its own pod, so there's no local sqlite file to
-# open. The deep session/user/span-count artifact introspection the old
-# check did is dropped rather than reimplemented against the artifacts API
-# right now (that instrumentation was always a soft `warn`-only check on a
-# known accepted limitation — ADR-0014 Problem 9 — not a hard pass/fail
-# gate); traceInputs/traceOutputs presence below is a lighter but still
-# meaningful substitute, empirically confirmed to be populated end-to-end
-# (docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md).
-if [[ -n "${MLFLOW_HOST:-}" && ${#AUTH_HEADERS_8[@]} -gt 0 ]]; then
-  MLFLOW_TRACES=$(curl -sk "${AUTH_HEADERS_8[@]}" \
-    "https://${MLFLOW_HOST}/api/2.0/mlflow/traces?experiment_ids=${RHOAI_MLFLOW_EXPERIMENT_ID:-0}&max_results=5" 2>/dev/null || echo "")
-
-  TRACE_COUNT=$(echo "$MLFLOW_TRACES" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('traces',[])))" 2>/dev/null || echo "")
-  if [[ "$TRACE_COUNT" =~ ^[1-9] ]]; then
-    pass "MLflow native traces: ${TRACE_COUNT} trace(s) in Traces tab"
-  elif [[ "$TRACE_COUNT" == "0" ]]; then
-    warn "MLflow native traces: no traces yet (send a message via UI first)"
-  else
-    warn "MLflow native traces: could not query traces API"
-  fi
-
-  RICH_CONTENT=$(echo "$MLFLOW_TRACES" | python3 -c "
-import sys,json
-data = json.load(sys.stdin)
-traces = data.get('traces', [])
-rich = sum(1 for t in traces if any(m.get('key') == 'mlflow.traceInputs' for m in t.get('request_metadata', [])))
-print(rich)
-" 2>/dev/null || echo "")
-  if [[ "$RICH_CONTENT" =~ ^[1-9] ]]; then
-    pass "MLflow trace content: ${RICH_CONTENT} trace(s) with full input/output (mlflow.traceInputs)"
-  elif [[ -n "$RICH_CONTENT" ]]; then
-    warn "MLflow trace content: no traces with mlflow.traceInputs found yet"
-  fi
-fi
+# Trace content + prompt-tag checks moved to Layer 10 (after Playwright E2E chat).
 
 # =============================================================================
 # Layer 8b: MLflow Prompt Registry
@@ -723,8 +689,7 @@ fi
 #   3. .prompt-versions.json manifest exists in sandbox (fetch ran)
 #   4. Prompt files are read-only (agent can't modify them)
 #   5. Trace linker sidecar is running (tags traces with prompt versions)
-#   6. Traces have mlflow.linkedPrompts tag (visible in MLflow "Prompt" column)
-#   7. Traces have prompt_versions custom tag (visible in trace detail view)
+#   6-7. Trace prompt tags: see Layer 10 (after E2E chat generates traces)
 # HOW TO FIX:
 #   Prompts not registered: scripts/prompt-registry/seed-mlflow-prompts.sh
 #   Manifest missing: launch-openclaw.sh (re-runs fetch)
@@ -840,40 +805,6 @@ sys.exit(0 if found else 1)
     else
       fail "Prompt trace linker not running"
     fi
-
-    # Verify traces have prompt tags
-    if [[ -n "${MLFLOW_HOST:-}" ]]; then
-      TAGGED_CHECK=$(curl -sf $CURL_OPTS "${AUTH_HEADERS_8B[@]}" "${MLFLOW_EXT_URL}/api/2.0/mlflow/traces?experiment_ids=${RHOAI_MLFLOW_EXPERIMENT_ID:-0}&max_results=5" 2>/dev/null || echo "")
-      if [[ -n "$TAGGED_CHECK" ]]; then
-        # mlflow.linkedPrompts populates the "Prompt" column in MLflow UI
-        TAGGED_COUNT=$(echo "$TAGGED_CHECK" | python3 -c "
-import sys,json
-data = json.load(sys.stdin)
-traces = data.get('traces',[])
-tagged = sum(1 for t in traces if any(tag.get('key') == 'mlflow.linkedPrompts' for tag in t.get('tags',[])))
-print(tagged)
-" 2>/dev/null || echo "0")
-        if [[ "$TAGGED_COUNT" -gt 0 ]]; then
-          pass "Prompt tags present on ${TAGGED_COUNT}/5 recent traces (mlflow.linkedPrompts)"
-        else
-          warn "No traces have prompt tags yet (send a message to generate traces)"
-        fi
-
-        # prompt_versions custom tag visible in individual trace detail view
-        PV_COUNT=$(echo "$TAGGED_CHECK" | python3 -c "
-import sys,json
-data = json.load(sys.stdin)
-traces = data.get('traces',[])
-tagged = sum(1 for t in traces if any(tag.get('key') == 'prompt_versions' for tag in t.get('tags',[])))
-print(tagged)
-" 2>/dev/null || echo "0")
-        if [[ "$PV_COUNT" -gt 0 ]]; then
-          pass "Custom prompt_versions tag on ${PV_COUNT}/5 recent traces"
-        else
-          warn "No prompt_versions custom tags on traces"
-        fi
-      fi
-    fi
   else
     warn "openshell CLI not available, skipping sandbox prompt checks"
   fi
@@ -918,7 +849,7 @@ else
     (cd "$TEST_DIR" && npx playwright install chromium) 2>&1 | tail -5
 
     export OPENCLAW_BASE_URL
-    if (cd "$TEST_DIR" && npx playwright test) 2>&1; then
+    if (cd "$TEST_DIR" && npx playwright test --project=ui-tests --project=security-tests) 2>&1; then
       pass "Playwright UI + security tests passed (OIDC flow)"
     else
       fail "Playwright tests failed"
@@ -926,6 +857,115 @@ else
   else
     warn "Playwright not installed, skipping UI tests"
     echo "    Install with: cd ${TEST_DIR} && npm install && npx playwright install chromium"
+  fi
+fi
+
+# =============================================================================
+# Layer 10: MLflow Traces + UI (post-E2E)
+# =============================================================================
+# WHY: Layer 9's Playwright chat generates real traces in RHOAI MLflow. These
+#   checks confirm the data is present via REST API and visible in the MLflow
+#   web UI (Prompts tab, Traces tab). Must run after Layer 9.
+# HOW TO FIX:
+#   No traces: re-run scripts/launch-openclaw.sh, then Layer 9 chat test
+#   UI fails: check MLflow route, wiring.env token, workspace header
+step "Layer 10: MLflow Traces + UI (post-E2E)"
+
+if [[ "$VERIFY_PROFILE" != "full" ]]; then
+  info "Skipping MLflow trace/UI checks (smoke profile)"
+else
+  RHOAI_WIRING_10="${PROJECT_DIR}/.rendered/rhoai-mlflow/wiring.env"
+  MLFLOW_HOST_L10=$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+  AUTH_HEADERS_10=()
+  if [[ -f "$RHOAI_WIRING_10" ]]; then
+    set -a; source "$RHOAI_WIRING_10"; set +a
+    AUTH_HEADERS_10=(-H "Authorization: Bearer ${RHOAI_MLFLOW_SA_TOKEN}" -H "X-MLFLOW-WORKSPACE: ${RHOAI_MLFLOW_WORKSPACE}")
+  else
+    warn "RHOAI wiring facts not found (${RHOAI_WIRING_10}) — MLflow API/UI checks will likely fail"
+  fi
+
+  if [[ -n "$MLFLOW_HOST_L10" && ${#AUTH_HEADERS_10[@]} -gt 0 ]]; then
+    # Brief poll: traces may take a few seconds to land after Layer 9 chat.
+    MLFLOW_TRACES=""
+    TRACE_COUNT=""
+    for _poll in 1 2 3 4 5 6; do
+      MLFLOW_TRACES=$(curl -sk "${AUTH_HEADERS_10[@]}" \
+        "https://${MLFLOW_HOST_L10}/api/2.0/mlflow/traces?experiment_ids=${RHOAI_MLFLOW_EXPERIMENT_ID:-0}&max_results=5" 2>/dev/null || echo "")
+      TRACE_COUNT=$(echo "$MLFLOW_TRACES" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('traces',[])))" 2>/dev/null || echo "")
+      if [[ "$TRACE_COUNT" =~ ^[1-9] ]]; then
+        break
+      fi
+      sleep 5
+    done
+
+    if [[ "$TRACE_COUNT" =~ ^[1-9] ]]; then
+      pass "MLflow native traces: ${TRACE_COUNT} trace(s) in Traces tab"
+    elif [[ "$TRACE_COUNT" == "0" ]]; then
+      fail "MLflow native traces: no traces after E2E chat (Layer 9 should have generated them)"
+    else
+      fail "MLflow native traces: could not query traces API"
+    fi
+
+    RICH_CONTENT=$(echo "$MLFLOW_TRACES" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+traces = data.get('traces', [])
+rich = sum(1 for t in traces if any(m.get('key') == 'mlflow.traceInputs' for m in t.get('request_metadata', [])))
+print(rich)
+" 2>/dev/null || echo "")
+    if [[ "$RICH_CONTENT" =~ ^[1-9] ]]; then
+      pass "MLflow trace content: ${RICH_CONTENT} trace(s) with full input/output (mlflow.traceInputs)"
+    elif [[ -n "$RICH_CONTENT" ]]; then
+      warn "MLflow trace content: no traces with mlflow.traceInputs found yet"
+    fi
+
+    TAGGED_CHECK="$MLFLOW_TRACES"
+    if [[ -n "$TAGGED_CHECK" ]]; then
+      TAGGED_COUNT=$(echo "$TAGGED_CHECK" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+traces = data.get('traces',[])
+tagged = sum(1 for t in traces if any(tag.get('key') == 'mlflow.linkedPrompts' for tag in t.get('tags',[])))
+print(tagged)
+" 2>/dev/null || echo "0")
+      if [[ "$TAGGED_COUNT" -gt 0 ]]; then
+        pass "Prompt tags present on ${TAGGED_COUNT}/5 recent traces (mlflow.linkedPrompts)"
+      else
+        warn "No traces have prompt tags yet (linker may need more time)"
+      fi
+
+      PV_COUNT=$(echo "$TAGGED_CHECK" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+traces = data.get('traces',[])
+tagged = sum(1 for t in traces if any(tag.get('key') == 'prompt_versions' for tag in t.get('tags',[])))
+print(tagged)
+" 2>/dev/null || echo "0")
+      if [[ "$PV_COUNT" -gt 0 ]]; then
+        pass "Custom prompt_versions tag on ${PV_COUNT}/5 recent traces"
+      else
+        warn "No prompt_versions custom tags on traces"
+      fi
+    fi
+  else
+    fail "MLflow route or auth wiring missing — cannot verify traces"
+  fi
+
+  if command -v npx &>/dev/null && [[ -d "${PROJECT_DIR}/tests/node_modules/@playwright" ]]; then
+    TEST_DIR="${PROJECT_DIR}/tests"
+    MLFLOW_BASE_URL="https://${MLFLOW_HOST_L10}/mlflow/"
+    export MLFLOW_BASE_URL MLFLOW_AUTH_TOKEN="${RHOAI_MLFLOW_SA_TOKEN:-}" \
+      MLFLOW_WORKSPACE="${RHOAI_MLFLOW_WORKSPACE:-openshell}" \
+      MLFLOW_EXPERIMENT_ID="${RHOAI_MLFLOW_EXPERIMENT_ID:-1}"
+    info "MLflow UI Playwright: ${MLFLOW_BASE_URL}"
+
+    if (cd "$TEST_DIR" && npx playwright test --project=mlflow-ui-tests) 2>&1; then
+      pass "Playwright MLflow UI tests passed (prompts + traces visible)"
+    else
+      fail "Playwright MLflow UI tests failed"
+    fi
+  else
+    warn "Playwright not installed, skipping MLflow UI tests"
   fi
 fi
 

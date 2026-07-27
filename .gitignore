@@ -36,6 +36,7 @@ tmp/
 .deploy-state.json
 .monitor-state.json
 .verify-status.json
+.verify-loop-state.json
 
 # Rendered templates (generated at deploy time from .tpl files)
 .rendered/

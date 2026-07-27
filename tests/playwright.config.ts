@@ -1,6 +1,15 @@
 import { defineConfig, devices } from '@playwright/test';
 
 const baseURL = process.env.OPENCLAW_BASE_URL || 'https://openclaw-gw--openclaw-ui.apps-crc.testing';
+const mlflowBaseURL = (process.env.MLFLOW_BASE_URL || 'https://mlflow-redhat-ods-applications.apps-crc.testing/mlflow').replace(/\/?$/, '/');
+
+const mlflowAuthHeaders: Record<string, string> = {};
+if (process.env.MLFLOW_AUTH_TOKEN) {
+  mlflowAuthHeaders['Authorization'] = `Bearer ${process.env.MLFLOW_AUTH_TOKEN}`;
+}
+if (process.env.MLFLOW_WORKSPACE) {
+  mlflowAuthHeaders['X-MLFLOW-WORKSPACE'] = process.env.MLFLOW_WORKSPACE;
+}
 
 export default defineConfig({
   testDir: '.',
@@ -26,6 +35,15 @@ export default defineConfig({
       dependencies: ['auth-setup'],
       use: {
         storageState: './test-results/.auth/state.json',
+      },
+    },
+    {
+      name: 'mlflow-ui-tests',
+      testMatch: /mlflow-ui\.spec\.ts/,
+      dependencies: ['ui-tests'],
+      use: {
+        baseURL: mlflowBaseURL,
+        extraHTTPHeaders: mlflowAuthHeaders,
       },
     },
   ],
