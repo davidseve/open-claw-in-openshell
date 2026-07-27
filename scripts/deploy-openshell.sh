@@ -79,6 +79,8 @@ step "Registering gateway with CLI (mTLS)"
 # certificates" for anywhere from seconds to 10+ minutes afterwards (most
 # likely host-side memory pressure/scheduling delays on the box running the
 # CRC VM, not anything wrong with the certs/route/pod itself).
+# Global OPENSHELL_GATEWAY_INSECURE breaks client-cert mTLS (constraints #18/#19).
+unset OPENSHELL_GATEWAY_INSECURE
 if ! openshell status &>/dev/null; then
   step "Extracting mTLS client certificates"
   MTLS_DIR="$HOME/.config/openshell/gateways/ocp/mtls"

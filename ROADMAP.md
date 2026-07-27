@@ -441,6 +441,31 @@ it doesn't cover every way the key text could be reshaped before being echoed).
       jailbreak/exfiltration prompts against a live session and asserts the real key
       never appears unmasked in `chat.history` / the `.jsonl` transcript
 
+### 13.5 Re-audit `OPENSHELL_GATEWAY_INSECURE` scoping when AWS OCP gets real certs
+
+**Context**: `scripts/common.sh`'s `detect_environment()` used to export
+`OPENSHELL_GATEWAY_INSECURE=true` (skip TLS server-cert verification for the
+`openshell` CLI) globally whenever `CRC_MODE=true`, to work around CRC's
+self-signed router wildcard cert not being in the system trust store
+(constraint #18). During a live `crc-lifecycle.sh full --fresh` run
+(2026-07-27), this was found to also break **mTLS gateway registration**
+(`openshell status` failing for 5+ minutes with `CertificateRequired`/"peer
+sent no certificates") — the blanket global export was scoped down to a new
+`enable_openshell_oidc_insecure()` helper, called only from the OIDC-specific
+code paths (`configure-oidc.sh`'s gateway re-registration,
+`ensure_oidc_token()`'s refresh calls), and explicitly `unset` before mTLS
+operations in `deploy-openshell.sh`. **Decision (2026-07-27): keep this
+CRC-only scoped fix as-is for now** — revisit the open items below
+specifically when preparing the AWS OCP deployment (real, cluster-issued
+certs).
+
+- [x] Scope `OPENSHELL_GATEWAY_INSECURE` to OIDC-only flows, unset it before mTLS gateway registration (`scripts/common.sh`, `scripts/deploy-openshell.sh`, `scripts/configure-oidc.sh`) — done 2026-07-27, still `CRC_MODE`-gated, never set on AWS
+- [ ] **Root cause not fully confirmed**: the working hypothesis (insecure-mode short-circuits the client-cert identity resolver, not just server-cert verification) is plausible but based on a ~1-minute A/B test that overlaps with constraint #19's own documented time-based recovery window (10s–8min, attributed there to host memory pressure, not to this flag). Re-validate with a cleaner, longer, repeated-trial experiment (or find/read the `openshell` CLI's TLS client source) before treating this as fully proven — the *practical* fix (unset before mTLS) is safe to keep either way, since it can only narrow, never widen, where verification is skipped
+- [ ] **Known gap introduced by this fix**: `cmd_verify()` in `scripts/crc-lifecycle.sh` (and any other caller of `verify.sh`/`smoke-test-e2e.sh` that doesn't first call `ensure_oidc_token`) no longer benefits from the old global export, so a standalone `./scripts/crc-lifecycle.sh verify` run long after the last `configure-oidc.sh` (OIDC access token expired, refresh-token call needed) could hit constraint #18 again on CRC. Not fixed yet — call `ensure_oidc_token` at the top of `cmd_verify()` (matching the pattern the `monitor-deployment` skill already uses manually) before this bites in practice
+- [ ] `docs/constraints.md` #18/#19 need a new/updated entry documenting this interaction — the code comments in `common.sh`/`deploy-openshell.sh` currently reference "constraints.md #18/#19" as if already covering this, but the doc text itself is stale
+- [ ] **AWS follow-up (the item to actually revisit before/during AWS OCP rollout)**: on AWS, `CRC_MODE` is false and `OPENSHELL_GATEWAY_INSECURE` is never set — confirm this stays true end-to-end (no accidental leak of CRC-only insecure logic into the AWS path) once the AWS OIDC/mTLS flow is validated live. AWS OCP's cluster-issued certs are trusted by default, so this entire workaround should be a complete no-op there; if any AWS symptom superficially resembles constraint #18/#19, do **not** reach for `OPENSHELL_GATEWAY_INSECURE` as the fix — investigate the real cert chain first (a real gap in AWS would indicate an actual trust-store or Route/cert-issuer problem, not the CRC self-signed-router quirk)
+- [ ] Stronger long-term fix (CRC-only, optional): replace the insecure-skip approach entirely by importing CRC's actual router CA into the CLI's trust store (or passing it explicitly, if the `openshell` CLI supports a custom CA flag), so CRC never needs `OPENSHELL_GATEWAY_INSECURE` either — would close the residual OIDC-path exposure window without needing an insecure flag at all
+
 ## References
 
 - [OpenShell OpenShift docs](https://docs.nvidia.com/openshell/kubernetes/openshift)

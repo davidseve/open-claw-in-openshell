@@ -126,9 +126,21 @@ detect_environment() {
     # found" / "unexpected identity" failures in verify.sh/smoke tests, even
     # though the sandbox is still Ready. Found live during a fresh
     # `crc-lifecycle.sh full --fresh` run. Not needed on AWS OCP (real certs).
-    export OPENSHELL_GATEWAY_INSECURE=true
+    # Do NOT export OPENSHELL_GATEWAY_INSECURE globally here — it disables
+    # client-cert presentation and breaks mTLS `openshell status` against the
+    # gateway Route (fatal alert: CertificateRequired). Scope it to OIDC-only
+    # flows via enable_openshell_oidc_insecure() instead.
   fi
   export CURL_OPTS
+}
+
+# Enable TLS skip for openshell CLI calls that reach Keycloak/OIDC endpoints
+# through CRC's self-signed router cert. Must NOT be set during mTLS gateway
+# registration or `openshell status` — see docs/constraints.md #18/#19.
+enable_openshell_oidc_insecure() {
+  if [[ "$CRC_MODE" == "true" ]]; then
+    export OPENSHELL_GATEWAY_INSECURE=true
+  fi
 }
 
 render_template() {
@@ -306,6 +318,7 @@ sandbox_run() {
 # NOTE: `openshell status` returns 0 even with expired OIDC (uses mTLS),
 # so we test `sandbox list` which requires a valid bearer token.
 ensure_oidc_token() {
+  enable_openshell_oidc_insecure
   if openshell sandbox list &>/dev/null; then return 0; fi
   if [[ -x "${SCRIPT_DIR}/configure-oidc.sh" ]]; then
     info "OIDC token expired, refreshing..."

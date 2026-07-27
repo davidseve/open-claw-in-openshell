@@ -41,6 +41,7 @@ step "Waiting for gateway rollout"
 oc -n "$NAMESPACE" rollout status statefulset/openshell --timeout=180s
 
 step "Re-registering gateway with OIDC"
+enable_openshell_oidc_insecure
 openshell gateway remove ocp 2>/dev/null || true
 
 GW_CONFIG_DIR="${HOME}/.config/openshell/gateways/ocp"
