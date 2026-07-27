@@ -1053,3 +1053,60 @@ unnecessary re-registration + retry loop). Flagged as a known upstream-
 `openshell`-CLI/server quirk (the remaining first-install case) rather than
 something fully fixable in this repo; a real fix for that residual case
 would need to come from the `openshell` project itself.
+
+## 20. MLflow Prompts Invisible in RHOAI Dashboard's Per-Experiment Prompts Tab (RESOLVED)
+
+**Prerequisite for this whole section to even be reachable**: the RHOAI
+Dashboard itself must be enabled (`dashboard.managementState: Managed` in
+the `DataScienceCluster`, `Removed` by default per
+`charts/rhoai/platform/values.yaml`) with `genAiStudio: true` set on its
+auto-created `OdhDashboardConfig` (`charts/rhoai/platform/templates/
+dashboard-config.yaml`). **This is AWS-OCP-only by design** —
+`scripts/deploy-rhoai-mlflow.sh` sets both via `--set-string` only when
+`CRC_MODE` is false; on CRC the Dashboard stays `Removed` (2 extra pods, 9
+containers each, no functional benefit — Prompt Registry/tracing work fully
+via the API/SDK either way, which is how every check in this section was
+originally confirmed). The `openshell` namespace is unconditionally labeled
+`opendatahub.io/dashboard: "true"` (`scripts/bootstrap-ocp.sh`, negligible
+cost either way) so the Dashboard recognizes it as a Data Science Project
+whenever it does run. See [ADR-0018](adrs/ADR-0018-rhoai-mlflow-sole-backend.md)'s
+2026-07-27 amendment for the full scope decision. The namespace label
+specifically was a dead end for the bug below (ruled out — prompts stayed
+invisible with only the label applied, before the experiment-id fix).
+
+**Symptom**: All 7 system prompts seeded by
+`scripts/prompt-registry/seed-mlflow-prompts.sh` were confirmed present and
+correctly tagged (`mlflow.prompt.is_prompt=true`) via both
+`mlflow.genai.search_prompts()` (Python SDK) and a direct
+`registered-models/search?filter=...` REST call against RHOAI-managed
+MLflow — yet the RHOAI Dashboard's "Prompts" tab, nested under a specific
+experiment (`/experiments/<id>/prompts?workspace=<ws>`), showed none of
+them.
+
+**Root cause, found by diffing a prompt created directly through that same
+UI page against ours**: a prompt registered through the Dashboard's
+per-experiment Prompts page picks up a `_mlflow_experiment_ids` tag on its
+registered-model matching the *current* experiment
+(e.g. `,1,` for `openclaw-tracing`). `seed-mlflow-prompts.sh` called
+`mlflow.genai.register_prompt()` without ever setting an active experiment,
+so MLflow defaulted every prompt's `_mlflow_experiment_ids` tag to `,0,`
+(the "Default" experiment) instead. The Dashboard's per-experiment Prompts
+view filters registered models by that tag matching the experiment in the
+URL, so prompts living under experiment `0` are invisible on the
+experiment `1` page — even though they are fully valid, gettable, and
+searchable through every other API path, which don't apply that filter.
+
+**Fix**: `scripts/prompt-registry/seed-mlflow-prompts.sh` now accepts an
+optional `MLFLOW_EXPERIMENT_ID` env var and calls
+`mlflow.set_experiment(experiment_id=...)` before registering any prompt
+versions, tying them to the correct experiment.
+`scripts/wire-rhoai-mlflow-tracing.sh` passes `RHOAI_MLFLOW_EXPERIMENT_ID`
+(already captured from the experiment-creation Job's logs) through to it.
+Re-seeding existing prompts appends the new experiment id to the tag
+(`,0,1,`) rather than replacing it, and that alone was sufficient — the
+Dashboard's filter appears to be a substring/membership check, not an exact
+match — for all 7 prompts to immediately appear in the UI without needing
+to delete and recreate them.
+
+**Scripts affected**: `scripts/prompt-registry/seed-mlflow-prompts.sh`,
+`scripts/wire-rhoai-mlflow-tracing.sh` — both fixed.

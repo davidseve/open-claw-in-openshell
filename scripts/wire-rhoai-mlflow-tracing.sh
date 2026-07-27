@@ -185,6 +185,7 @@ step "Seeding system prompts into MLflow Prompt Registry"
 # already auto-detects that Route when MLFLOW_URL is unset.
 MLFLOW_TRACKING_TOKEN="${SA_TOKEN}" \
 MLFLOW_WORKSPACE="${WORKSPACE}" \
+MLFLOW_EXPERIMENT_ID="${EXPERIMENT_ID}" \
   "${SCRIPT_DIR}/prompt-registry/seed-mlflow-prompts.sh" \
   && pass "System prompts seeded into RHOAI MLflow" \
   || warn "Could not seed prompts (run scripts/prompt-registry/seed-mlflow-prompts.sh manually — see its usage comment for the required env vars)"

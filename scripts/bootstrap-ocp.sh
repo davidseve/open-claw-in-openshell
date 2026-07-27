@@ -6,7 +6,18 @@ check_prereqs
 detect_environment
 
 step "Creating namespace: $NAMESPACE"
-oc get ns "$NAMESPACE" &>/dev/null || oc create ns "$NAMESPACE"
+# opendatahub.io/dashboard=true marks this namespace as a Data Science
+# Project the RHOAI Dashboard (docs/constraints.md #20) will list under
+# Experiments/Prompts/Traces — applied declaratively here instead of a
+# one-off `oc label` so it survives a fresh `crc-lifecycle.sh full --fresh`.
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+  labels:
+    opendatahub.io/dashboard: "true"
+EOF
 
 step "Installing Agent Sandbox CRDs and controller (v0.5.1)"
 oc apply -f "${PROJECT_DIR}/manifests/agent-sandbox-v0.5.1.yaml"

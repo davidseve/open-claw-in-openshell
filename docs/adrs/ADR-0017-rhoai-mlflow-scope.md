@@ -660,10 +660,14 @@ trimmed to only what Phase 12 needs:
   from `agentops-example`'s `Automatic`, per this repo's `AGENTS.md`: *"Use
   installPlanApproval: Manual for OLM operators to prevent unreviewed
   upgrades"*).
-- `platform/` — `DataScienceCluster` with only `mlflowoperator: Managed`;
-  `dashboard`, `kserve`, `llamastackoperator`, `trustyai`, `modelsAsService`,
-  `aipipelines`, `feastoperator`, `kueue`, `modelregistry`, `ray`, `trainer`,
-  `trainingoperator`, `sparkoperator`, `workbenches` all `Removed`.
+- `platform/` — `DataScienceCluster` with only `mlflowoperator: Managed`
+  by default; `dashboard`, `kserve`, `llamastackoperator`, `trustyai`,
+  `modelsAsService`, `aipipelines`, `feastoperator`, `kueue`,
+  `modelregistry`, `ray`, `trainer`, `trainingoperator`, `sparkoperator`,
+  `workbenches` all `Removed`. (`dashboard` is overridden to `Managed` on
+  AWS OCP only — see [ADR-0018](ADR-0018-rhoai-mlflow-sole-backend.md)'s
+  2026-07-27 amendment; CRC keeps it `Removed`, matching this ADR's
+  original minimal-footprint decision.)
 - `database/` — Postgres backend, scoped to a single `mlflow` database (no
   `evalhub`, unlike `agentops-example`).
 - `mlflow/` — `MLflow` CR + Route + the DNS NetworkPolicy workaround for the

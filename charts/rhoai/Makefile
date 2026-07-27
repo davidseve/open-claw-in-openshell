@@ -1,11 +1,15 @@
-# charts/rhoai/Makefile - minimal RHOAI installation (MLflow only)
+# charts/rhoai/Makefile - minimal RHOAI installation (MLflow only by default)
 #
 # Adapted from agentops-example/deploy/Makefile, trimmed to only what
 # open-claw-in-openshell's Phase 12 needs: the RHOAI operator + a
 # DataScienceCluster with only mlflowoperator Managed + a Postgres backend +
-# the MLflow CR. No Dashboard, TrustyAI, KServe, OGX/llamastack, or EvalHub.
-# See ROADMAP.md Phase 12 and docs/adrs/ADR-0017 for the resource-fit
-# investigation and scope decision behind this trim.
+# the MLflow CR. No Dashboard, TrustyAI, KServe, OGX/llamastack, or EvalHub
+# by default. See ROADMAP.md Phase 12 and docs/adrs/ADR-0017 for the
+# resource-fit investigation and scope decision behind this trim.
+#
+# scripts/deploy-rhoai-mlflow.sh additionally enables the Dashboard (+
+# genAiStudio) via HELM_OPTS on AWS OCP only (not CRC) — see ADR-0018's
+# 2026-07-27 amendment and docs/constraints.md #20.
 #
 # Usage: make deploy-all    (full minimal stack)
 #        make validate      (post-deploy health checks)

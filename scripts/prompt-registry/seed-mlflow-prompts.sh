@@ -17,8 +17,19 @@
 #   MLFLOW_URL="$RHOAI_MLFLOW_TRACKING_URI" \
 #   MLFLOW_TRACKING_TOKEN="$RHOAI_MLFLOW_SA_TOKEN" \
 #   MLFLOW_WORKSPACE="$RHOAI_MLFLOW_WORKSPACE" \
+#   MLFLOW_EXPERIMENT_ID="$RHOAI_MLFLOW_EXPERIMENT_ID" \
 #   MLFLOW_TRACKING_SERVER_CERT_PATH="$RHOAI_MLFLOW_CA_FILE" \
 #     ./scripts/prompt-registry/seed-mlflow-prompts.sh
+#
+# MLFLOW_EXPERIMENT_ID matters, not just cosmetically: registering a prompt
+# without an active experiment set tags it with `_mlflow_experiment_ids=,0,`
+# (the "Default" experiment). RHOAI's dashboard Prompts tab is nested per
+# experiment (/experiments/<id>/prompts) and filters by that tag, so prompts
+# registered without setting the experiment first are invisible there even
+# though they're fully valid and gettable/searchable via the API/SDK
+# (confirmed live: `mlflow.genai.search_prompts()` and a direct
+# `registered-models/search?filter=...` both return them regardless of
+# `_mlflow_experiment_ids` — only the per-experiment dashboard view cares).
 set -euo pipefail
 source "$(dirname "$0")/../common.sh"
 
@@ -41,8 +52,12 @@ info "MLflow URL: ${MLFLOW_URL}"
 
 MLFLOW_TRACKING_TOKEN="${MLFLOW_TRACKING_TOKEN:-}"
 MLFLOW_WORKSPACE="${MLFLOW_WORKSPACE:-}"
+MLFLOW_EXPERIMENT_ID="${MLFLOW_EXPERIMENT_ID:-}"
 if [[ -z "$MLFLOW_TRACKING_TOKEN" || -z "$MLFLOW_WORKSPACE" ]]; then
   warn "MLFLOW_TRACKING_TOKEN / MLFLOW_WORKSPACE not set — requests will fail against RHOAI MLflow's workspace-enabled server unless the default workspace happens to match"
+fi
+if [[ -z "$MLFLOW_EXPERIMENT_ID" ]]; then
+  warn "MLFLOW_EXPERIMENT_ID not set — prompts will be tagged to the 'Default' experiment and won't show up in the RHOAI dashboard's per-experiment Prompts tab"
 fi
 
 PROMPT_FILES=(AGENTS SOUL TOOLS IDENTITY USER HEARTBEAT BOOTSTRAP)
@@ -54,7 +69,7 @@ if [[ "$CRC_MODE" == "true" ]]; then
   SSL_VERIFY="False"
 fi
 
-python3 - "$MLFLOW_URL" "$PROMPTS_DIR" "$PREFIX" "$SSL_VERIFY" "${MLFLOW_TRACKING_TOKEN}" "${MLFLOW_WORKSPACE}" "${PROMPT_FILES[@]}" <<'PYEOF'
+python3 - "$MLFLOW_URL" "$PROMPTS_DIR" "$PREFIX" "$SSL_VERIFY" "${MLFLOW_TRACKING_TOKEN}" "${MLFLOW_WORKSPACE}" "${MLFLOW_EXPERIMENT_ID}" "${PROMPT_FILES[@]}" <<'PYEOF'
 import sys
 import os
 import warnings
@@ -67,7 +82,8 @@ prefix = sys.argv[3]
 ssl_verify = sys.argv[4] == "True"
 tracking_token = sys.argv[5]
 workspace = sys.argv[6]
-prompt_names = sys.argv[7:]
+experiment_id = sys.argv[7]
+prompt_names = sys.argv[8:]
 
 os.environ["MLFLOW_TRACKING_URI"] = mlflow_url
 if not ssl_verify:
@@ -78,6 +94,12 @@ if workspace:
     os.environ["MLFLOW_WORKSPACE"] = workspace
 
 import mlflow
+
+if experiment_id:
+    # Ties every registered prompt to this experiment via the
+    # `_mlflow_experiment_ids` tag, which is what the RHOAI dashboard's
+    # per-experiment Prompts tab filters on (see usage comment above).
+    mlflow.set_experiment(experiment_id=experiment_id)
 
 for name in prompt_names:
     filepath = os.path.join(prompts_dir, f"{name}.md")

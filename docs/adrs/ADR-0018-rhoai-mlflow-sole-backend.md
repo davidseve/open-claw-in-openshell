@@ -157,6 +157,56 @@ MLflow deployed and wired:
   works (TLS trust, hostname matching, workspace header) — this ADR does
   not repeat those details, only the scope decision that followed them.
 
+## Amendment (2026-07-27): RHOAI Dashboard enabled for Prompt Registry / Traces UI visibility — AWS only, kept Removed on CRC
+
+While validating the Prompt Registry UI (browsing `openclaw-system.*` prompts
+and their linked traces through the RHOAI Dashboard, as opposed to the API/
+SDK access already covered above), found and fixed two more gaps — one real
+bug, one an intentional scope decision this ADR had not made explicit yet.
+
+**Scope decision, environment-conditional**: `charts/rhoai/platform`'s
+`dashboard` component **stays `Removed` by default** (the value in
+`values.yaml`, unchanged from ADR-0017's original minimal-footprint chart —
+this project's actual tracing/prompt-registry needs are all met by the
+MLflow Route's API/SDK alone, validated end-to-end without the Dashboard).
+`scripts/deploy-rhoai-mlflow.sh` now overrides it to **`Managed`** (+
+`genAiStudio: true` via the new `charts/rhoai/platform/templates/
+dashboard-config.yaml`) via `--set-string` **only when `CRC_MODE` is
+false**, i.e. on AWS OCP. Rationale: the Dashboard is a "nice to browse"
+convenience (2 `rhods-dashboard` pods, 9 containers each) with zero effect
+on whether tracing/prompt-registration actually works — not worth the extra
+footprint on a resource-constrained CRC laptop that's already sharing RAM
+with Cursor (see ADR-0017's Stage 2 findings), but a reasonable default on
+a dedicated AWS cluster where a human is more likely to want to browse the
+registry through a UI. First tried enabling it unconditionally on CRC too;
+reverted after the user pointed out it adds real footprint for zero
+functional benefit there — see `docs/constraints.md` #20's prerequisite
+note for the up-to-date, environment-conditional description.
+
+**Real bug found and fixed**: prompts registered by
+`scripts/prompt-registry/seed-mlflow-prompts.sh` were confirmed present and
+correctly tagged via the API/SDK, but invisible in the Dashboard's
+per-experiment Prompts tab. Root cause: `register_prompt()` was called
+without an active MLflow experiment set, so every prompt's
+`_mlflow_experiment_ids` tag defaulted to `,0,` (the "Default" experiment)
+instead of the `openclaw-tracing` experiment the Dashboard's per-experiment
+Prompts page filters on. Fixed by having `seed-mlflow-prompts.sh` call
+`mlflow.set_experiment(experiment_id=...)` first, with
+`wire-rhoai-mlflow-tracing.sh` passing through the experiment ID it already
+captures. Full writeup: `docs/constraints.md` #20.
+
+**Namespace label**: `opendatahub.io/dashboard: "true"` was also added to
+the `openshell` namespace (`scripts/bootstrap-ocp.sh`) so the Dashboard
+lists it as a Data Science Project. This was investigated as a candidate
+root cause for the bug above and ruled out (prompts were still invisible
+with the label alone, before the experiment-id fix) — but it's kept since
+it's part of the now-working configuration and is a reasonable prerequisite
+for the Dashboard to recognize the namespace at all.
+
+Net effect on this ADR's "Consequences" section: no change to the tracing/
+prompt-registry backend or its API-level auth model, only an additional UI
+surface (RHOAI Dashboard) turned on for the same underlying data.
+
 ## References
 
 - [ADR-0014: Agent Observability — Dual-Pipeline Tracing with OTel + MLflow](ADR-0014-agent-observability.md) (superseded, MLflow half)

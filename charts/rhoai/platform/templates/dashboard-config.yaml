@@ -1,0 +1,15 @@
+{{- if and (eq .Values.datasciencecluster.components.dashboard.managementState "Managed") (.Capabilities.APIVersions.Has "opendatahub.io/v1alpha") }}
+# Patches the dashboard component's auto-created singleton config (fixed
+# name/namespace, not something this chart creates from scratch — see
+# ADR-0018's 2026-07-27 amendment and docs/constraints.md #20). Applied in
+# the same release as the DataScienceCluster above so genAiStudio is set
+# from the very first reconcile, not as a separate manual patch step.
+apiVersion: opendatahub.io/v1alpha
+kind: OdhDashboardConfig
+metadata:
+  name: odh-dashboard-config
+  namespace: redhat-ods-applications
+spec:
+  dashboardConfig:
+    genAiStudio: {{ .Values.dashboardConfig.genAiStudio }}
+{{- end }}

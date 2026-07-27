@@ -3,6 +3,14 @@
 # trustyai, kserve, modelsAsService all Managed), this repo only needs
 # mlflowoperator — everything else is Removed to keep the footprint as small
 # as possible on a resource-constrained cluster. See ADR-0017.
+#
+# dashboard defaults to Removed (this value) on CRC to keep the footprint
+# minimal — the Prompt Registry / Traces functionality (register, fetch,
+# trace-linking) is fully validated via the API/SDK alone and doesn't need
+# it (docs/constraints.md #20). scripts/deploy-rhoai-mlflow.sh overrides this
+# to Managed (+ genAiStudio: true below) only when NOT CRC_MODE, i.e. on AWS
+# OCP, where a human browsing the UI doesn't compete with Cursor/desktop
+# apps for the same laptop's RAM. See ADR-0018's 2026-07-27 amendment.
 datasciencecluster:
   name: default-dsc
   components:
@@ -44,3 +52,14 @@ datasciencecluster:
       managementState: Removed
     workbenches:
       managementState: Removed
+
+# Only takes effect when dashboard is Managed (AWS — see above): patches the
+# OdhDashboardConfig singleton the dashboard component auto-creates
+# (name/namespace are fixed by RHOAI, not configurable). genAiStudio
+# surfaces the GenAI hub nav (Experiments, Prompts, Traces) the Prompt
+# Registry (ADR-0015/ADR-0018) needs for UI visibility. Defaults to false
+# here since the template it feeds is itself skipped while dashboard is
+# Removed; scripts/deploy-rhoai-mlflow.sh overrides this to true alongside
+# the dashboard override on AWS.
+dashboardConfig:
+  genAiStudio: false

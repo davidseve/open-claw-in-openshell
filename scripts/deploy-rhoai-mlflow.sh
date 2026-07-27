@@ -29,10 +29,18 @@ CHART_DIR="${PROJECT_DIR}/charts/rhoai"
 check_prereqs
 detect_environment
 
+DASHBOARD_OPTS=""
 if [[ "$CRC_MODE" == "true" ]]; then
   info "CRC mode: RHOAI + MLflow combined with the full OpenClaw stack squeezes"
   info "host free memory to ~11 GiB (see ADR-0017/ADR-0018) — accepted trade-off,"
   info "no lightweight fallback. Close other memory-heavy apps if things feel slow."
+  info "RHOAI Dashboard stays Removed on CRC (2 extra pods, 9 containers each,"
+  info "not needed — Prompt Registry/Traces are fully usable via API/SDK, see"
+  info "docs/constraints.md #20). Enabled automatically on AWS OCP instead."
+else
+  info "AWS OCP: enabling RHOAI Dashboard (+ genAiStudio) for the Prompt"
+  info "Registry / Traces UI — see ADR-0018's 2026-07-27 amendment."
+  DASHBOARD_OPTS="--set-string datasciencecluster.components.dashboard.managementState=Managed --set-string dashboardConfig.genAiStudio=true"
 fi
 
 step "Ensuring MLFLOW_DB_PASSWORD secret exists"
@@ -45,7 +53,7 @@ info "on every environment, CRC and AWS alike. To approve by hand instead:"
 info "  oc -n redhat-ods-operator get installplan"
 info "  oc -n redhat-ods-operator patch installplan <name> --type merge -p '{\"spec\":{\"approved\":true}}'"
 make -C "$CHART_DIR" deploy-all \
-  HELM_OPTS="--set-string database.password=${MLFLOW_DB_PASSWORD} --set-string postgresql.password=${MLFLOW_DB_PASSWORD}"
+  HELM_OPTS="--set-string database.password=${MLFLOW_DB_PASSWORD} --set-string postgresql.password=${MLFLOW_DB_PASSWORD} ${DASHBOARD_OPTS}"
 
 step "Validating RHOAI MLflow deployment"
 if make -C "$CHART_DIR" validate; then
