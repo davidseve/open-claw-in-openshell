@@ -466,6 +466,21 @@ certs).
 - [x] **AWS follow-up — confirmed 2026-08-03 on a real AWS OCP cluster (`sandbox659.opentlc.com`, Let's Encrypt-issued router wildcard cert)**: `enable_openshell_oidc_insecure()` is strictly gated on `CRC_MODE=true` (`scripts/common.sh`), so `OPENSHELL_GATEWAY_INSECURE` was never exported anywhere during a full `crc-lifecycle.sh deploy --with-oidc --with-obs` + `verify.sh` (full profile) run — confirmed via `env | grep OPENSHELL_GATEWAY_INSECURE` (empty) throughout. This entire workaround was indeed a complete no-op on AWS, exactly as predicted: mTLS gateway registration, `openshell status`, OIDC token refresh against Keycloak, and the oauth-proxy OAuth login flow (real `redhat` HTPasswd user) all passed with zero TLS trust issues — Let's Encrypt's publicly-trusted chain needs no special handling, unlike CRC's self-signed router cert (constraint #18). No AWS-side gap found; no code changes needed for this item.
 - [ ] Stronger long-term fix (CRC-only, optional): replace the insecure-skip approach entirely by importing CRC's actual router CA into the CLI's trust store (or passing it explicitly, if the `openshell` CLI supports a custom CA flag), so CRC never needs `OPENSHELL_GATEWAY_INSECURE` either — would close the residual OIDC-path exposure window without needing an insecure flag at all
 
+### 13.6 Prompt file "read-only" protection (`chmod 444`) is bypassable — needs a directory-level fix
+
+Discovered from a real chat-session report (the agent successfully edited `AGENTS.md` via its `edit` tool despite the file being `chown root:root` + `chmod 444`) and confirmed live against the running sandbox — see [`docs/constraints.md` #24](docs/constraints.md) for the full root-cause analysis and reproduction steps.
+
+**Root cause**: the lock only prevents *in-place* writes. Deleting/recreating the file (an atomic write-then-rename, which is what OpenClaw's `edit` tool appears to do) only needs write permission on the *parent directory* (`/sandbox/workspace`, owned by `sandbox`, mode `700`), bypassing the file-level `chmod 444` entirely — confirmed live with `rm AGENTS.md && echo hacked > AGENTS.md` as the real `sandbox` user. Also confirmed this defeats a file-level Landlock `read_only` policy entry added via `openshell policy set`, for the same reason (remove permission is directory-scoped, not file-scoped).
+
+**Also checked**: OpenClaw's config schema (`openclaw config schema`) has no per-path read-only/deny option for its filesystem tools (`read`/`write`/`edit`/`apply_patch`) — only a whole-workspace `tools.fs.workspaceOnly` boolean. No native OpenClaw feature currently solves this.
+
+**Decision (2026-08-03): accepted risk, deferred.** Not fixing now.
+
+- [ ] Move `AGENTS.md`/`SOUL.md`/`TOOLS.md`/`IDENTITY.md`/`USER.md`/`HEARTBEAT.md`/`BOOTSTRAP.md` into a subdirectory `sandbox` cannot write to (e.g. `root:root` mode `555`, or that subdirectory path added to `filesystem_policy.read_only`) so the *parent directory* itself denies unlink/rename, not just the file mode
+- [ ] Verify OpenClaw's startup-context loader can still find these files if relocated (symlinks from `/sandbox/workspace/*.md` into the protected subdir, or a config option pointing at a custom prompt directory)
+- [ ] Add a real write/delete attempt (not just a `stat` mode check) to `scripts/verify.sh` Layer 8b, mirroring the existing Landlock write-test pattern already used for `/sandbox/.openclaw/`
+- [ ] Re-run the live repro from `docs/constraints.md` #24 against the fix to confirm both the in-place-write AND unlink+recreate vectors are blocked
+
 ## References
 
 - [OpenShell OpenShift docs](https://docs.nvidia.com/openshell/kubernetes/openshift)

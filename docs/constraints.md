@@ -1336,3 +1336,77 @@ This does **not** eliminate the CRD/ownership race in constraint #21 above
 independently of `llamastackoperator` timing) — only the read-side race
 this constraint (#23) describes.
 
+## 24. Prompt File Read-Only Protection (`chmod 444`) Is Bypassable via Directory Permissions — NOT YET FIXED
+
+**Status: open, accepted risk, deferred.** See ROADMAP.md Phase 13.6 for the tracked follow-up.
+
+**Constraint**: `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `USER.md`,
+`HEARTBEAT.md`, `BOOTSTRAP.md` are locked with `chown 0:0` + `chmod 444` after
+being fetched from the MLflow Prompt Registry (`launch-openclaw.sh` Step 4),
+intended to make them immutable to the agent. **This protection is
+insufficient** — the agent can still overwrite these files' *content* (it
+cannot forge the fetched-version metadata comment, but the body text is
+fully attacker/agent-controlled).
+
+**Why it fails**: these files live inside `/sandbox/workspace`, a directory
+owned `sandbox:sandbox` with mode `700` (`filesystem_policy.read_write` in
+`policies/openclaw-sandbox.yaml`). In POSIX, permission to delete or rename a
+directory entry is governed by the **parent directory's** write permission,
+not the target file's own mode bits. Since `sandbox` owns and can write to
+`/sandbox/workspace`, it can `unlink()` any file inside it — including
+root-owned, `chmod 444` files — and create a new file with the same name.
+Most file-edit implementations (write-to-temp + atomic `rename()`, or
+truncate+recreate) use exactly this pattern rather than opening the existing
+file for in-place writing, so they succeed against `chmod 444` files without
+ever needing write permission on the file itself.
+
+**Live verification (2026-08-03)**: confirmed directly against the running
+`openclaw-gw` sandbox, executing as the real `sandbox` user via `openshell
+sandbox connect` (the same confinement the agent's own tools run under):
+
+```
+echo x >> AGENTS.md                        → Permission denied   (blocked correctly)
+rm AGENTS.md && echo "hacked" > AGENTS.md  → succeeds, file now sandbox:sandbox
+```
+
+This was also observed for real in a live OpenClaw chat session: the agent's
+`edit` tool reported `"Successfully replaced 1 block(s)"` against
+`AGENTS.md`, and the file's owner changed from `root:root` to
+`sandbox:sandbox` on disk afterward — proof the tool performed an
+unlink+recreate, not an in-place write. (The tampering was reverted by
+re-running `scripts/prompt-registry/fetch-prompts-from-mlflow.sh` +
+re-applying `chown 0:0`/`chmod 444`, restoring all 7 files to their
+`@production` MLflow versions.)
+
+**Landlock does not help here either**: tested adding the specific file path
+to `filesystem_policy.read_only` in the sandbox policy (while its parent
+directory stays in `read_write`) via `openshell policy set` on the live
+sandbox — the delete+recreate bypass still worked identically. Landlock's
+remove-file permission is evaluated against the *parent directory's*
+ruleset, not the child file's, so a file-level allow/deny entry doesn't stop
+it from being unlinked by its parent.
+
+**No native OpenClaw feature covers this either**: dumped the full config
+schema (`openclaw config schema`) and found no per-path read-only/deny
+option for the built-in filesystem tools (`read`/`write`/`edit`/
+`apply_patch`) — only a whole-workspace `tools.fs.workspaceOnly` boolean
+(all-or-nothing directory scoping, no fine-grained per-file protection). The
+only `denyPaths`/`allowWritePaths`-shaped schema found is specific to the
+`nodes` remote-exec plugin config, unrelated to the agent's own file tools
+(and `nodes` is already in `tools.deny`).
+
+**`verify.sh` blind spot**: Layer 8b's prompt-file check (`scripts/verify.sh`
+~line 786) only asserts `stat -c %a == 444`; it never attempts an actual
+write/delete, so this bypass produces no failing check today.
+
+**Why not fixed yet**: a real fix requires restructuring where these files
+live — e.g. a `root`-owned, non-`sandbox`-writable subdirectory, so the
+*parent directory* itself denies `sandbox` unlink/rename rights — plus
+verifying OpenClaw's startup-context loader can still discover
+`AGENTS.md`/etc. at a relocated path (symlinks or a config option). Deferred
+as an accepted risk for now (2026-08-03 decision) rather than implemented
+immediately.
+
+**Scripts affected (for the future fix)**: `scripts/launch-openclaw.sh`
+(Step 4), `policies/openclaw-sandbox.yaml`, `scripts/verify.sh` (Layer 8b)
+
