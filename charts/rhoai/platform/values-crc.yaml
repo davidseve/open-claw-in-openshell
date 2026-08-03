@@ -1,0 +1,23 @@
+# CRC (OpenShift Local) overlay: RHOAI Dashboard + Gen AI Studio stay fully
+# Removed — same values as this chart's own values.yaml defaults, restated
+# explicitly here so CRC's behavior is a first-class, reviewable decision
+# rather than "whatever values.yaml happens to default to today".
+#
+# Rationale: the Dashboard is 2 extra pods (9 containers each) with zero
+# effect on whether tracing/prompt-registration actually works — the Prompt
+# Registry / Traces functionality (register, fetch, trace-linking) is fully
+# validated via the MLflow API/SDK alone (docs/constraints.md #20). CRC +
+# this minimal MLflow ALONE already fits ADR-0017's resource budget, but
+# combined with the rest of the OpenClaw-in-OpenShell stack on a shared dev
+# laptop, host free memory drops to ~11 GiB and swap engages (still
+# functional, but below this project's comfort margin) — not worth adding
+# the Dashboard's footprint on top for zero functional benefit. See
+# ADR-0018's 2026-07-27 amendment.
+datasciencecluster:
+  components:
+    dashboard:
+      managementState: Removed
+    llamastackoperator:
+      managementState: Removed
+dashboardConfig:
+  genAiStudio: false

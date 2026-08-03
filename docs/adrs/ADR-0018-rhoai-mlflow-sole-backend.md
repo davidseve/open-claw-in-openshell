@@ -171,8 +171,11 @@ this project's actual tracing/prompt-registry needs are all met by the
 MLflow Route's API/SDK alone, validated end-to-end without the Dashboard).
 `scripts/deploy-rhoai-mlflow.sh` now overrides it to **`Managed`** (+
 `genAiStudio: true` via the new `charts/rhoai/platform/templates/
-dashboard-config.yaml`) via `--set-string` **only when `CRC_MODE` is
-false**, i.e. on AWS OCP. Rationale: the Dashboard is a "nice to browse"
+dashboard-config.yaml`) by layering the declarative
+`charts/rhoai/platform/values-aws.yaml` overlay on top of `values.yaml`
+(instead of `values-crc.yaml`, which restates the `Removed`/`false`
+defaults explicitly) **only when `CRC_MODE` is false**, i.e. on AWS OCP.
+Rationale: the Dashboard is a "nice to browse"
 convenience (2 `rhods-dashboard` pods, 9 containers each) with zero effect
 on whether tracing/prompt-registration actually works — not worth the extra
 footprint on a resource-constrained CRC laptop that's already sharing RAM

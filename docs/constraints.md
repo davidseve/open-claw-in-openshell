@@ -1062,8 +1062,9 @@ the `DataScienceCluster`, `Removed` by default per
 `charts/rhoai/platform/values.yaml`) with `genAiStudio: true` set on its
 auto-created `OdhDashboardConfig` (`charts/rhoai/platform/templates/
 dashboard-config.yaml`). **This is AWS-OCP-only by design** —
-`scripts/deploy-rhoai-mlflow.sh` sets both via `--set-string` only when
-`CRC_MODE` is false; on CRC the Dashboard stays `Removed` (2 extra pods, 9
+`scripts/deploy-rhoai-mlflow.sh` sets both by passing the
+`charts/rhoai/platform/values-aws.yaml` overlay only when `CRC_MODE` is
+false; on CRC the Dashboard stays `Removed` (2 extra pods, 9
 containers each, no functional benefit — Prompt Registry/tracing work fully
 via the API/SDK either way, which is how every check in this section was
 originally confirmed). The `openshell` namespace is unconditionally labeled
@@ -1282,10 +1283,10 @@ not via a live Kubernetes watch — the same general shape as constraint
 just-satisfied prerequisite), just on the read side of the dashboard
 instead of the write side of the MLflow wiring.
 
-**Fix**: `scripts/deploy-rhoai-mlflow.sh` now also sets
-`datasciencecluster.components.llamastackoperator.managementState=Managed`
-in `DASHBOARD_OPTS`, AWS-only (same conditional as the dashboard component
-itself — stays `Removed` on CRC, no functional loss there since this
+**Fix**: `datasciencecluster.components.llamastackoperator.managementState:
+Managed` is now also set in `charts/rhoai/platform/values-aws.yaml`,
+AWS-only (same conditional as the dashboard component itself — stays
+`Removed` on CRC via `values-crc.yaml`, no functional loss there since this
 project's own tracing/prompt-registry needs never depended on Gen AI
 Studio). `charts/rhoai/Makefile`'s `deploy-platform` target gained a new
 `wait-llamastack-and-refresh-dashboard` step, run whenever `HELM_OPTS`
@@ -1309,10 +1310,13 @@ above works, but only *reacts* to the race (wait, then restart) after the
 `rhods-dashboard` pod has already booted with a stale capability snapshot.
 `charts/rhoai/Makefile`'s `deploy-platform` now avoids the race at its
 source for the common case (a from-scratch cluster, or any cluster where
-the Dashboard component isn't already `Managed`): when `HELM_OPTS` requests
-`llamastackoperator: Managed` and the current `DataScienceCluster` doesn't
+the Dashboard component isn't already `Managed`): when `PLATFORM_ENV_VALUES`
+is `platform/values-aws.yaml` and the current `DataScienceCluster` doesn't
 already have `dashboard: Managed`, it first applies the chart with
-`dashboard` force-overridden to `Removed`, waits for
+`dashboard` force-overridden to `Removed` (one `--set-string` layered on
+top of `values-aws.yaml`, kept minimal and well-commented since this one
+step is a genuinely imperative bootstrap-ordering trick — see
+`values-aws.yaml`'s own comment), waits for
 `LlamaStackOperatorReady=True` (new `wait-llamastack` target, factored out
 of `wait-llamastack-and-refresh-dashboard`), and only *then* runs the real
 apply that turns `dashboard: Managed` on. The `rhods-dashboard` pod is

@@ -7,9 +7,13 @@
 # by default. See ROADMAP.md Phase 12 and docs/adrs/ADR-0017 for the
 # resource-fit investigation and scope decision behind this trim.
 #
-# scripts/deploy-rhoai-mlflow.sh additionally enables the Dashboard (+
-# genAiStudio) via HELM_OPTS on AWS OCP only (not CRC) — see ADR-0018's
-# 2026-07-27 amendment and docs/constraints.md #20.
+# The Dashboard (+ genAiStudio + llamastackoperator) is the one part of the
+# DataScienceCluster spec that legitimately differs between CRC and AWS OCP
+# — see platform/values-crc.yaml / platform/values-aws.yaml for the two
+# declarative overlays (layered on top of platform/values.yaml's common
+# defaults) and docs/constraints.md #20/#23. scripts/deploy-rhoai-mlflow.sh
+# just picks which overlay file to pass via PLATFORM_ENV_VALUES below —
+# no environment-conditional --set-string flags.
 #
 # Usage: make deploy-all    (full minimal stack)
 #        make validate      (post-deploy health checks)
@@ -24,6 +28,13 @@
 HELM := helm
 HELM_OPTS ?=
 WAIT_TIMEOUT ?= 300s
+
+# Which environment overlay to layer on top of platform/values.yaml for the
+# Dashboard/Gen AI Studio component matrix. Defaults to the CRC overlay
+# (dashboard/llamastackoperator Removed, same as values.yaml's own
+# defaults) since that's the safe/minimal choice; scripts/deploy-rhoai-mlflow.sh
+# overrides this to platform/values-aws.yaml on AWS OCP.
+PLATFORM_ENV_VALUES ?= platform/values-crc.yaml
 
 OPERATORS_CHART := operators
 PLATFORM_CHART  := platform
@@ -80,27 +91,28 @@ wait-operators: deploy-operators
 
 deploy-platform: wait-operators
 	@CURRENT_DASHBOARD=$$(oc get datasciencecluster default-dsc -o jsonpath='{.spec.components.dashboard.managementState}' 2>/dev/null || true); \
-	if echo "$(HELM_OPTS)" | grep -q 'llamastackoperator.managementState=Managed' && [ "$$CURRENT_DASHBOARD" != "Managed" ]; then \
+	if [ "$(PLATFORM_ENV_VALUES)" = "platform/values-aws.yaml" ] && [ "$$CURRENT_DASHBOARD" != "Managed" ]; then \
 		echo "Fresh Dashboard enable detected: sequencing llamastackoperator BEFORE"; \
-		echo "dashboard (forcing dashboard=Removed for this one apply, regardless of"; \
-		echo "HELM_OPTS) and waiting for LlamaStackOperatorReady, so the dashboard pod"; \
-		echo "is never created until LlamaStackOperator already is -- see"; \
-		echo "docs/constraints.md #23's root-cause fix: this avoids the capability-gate"; \
-		echo "race at its source instead of reacting to it with a restart afterward."; \
-		$(HELM) upgrade --install $(PLATFORM_RELEASE) $(PLATFORM_CHART) $(HELM_OPTS) --set-string datasciencecluster.components.dashboard.managementState=Removed; \
+		echo "dashboard (forcing dashboard=Removed for this one apply, overriding"; \
+		echo "platform/values-aws.yaml just for this step) and waiting for"; \
+		echo "LlamaStackOperatorReady, so the dashboard pod is never created until"; \
+		echo "LlamaStackOperator already is -- see docs/constraints.md #23's"; \
+		echo "root-cause fix: this avoids the capability-gate race at its source"; \
+		echo "instead of reacting to it with a restart afterward."; \
+		$(HELM) upgrade --install $(PLATFORM_RELEASE) $(PLATFORM_CHART) -f $(PLATFORM_ENV_VALUES) $(HELM_OPTS) --set-string datasciencecluster.components.dashboard.managementState=Removed; \
 		$(MAKE) wait-llamastack; \
 	fi
-	@if echo "$(HELM_OPTS)" | grep -q 'dashboard.managementState=Managed'; then $(MAKE) adopt-dashboard-config; fi
-	$(HELM) upgrade --install $(PLATFORM_RELEASE) $(PLATFORM_CHART) $(HELM_OPTS)
-	@if echo "$(HELM_OPTS)" | grep -q 'dashboard.managementState=Managed'; then \
+	@if [ "$(PLATFORM_ENV_VALUES)" = "platform/values-aws.yaml" ]; then $(MAKE) adopt-dashboard-config; fi
+	$(HELM) upgrade --install $(PLATFORM_RELEASE) $(PLATFORM_CHART) -f $(PLATFORM_ENV_VALUES) $(HELM_OPTS)
+	@if [ "$(PLATFORM_ENV_VALUES)" = "platform/values-aws.yaml" ]; then \
 		$(MAKE) wait-dashboard-crd; \
 		$(MAKE) adopt-dashboard-config; \
 		echo "Re-applying platform chart now that the OdhDashboardConfig CRD/object exist,"; \
 		echo "so the genAiStudio patch (templates/dashboard-config.yaml) actually renders"; \
 		echo "instead of being silently skipped by its Capabilities.APIVersions guard:"; \
-		$(HELM) upgrade --install $(PLATFORM_RELEASE) $(PLATFORM_CHART) $(HELM_OPTS); \
+		$(HELM) upgrade --install $(PLATFORM_RELEASE) $(PLATFORM_CHART) -f $(PLATFORM_ENV_VALUES) $(HELM_OPTS); \
 	fi
-	@if echo "$(HELM_OPTS)" | grep -q 'llamastackoperator.managementState=Managed'; then $(MAKE) wait-llamastack-and-refresh-dashboard; fi
+	@if [ "$(PLATFORM_ENV_VALUES)" = "platform/values-aws.yaml" ]; then $(MAKE) wait-llamastack-and-refresh-dashboard; fi
 
 # On a truly fresh cluster, the first deploy-platform run enables the
 # Dashboard component (managementState: Managed) in the same Helm release
@@ -267,7 +279,7 @@ undeploy-all: undeploy-apps purge-dsci undeploy-operators cleanup-orphans
 
 template:
 	$(HELM) template $(OPERATORS_RELEASE) $(OPERATORS_CHART)
-	$(HELM) template $(PLATFORM_RELEASE) $(PLATFORM_CHART)
+	$(HELM) template $(PLATFORM_RELEASE) $(PLATFORM_CHART) -f $(PLATFORM_ENV_VALUES)
 	$(HELM) template $(DATABASE_RELEASE) $(DATABASE_CHART)
 	$(HELM) template $(MLFLOW_RELEASE) $(MLFLOW_CHART)
 
