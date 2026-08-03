@@ -1110,3 +1110,225 @@ to delete and recreate them.
 
 **Scripts affected**: `scripts/prompt-registry/seed-mlflow-prompts.sh`,
 `scripts/wire-rhoai-mlflow-tracing.sh` — both fixed.
+
+## 21. RHOAI Dashboard `genAiStudio` Silently Never Enabled on a Fresh AWS Deploy (RESOLVED)
+
+**Context**: found live 2026-08-03 on a real AWS OCP cluster
+(`sandbox659.opentlc.com`) while validating the user's explicit request to
+enable the RHOAI Dashboard UI + GenAI Studio (constraint #20's
+"AWS-OCP-only" prerequisite) on a large cluster where the Dashboard's extra
+pods are affordable.
+
+**Symptom**: `scripts/deploy-rhoai-mlflow.sh` printed "AWS OCP: enabling
+RHOAI Dashboard (+ genAiStudio)" and `make -C charts/rhoai validate`
+reported success, yet `oc get odhdashboardconfig odh-dashboard-config -n
+redhat-ods-applications -o yaml` showed `dashboardConfig: {disableTracking:
+false}` — no `genAiStudio` key at all. The Dashboard itself was `Ready` and
+reachable; only the GenAI Studio nav (Experiments/Prompts/Traces) was
+missing.
+
+**Root cause — two stacked races, both on a truly fresh cluster only
+(never CRC, where the Dashboard component stays `Removed`)**:
+
+1. `charts/rhoai/platform/templates/dashboard-config.yaml` (the
+   `OdhDashboardConfig` patch that sets `genAiStudio: true`) is gated on
+   `.Capabilities.APIVersions.Has "opendatahub.io/v1alpha"`. The very first
+   `helm upgrade --install rhoai-platform` that flips
+   `dashboard.managementState` to `Managed` evaluates that guard *before*
+   the CRD exists — the Dashboard operator only registers it a few seconds
+   later, once it starts reconciling the newly-Managed component. The guard
+   evaluates false, the patch is silently skipped, and Helm never even
+   attempts to manage the object.
+2. Once the CRD is registered, the Dashboard operator auto-creates the
+   `odh-dashboard-config` singleton itself — without any Helm ownership
+   metadata (since Helm never got to create it in race #1). A subsequent
+   `helm upgrade` for the same release then fails outright: `"exists and
+   cannot be imported into the current release: invalid ownership
+   metadata"` — standard Helm 3 behavior refusing to silently adopt a
+   resource it doesn't already own.
+
+**Fix**: `charts/rhoai/Makefile`'s `deploy-platform` target now: (a) calls a
+new `adopt-dashboard-config` target *before* every `helm upgrade` attempt,
+which annotates/labels a pre-existing `odh-dashboard-config` object with the
+exact `meta.helm.sh/release-name`, `meta.helm.sh/release-namespace`, and
+`app.kubernetes.io/managed-by: Helm` metadata Helm itself would have set
+(idempotent no-op if the object doesn't exist yet or is already owned); (b)
+after the first `helm upgrade`, waits for the CRD *and* the object to exist
+(`wait-dashboard-crd`), re-runs `adopt-dashboard-config`, then re-applies
+the chart a second time so the now-unblocked template actually renders. The
+`validate` target also gained an explicit check
+(`genAiStudio enabled on OdhDashboardConfig`) so a regression here fails
+loudly instead of silently, the same way constraint #20 was originally
+invisible until manually diffed against the live cluster.
+
+**Scripts affected**: `charts/rhoai/Makefile` (`deploy-platform`,
+`wait-dashboard-crd`, `adopt-dashboard-config`, `validate`) — fixed and
+confirmed idempotent across three consecutive re-runs on the live AWS
+cluster (including one starting from the mid-broken, partially-adopted
+state race #2 above left behind).
+
+## 22. Re-running `deploy-rhoai-mlflow.sh` After Initial Wiring Silently Deletes the OpenClaw↔MLflow Integration (RESOLVED)
+
+**Context**: found live 2026-08-03 immediately after fixing constraint #21
+above — re-running `scripts/deploy-rhoai-mlflow.sh` to pick up that chart
+fix on an AWS cluster that had already completed a full
+`crc-lifecycle.sh deploy` (OpenShell + `wire-rhoai-mlflow-tracing.sh`
+already run once).
+
+**Symptom**: `verify.sh` Layer 8 ("MLflow health returned HTTP 401") and
+Layer 8b ("No prompts registered in MLflow" / "No @production aliases
+set") started failing immediately after the redeploy, even though the
+exact same checks had passed minutes earlier. Direct API reproduction
+returned `{"error":{"code":"UNAUTHENTICATED","message":"Authentication
+with the Kubernetes API failed. The provided token may be invalid or
+expired."}}` (HTTP 401) using the cached token from
+`.rendered/rhoai-mlflow/wiring.env`. `oc get secret
+openshell-sandbox-mlflow-token -n openshell` came back `NotFound` — the
+Secret backing that token no longer existed.
+
+**Root cause**: `charts/rhoai/mlflow/templates/openclaw-integration-
+rbac.yaml`'s RoleBinding + SA token Secret only render when
+`openclawIntegration.enabled: true` (chart default: `false`).
+`wire-rhoai-mlflow-tracing.sh` flips that on via its own, separate `helm
+upgrade rhoai-mlflow` call (deliberately without `--reuse-values` — see
+that script's own comment on why). `scripts/deploy-rhoai-mlflow.sh`'s
+`make deploy-all` → `helm upgrade --install rhoai-mlflow` call computes
+values from the chart's defaults + its own `HELM_OPTS` only, with no
+awareness of `wire-rhoai-mlflow-tracing.sh`'s prior override — so it always
+resets `openclawIntegration.enabled` back to `false`, deleting the
+RoleBinding and the declarative SA token Secret Helm now considers
+orphaned. Any cached token immediately stops validating against the
+Kubernetes API (the Secret backing it is gone), even though the token
+string itself still decodes fine as a JWT. This was invisible before
+because `deploy-rhoai-mlflow.sh` had only ever been run once per
+environment, before OpenShell (and thus the wiring) existed — the
+destructive reset had nothing to destroy yet.
+
+**Fix**: `scripts/deploy-rhoai-mlflow.sh` now checks, after its own
+deploy+validate, whether `openshell-sandbox` SA already exists in the
+`openshell` namespace (i.e. this is a re-run after the full stack was
+already up, not the one-shot pre-OpenShell bootstrap run) and, if so,
+automatically re-invokes `wire-rhoai-mlflow-tracing.sh` to restore the
+RBAC/token/experiment wiring it would otherwise have just deleted. Also
+note: the sandbox's already-running `openclaw-gateway`/`prompt-trace-
+linker` processes bake the SA token in as an env var at process start
+(`scripts/launch-openclaw.sh`) and do **not** pick up a refreshed token
+without a restart — after any re-wiring, `./scripts/launch-openclaw.sh`
+must be re-run too (it force-kills and restarts both processes
+idempotently). A stray old `openclaw-gateway` process that survives one
+cleanup pass (observed once, cause not fully isolated — possibly a PID
+namespace/session artifact of `oc exec`) can also keep listening on
+`:18789` with the stale token underneath a freshly-started instance that
+then fails silently on the port conflict; if `launch-openclaw.sh` reports
+"mlflow-openclaw plugin may not have loaded", check for and force-kill
+duplicate `pgrep -af "openclaw|node"` processes in the sandbox before
+re-launching.
+
+**Scripts affected**: `scripts/deploy-rhoai-mlflow.sh` — fixed. Confirmed
+live: re-wiring restored the RoleBinding/Secret/experiment, prompts
+re-seeded cleanly (versions bumped 1→2, `@production` alias reapplied), and
+a full `verify.sh` (full profile) + Playwright run afterward passed Layers
+8/8b/9/10 end-to-end, including 5 real MLflow-native traces with prompt
+tags from actual E2E chat turns.
+
+## 23. RHOAI Dashboard "Gen AI studio" Nav Item Requires `llamastackoperator: Managed`, Not Just `dashboardConfig.genAiStudio: true` (RESOLVED)
+
+**Context**: found live 2026-08-03, immediately after fixing constraint #21
+(the `genAiStudio` CRD/ownership race). With `genAiStudio: true` correctly
+landed on `OdhDashboardConfig` and the `rhods-dashboard` pods restarted, the
+Dashboard's left nav still showed no "Gen AI studio" section at all — only
+"Home / Projects / AI hub / Develop & train / Learning resources /
+Applications / Settings", confirmed both via a live user screenshot and
+independently by extracting the full rendered nav via
+`document.querySelectorAll('nav a, nav button')` in an authenticated
+browser session. Navigating directly to `/genAi` rendered the dashboard
+shell's own "We can't find that page" 404 (a client-side router miss, not a
+plugin-level 404) — proof the route was never registered at all, not just
+hidden from the sidebar.
+
+**Root cause**: the "Gen AI studio" nav (Playground / AI asset endpoints /
+Prompts) is served by a separate `gen-ai-ui` sidecar container in the
+`rhods-dashboard` pod (one of nine containers: `rhods-dashboard`,
+`kube-rbac-proxy`, `model-registry-ui`, `gen-ai-ui`, `maas-ui`,
+`mlflow-ui`, `eval-hub-ui`, `automl-ui`, `autorag-ui` — RHOAI 3.4's
+dashboard is a module-federation shell loading each "hub" as an
+independent micro-frontend). The dashboard shell's own logs confirmed it
+*does* fetch the extension bundle
+(`/_mf/genAi/remoteEntry.js`, `__federation_expose_extensions.bundle.js`)
+once `genAiStudio: true` is set — but grepping that bundle inside a live
+`gen-ai-ui` container
+(`/static/__federation_expose_extensions.bundle.js`) turned up
+`requiredComponents:[t.W.LLAMA_STACK_OPERATOR]`. `genAiStudio: true` only
+controls whether the shell *attempts* to load the extension; the extension
+itself then self-gates on the `llamastackoperator` DataScienceCluster
+component's readiness, which this chart's `values.yaml` defaults to
+`Removed` (same minimal-footprint rationale as everything else — see
+ADR-0017). Two dead ends tried first before finding this: (1)
+`dashboardConfig.modelAsService: true` (another real
+`OdhDashboardConfig` field, seen paired with `genAiStudio` in some
+community examples) — no effect; (2) a plain `rhods-dashboard` pod restart
+with only `genAiStudio: true` set — no effect, since the actual blocker was
+never about `OdhDashboardConfig` at all.
+
+**Second race layered on top**: setting
+`datasciencecluster.components.llamastackoperator.managementState: Managed`
+and waiting for `LlamaStackOperatorReady=True` was still not enough on its
+own — the nav item stayed absent until the `rhods-dashboard` deployment was
+restarted *again*, after that condition went `True`. Whatever gates the
+`gen-ai-ui` extension's capability check on the frontend/backend side
+appears to be evaluated once (env/informer cache read at process start),
+not via a live Kubernetes watch — the same general shape as constraint
+#22's token problem (an already-running process not picking up a
+just-satisfied prerequisite), just on the read side of the dashboard
+instead of the write side of the MLflow wiring.
+
+**Fix**: `scripts/deploy-rhoai-mlflow.sh` now also sets
+`datasciencecluster.components.llamastackoperator.managementState=Managed`
+in `DASHBOARD_OPTS`, AWS-only (same conditional as the dashboard component
+itself — stays `Removed` on CRC, no functional loss there since this
+project's own tracing/prompt-registry needs never depended on Gen AI
+Studio). `charts/rhoai/Makefile`'s `deploy-platform` target gained a new
+`wait-llamastack-and-refresh-dashboard` step, run whenever `HELM_OPTS`
+requests `llamastackoperator: Managed`: waits for
+`LlamaStackOperatorReady=True`, then `oc rollout restart
+deployment/rhods-dashboard` so the already-running dashboard pods
+re-evaluate the capability. `make validate` also gained a matching check
+(`LlamaStackOperator ready (required for Gen AI Studio dashboard nav)`).
+
+**Scripts affected**: `scripts/deploy-rhoai-mlflow.sh`,
+`charts/rhoai/Makefile` (`deploy-platform`, `wait-llamastack-and-refresh-
+dashboard`, `validate`), `charts/rhoai/platform/values.yaml` (comment only,
+default stays `Removed`) — fixed and confirmed reproducible end-to-end via
+a from-scratch automated re-run of `deploy-rhoai-mlflow.sh` (not just the
+live manual patches used to diagnose it): "Gen AI studio" (with
+"Playground", "AI asset endpoints", "Prompts" sub-items, all marked "Tech
+Preview") appeared in the Dashboard nav on first login after that run.
+
+**2026-08-03 follow-up — root-caused instead of just reacted-to**: the fix
+above works, but only *reacts* to the race (wait, then restart) after the
+`rhods-dashboard` pod has already booted with a stale capability snapshot.
+`charts/rhoai/Makefile`'s `deploy-platform` now avoids the race at its
+source for the common case (a from-scratch cluster, or any cluster where
+the Dashboard component isn't already `Managed`): when `HELM_OPTS` requests
+`llamastackoperator: Managed` and the current `DataScienceCluster` doesn't
+already have `dashboard: Managed`, it first applies the chart with
+`dashboard` force-overridden to `Removed`, waits for
+`LlamaStackOperatorReady=True` (new `wait-llamastack` target, factored out
+of `wait-llamastack-and-refresh-dashboard`), and only *then* runs the real
+apply that turns `dashboard: Managed` on. The `rhods-dashboard` pod is
+therefore never created until `llamastackoperator` is already `Ready`, so
+its one-time capability snapshot at boot is already correct — no restart
+needed. `wait-llamastack-and-refresh-dashboard`'s restart is kept as a
+defensive fallback for the one case the sequencing doesn't cover: an
+*upgrade* of an already-`Managed`, already-running dashboard where
+`llamastackoperator` gets flipped on later (rare in this project, since
+`deploy-rhoai-mlflow.sh` always requests both together) — on the common
+fresh-install path it degrades to a fast, harmless no-op (`llamastackoperator`
+is already `Ready`, so the restart is redundant but cheap).
+
+This does **not** eliminate the CRD/ownership race in constraint #21 above
+(`wait-dashboard-crd` / `adopt-dashboard-config` are still needed —
+`genAiStudio` is a separate field on a separate CRD, raced against
+independently of `llamastackoperator` timing) — only the read-side race
+this constraint (#23) describes.
+

@@ -23,6 +23,11 @@ datasciencecluster:
         managementState: Removed
     modelsAsService:
       managementState: Removed
+    # Required (Managed) for the Dashboard's "Gen AI studio" nav section to
+    # render at all, on top of dashboardConfig.genAiStudio: true below --
+    # that flag alone is necessary but not sufficient (docs/constraints.md
+    # #23). scripts/deploy-rhoai-mlflow.sh overrides this to Managed
+    # alongside the dashboard override, AWS-only, same as dashboard itself.
     llamastackoperator:
       managementState: Removed
     mlflowoperator:

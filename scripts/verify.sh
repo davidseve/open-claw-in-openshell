@@ -484,8 +484,16 @@ if oc -n "$NAMESPACE" get route openclaw-ui-auth &>/dev/null; then
     warn "Redirect location does not point to oauth-openshift: ${REDIRECT_LOCATION:0:80}"
   fi
 
-  # Full authorization-code flow against the HTPasswd `developer` user,
-  # proving end-to-end login without any Keycloak hop (ADR-0016 evidence).
+  # Full authorization-code flow against an HTPasswd test user, proving
+  # end-to-end login without any Keycloak hop (ADR-0016 evidence). CRC's
+  # default HTPasswd identity is `developer`/`developer`; real AWS OCP
+  # clusters (e.g. OpenTLC sandboxes) typically provision a single, differently
+  # named HTPasswd user instead (no `developer` user at all) -- override via
+  # OCP_TEST_USERNAME/OCP_TEST_PASSWORD env vars, same names tests/auth.setup.ts
+  # already uses, so both the shell verify path and the Playwright path share
+  # one override mechanism per environment.
+  OCP_TEST_USERNAME="${OCP_TEST_USERNAME:-developer}"
+  OCP_TEST_PASSWORD="${OCP_TEST_PASSWORD:-developer}"
   CJ=$(mktemp)
   LOGIN_HTML=$(mktemp)
   curl -sk -c "$CJ" -L "https://${OAUTH_PROXY_HOST}/" -o "$LOGIN_HTML" 2>/dev/null || true
@@ -496,12 +504,12 @@ if oc -n "$NAMESPACE" get route openclaw-ui-auth &>/dev/null; then
     FINAL_URL=$(curl -sk -b "$CJ" -c "$CJ" -L \
       --data-urlencode "csrf=${CSRF}" \
       --data-urlencode "then=${THEN}" \
-      --data-urlencode "username=developer" \
-      --data-urlencode "password=developer" \
+      --data-urlencode "username=${OCP_TEST_USERNAME}" \
+      --data-urlencode "password=${OCP_TEST_PASSWORD}" \
       "https://oauth-openshift.${APPS_DOMAIN}/login" \
       -o /dev/null -w '%{url_effective}' 2>/dev/null || echo "")
     if [[ "$FINAL_URL" == "https://${OAUTH_PROXY_HOST}/" ]]; then
-      pass "Full OAuth login flow (HTPasswd developer user) reaches the Control UI"
+      pass "Full OAuth login flow (HTPasswd ${OCP_TEST_USERNAME} user) reaches the Control UI"
 
       # Regression check for the WebSocket Host-header bug this hostname
       # unification fix addresses (ADR-0016 "WebSocket login failure"): a

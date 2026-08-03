@@ -40,7 +40,12 @@ if [[ "$CRC_MODE" == "true" ]]; then
 else
   info "AWS OCP: enabling RHOAI Dashboard (+ genAiStudio) for the Prompt"
   info "Registry / Traces UI — see ADR-0018's 2026-07-27 amendment."
-  DASHBOARD_OPTS="--set-string datasciencecluster.components.dashboard.managementState=Managed --set-string dashboardConfig.genAiStudio=true"
+  info "Also enabling llamastackoperator: the Gen AI Studio dashboard nav item"
+  info "is a module-federation extension gated on requiredComponents:"
+  info "[LLAMA_STACK_OPERATOR] (confirmed by grepping the deployed gen-ai-ui"
+  info "container's extension bundle) — dashboardConfig.genAiStudio=true alone"
+  info "is necessary but not sufficient; see docs/constraints.md #23."
+  DASHBOARD_OPTS="--set-string datasciencecluster.components.dashboard.managementState=Managed --set-string dashboardConfig.genAiStudio=true --set-string datasciencecluster.components.llamastackoperator.managementState=Managed"
 fi
 
 step "Ensuring MLFLOW_DB_PASSWORD secret exists"
@@ -60,6 +65,30 @@ if make -C "$CHART_DIR" validate; then
   pass "RHOAI-managed MLflow deployed and validated"
 else
   fail "RHOAI-managed MLflow validation failed - see 'make -C charts/rhoai validate' output above"
+fi
+
+# Re-running this script after OpenShell + wire-rhoai-mlflow-tracing.sh have
+# already run once (e.g. to pick up a chart fix, like the genAiStudio
+# CRD-race fix in charts/rhoai/Makefile) is otherwise destructive: the plain
+# `helm upgrade --install rhoai-mlflow` above computes values from the
+# chart's own defaults + HELM_OPTS only (neither this call nor
+# wire-rhoai-mlflow-tracing.sh's own separate `helm upgrade` for the same
+# release uses `--reuse-values`), so it silently resets
+# `openclawIntegration.enabled` back to its chart default (false) —
+# deleting the RoleBinding + declarative SA token Secret
+# (openshell-sandbox-mlflow-token) that wire-rhoai-mlflow-tracing.sh had
+# created. Any cached token in .rendered/rhoai-mlflow/wiring.env instantly
+# becomes invalid (the backing Secret is gone), breaking mlflow-openclaw
+# tracing and every verify.sh Layer 8/8b/10 MLflow API check with a 401 —
+# confirmed live on a real AWS OCP deploy. Detect that wiring already
+# happened (openshell-sandbox SA exists) and transparently re-wire so this
+# script stays safe to re-run at any point in the deploy lifecycle, not just
+# as the very first, one-shot pre-OpenShell step.
+if oc get sa openshell-sandbox -n "${NAMESPACE:-openshell}" &>/dev/null; then
+  step "openshell-sandbox SA already exists — re-wiring RHOAI MLflow integration"
+  info "(the helm upgrade above resets openclawIntegration.enabled to false;"
+  info "re-running wire-rhoai-mlflow-tracing.sh restores RBAC/token/experiment)"
+  "${SCRIPT_DIR}/wire-rhoai-mlflow-tracing.sh"
 fi
 
 step "RHOAI MLflow deploy script complete"
