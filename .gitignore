@@ -37,6 +37,8 @@ tmp/
 .monitor-state.json
 .verify-status.json
 .verify-loop-state.json
+.logs/
+.agent-status/
 
 # Rendered templates (generated at deploy time from .tpl files)
 .rendered/

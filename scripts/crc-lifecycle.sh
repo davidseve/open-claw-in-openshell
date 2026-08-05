@@ -283,9 +283,22 @@ cmd_status() {
 
 # --- Main ---
 
+_ORIG_ARGS=("$@")
 COMMAND="${1:-help}"
 shift || true
 parse_flags "$@"
+
+# Token-efficient agent wrapper for long-running commands (see long-running-scripts skill).
+if [[ -f "${SCRIPT_DIR}/lib/agent-run.sh" && "${CRC_LIFECYCLE_AGENT_RUN:-}" != "1" ]]; then
+  case "$COMMAND" in
+    deploy|verify|full)
+      # shellcheck source=scripts/lib/agent-run.sh
+      source "${SCRIPT_DIR}/lib/agent-run.sh"
+      agent_run "crc-lifecycle-${COMMAND}" env CRC_LIFECYCLE_AGENT_RUN=1 "$0" "${_ORIG_ARGS[@]}"
+      exit $?
+      ;;
+  esac
+fi
 
 case "$COMMAND" in
   setup)    cmd_setup ;;

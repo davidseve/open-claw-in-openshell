@@ -47,6 +47,14 @@
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_AGENT_RUN_STARTED=""
+if [[ -f "${SCRIPT_DIR}/lib/agent-run.sh" ]]; then
+  # shellcheck source=scripts/lib/agent-run.sh
+  source "${SCRIPT_DIR}/lib/agent-run.sh"
+  _AGENT_RUN_STARTED="$(agent_run_now)"
+fi
+
 NAMESPACE="${NAMESPACE:-openshell}"
 SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-full}"
@@ -997,6 +1005,18 @@ echo "    Warnings: $WARN_COUNT"
 
 if [[ $FAIL_COUNT -gt 0 ]]; then
   error "$FAIL_COUNT check(s) failed"
+  if [[ -n "$_AGENT_RUN_STARTED" ]]; then
+    agent_run_emit_status "verify" 1 "$_AGENT_RUN_STARTED" "" \
+      "VERIFY_PROFILE=${VERIFY_PROFILE} ./scripts/verify.sh" \
+      "failed=${FAIL_COUNT} passed=${PASS_COUNT} warn=${WARN_COUNT}" \
+      "{\"verifyStatus\":\"${VERIFY_STATUS_FILE}\"}"
+  fi
   exit 1
 fi
 info "All checks passed (with $WARN_COUNT warning(s))"
+if [[ -n "$_AGENT_RUN_STARTED" ]]; then
+  agent_run_emit_status "verify" 0 "$_AGENT_RUN_STARTED" "" \
+    "VERIFY_PROFILE=${VERIFY_PROFILE} ./scripts/verify.sh" \
+    "passed=${PASS_COUNT} failed=${FAIL_COUNT} warn=${WARN_COUNT}" \
+    "{\"verifyStatus\":\"${VERIFY_STATUS_FILE}\"}"
+fi

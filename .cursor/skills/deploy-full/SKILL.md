@@ -137,6 +137,16 @@ After a successful deploy, if the user asks to monitor, use the
 `monitor-deployment` skill. Works identically on AWS and CRC — same
 `verify.sh`, same repair logic, same constraints from `docs/constraints.md`.
 
+## Token-efficient execution
+
+Follow the global skill **`long-running-scripts`** (`~/.cursor/skills/long-running-scripts/`).
+
+- **One command:** `./scripts/crc-lifecycle.sh full --fresh` with high `block_until_ms` (≥ 900000) or background + `notify_on_output` `^AGENT_SCRIPT_DONE`
+- **No polling** while it runs
+- **On success:** read `.agent-status/crc-lifecycle-full.json` and `.verify-status.json` — not full logs
+- **Iteration:** `VERIFY_PROFILE=smoke ./scripts/verify.sh`; **full** verify only at deploy end
+- **On failure only:** `tail -50` of log path from status JSON
+
 ## Token Optimization
 
 - Run the single command, do not re-implement phases
