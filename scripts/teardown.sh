@@ -110,5 +110,6 @@ fi
 if [[ "$WITH_RHOAI_MLFLOW" != "true" ]]; then
   info "RHOAI + MLflow was NOT removed — rerun with --with-rhoai-mlflow (shared/slow cluster resource, opt-in on purpose)"
 fi
-info "Operator namespace (openshift-sandboxed-containers-operator) was NOT removed."
+info "Agent Sandbox Operator namespace (agent-sandbox-system) was NOT removed (shared cluster resource)."
 info "Agent Sandbox CRDs were NOT removed (shared cluster resource)."
+info "To remove the Operator on a dedicated demo cluster: oc delete subscription,csv -n agent-sandbox-system --all; oc delete ns agent-sandbox-system"

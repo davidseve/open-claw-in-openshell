@@ -89,11 +89,11 @@ oc get crd sandboxes.agents.x-k8s.io &>/dev/null \
   || fail "Agent Sandbox CRD not found"
 
 if [[ "$CRC_MODE" == "true" ]]; then
-  info "CRC mode: skipping OLM operator CSV check"
+  info "CRC mode: skipping OLM operator CSV check (raw upstream manifest fallback)"
 else
-  oc get csv -n openshift-sandboxed-containers-operator 2>/dev/null | grep -q Succeeded \
-    && pass "Operator CSV healthy" \
-    || warn "Operator CSV not in Succeeded phase"
+  oc get csv -n agent-sandbox-system 2>/dev/null | grep -q Succeeded \
+    && pass "Agent Sandbox Operator CSV healthy (agent-sandbox-system)" \
+    || warn "Agent Sandbox Operator CSV not in Succeeded phase (oc -n agent-sandbox-system get csv)"
 fi
 
 oc get ns "$NAMESPACE" &>/dev/null \

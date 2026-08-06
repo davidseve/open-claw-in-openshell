@@ -11,7 +11,7 @@ Supports both AWS OCP clusters and local CRC (CodeReady Containers) for developm
 | OpenShell Helm chart | `0.0.83` | `oci://ghcr.io/nvidia/openshell/helm-chart` |
 | OpenShell gateway/supervisor | `0.0.83` | `ghcr.io/nvidia/openshell/gateway:0.0.83` |
 | OpenClaw sandbox image | `latest` | `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest` |
-| Agent Sandbox operator (OLM) | `v1.12.0` | `sandboxed-containers-operator.v1.12.0`, channel `stable` |
+| Agent Sandbox operator (OLM) | channel `preview-0.9`, CSV `agent-sandbox-operator.v0.9.0` | package `agent-sandbox-operator`, ns `agent-sandbox-system` (OSC 1.13 TP); CRC fallback: `manifests/agent-sandbox-v0.5.1.yaml` |
 | agent-harness-in-a-box (ref) | `76aca3b` | https://github.com/rcarrata/agent-harness-in-a-box/ |
 | oauth2-proxy | `v7.15.3` | `quay.io/oauth2-proxy/oauth2-proxy:v7.15.3` |
 | Keycloak | `24.0` | `quay.io/keycloak/keycloak:24.0` |
@@ -36,7 +36,7 @@ All scripts auto-detect the environment via `detect_environment` in `scripts/com
 - [x] ADR-0001: Helm deployment, no GPU
 - [x] ADR-0002: OpenClaw in sandbox (not separate Helm chart)
 - [x] ADR-0003: Secret management via OpenShell providers
-- [x] ADR-0004: Red Hat Agent Sandbox (OLM, pinned v1.12.0)
+- [x] ADR-0004: Red Hat build of Agent Sandbox Operator (OLM `agent-sandbox-operator`, channel `preview-0.9`; CRC raw-manifest fallback)
 - [x] ADR-0005: MaaS inference provider
 - [x] ADR-0006: Privileged SCC justification
 - [x] ADR-0007: Pattern A vs Pattern B (OpenClaw inside sandbox)
@@ -54,11 +54,12 @@ Run: `./scripts/bootstrap-ocp.sh`
 
 - [x] Verify OCP cluster access (`oc whoami`)
 - [x] Create `openshell` namespace
-- [x] Install Agent Sandbox operator (OSC 1.12 via OLM)
+- [x] Install Agent Sandbox operator (OLM `agent-sandbox-operator`, channel `preview-0.9` / CSV `v0.9.0` on OCP; CRC still uses raw `manifests/agent-sandbox-v0.5.1.yaml` fallback — see open item below)
 - [x] Approve InstallPlan manually
 - [x] Grant `privileged` SCC to `openshell-sandbox` SA
 - [x] Generate Ed25519 JWT signing secret
 - [x] Verify `sandboxes.agents.x-k8s.io` CRD is available
+- [ ] **Validate whether the CRC raw-manifest fallback can also be dropped** — try installing `agent-sandbox-operator` via OLM on CRC (or another catalog source available there). If it works, delete `manifests/agent-sandbox-v0.5.1.yaml` and the CRC branch in `scripts/bootstrap-ocp.sh`, and update [ADR-0004](docs/adrs/ADR-0004-agent-sandbox-redhat.md). If OLM/`redhat-operators` is unavailable on CRC, keep the fallback and document the constraint.
 
 ## Phase 3: Deploy OpenShell
 
@@ -306,6 +307,42 @@ The original plan for this section ("Map Keycloak roles to OpenClaw operator sco
 - [ ] Add npm/PyPI endpoints if OpenClaw tools need them
 - [ ] Switch to `enforcement: enforce` after validation
 - [ ] Implement credential rotation procedure
+- [ ] Migrate inference routing to `inference.local` + `model='router'` alias (see below)
+
+### 11.1 Migrate to OpenShell Inference Router (`inference.local`)
+
+**Context**: The current deployment routes LLM traffic directly from the sandbox to the external MaaS endpoint (`maas-rhdp.apps.maas.redhatworkshops.io:443`) with `request_body_credential_rewrite: true` in the network policy. The upstream [opendatahub-io/agent-ops](https://github.com/opendatahub-io/agent-ops) project uses OpenShell's built-in inference router instead: sandbox code calls `inference.local` via the OpenAI SDK with `model='router'`, and the gateway transparently injects provider credentials and forwards to the configured backend. This makes the agent code fully provider-agnostic.
+
+**Benefits**:
+- Swap providers (MaaS, vLLM, Bedrock, RHOAI-served model) without touching sandbox policy, `openclaw.json`, or the agent code
+- Eliminates the `request_body_credential_rewrite` dependency (credential injection moves to the gateway's inference layer, not the L7 proxy's body rewrite)
+- Enables `providers_v2_enabled` features: provider profile policy composition, per-provider policy layers auto-contributed to sandbox effective policy
+- Agent code becomes a single `base_url: https://inference.local/v1`, `model: router` config — no hardcoded endpoint or model name
+
+**Prerequisites**:
+- [ ] Enable `providers_v2_enabled` on the gateway: `openshell settings set --global --key providers_v2_enabled --value true --yes`
+- [ ] Re-register the MaaS provider with a v2-compatible type (evaluate `--type openai` since MaaS/LiteLLM serves the OpenAI chat completions API)
+- [ ] Configure inference route: `openshell inference set --provider <name> --model <model>`
+- [ ] Update `config/openclaw.json.tpl` provider config: point `baseUrl` at `https://inference.local/v1`, set model to `router`
+- [ ] Update `policies/openclaw-sandbox.yaml`: remove (or keep as fallback) the `maas_inference` network policy block — `inference.local` traffic is handled by the OpenShell proxy automatically, no explicit endpoint entry needed
+- [ ] Validate that `@mlflow/mlflow-openclaw` plugin traces still capture model name correctly (the router resolves `router` to the real model name in the response)
+- [ ] Add `providers_v2_enabled` enablement to `scripts/deploy-openshell.sh` or `scripts/common.sh`
+- [ ] Add inference routing smoke test: `openshell sandbox create --no-keep -- uv run --with openai python3 -c "..."` (disposable sandbox, validates the full routing stack)
+
+### 11.2 OCSF Audit Event Assertions in `verify.sh`
+
+**Context**: The upstream [opendatahub-io/agent-ops](https://github.com/opendatahub-io/agent-ops) guides highlight `openshell logs <sandbox> --source sandbox|gateway` and `openshell term` for live OCSF event streaming — every network policy verdict (ALLOWED/DENIED), the binary that made the connection, the destination endpoint, and which policy engine made the decision are recorded as structured OCSF `HttpActivity` events. Currently `verify.sh` Layer 4 tests that egress is *blocked* (curl returns 403/timeout) but does not verify that the corresponding DENIED OCSF event was actually recorded in the audit trail.
+
+**Benefits**:
+- Validates the full observability chain end-to-end: policy enforcement happened AND the audit trail captured it
+- Catches silent audit failures (policy works but logging is broken — the sandbox is secure but the operator has no visibility)
+- Aligns with compliance requirements where audit evidence must be independently verifiable
+
+**Tasks**:
+- [ ] After the existing Layer 4 egress-denied test (`curl github.com` → blocked), query `openshell logs $SANDBOX_NAME --source sandbox` and assert a `NET:OPEN [MED] DENIED` event exists for the blocked destination
+- [ ] After the existing Layer 4 MaaS-allowed test, assert a `NET:OPEN [INFO] ALLOWED` event exists for the MaaS endpoint with `engine:opa`
+- [ ] Add to both `full` and `smoke` profiles (the `openshell logs` call is fast — no sandbox exec required)
+- [ ] Document expected OCSF event format in `docs/constraints.md` for future reference
 
 ## Phase 12: Migrate to RHOAI-managed MLflow
 
@@ -493,6 +530,31 @@ Discovered from a real chat-session report (the agent successfully edited `AGENT
 - [ ] Add a real write/delete attempt (not just a `stat` mode check) to `scripts/verify.sh` Layer 8b, mirroring the existing Landlock write-test pattern already used for `/sandbox/.openclaw/`
 - [ ] Re-run the live repro from `docs/constraints.md` #24 against the fix to confirm both the in-place-write AND unlink+recreate vectors are blocked
 
+### 13.7 Revisit oauth-proxy WebSocket Host-header bug (upstream fix watch)
+
+**Context**: ADR-0016 documents a bug in `openshift/oauth-proxy` where
+`--pass-host-header=false` is never applied to WebSocket connections (the
+`wsutil`-based proxy path). The community `oauth2-proxy` fixed this in
+[PR #3290](https://github.com/oauth2-proxy/oauth2-proxy/pull/3290) (Jan
+2026), but that fix has not been backported to `openshift/oauth-proxy` or
+`opendatahub-io/kube-auth-proxy`. The current workaround (hostname
+unification + `hostAliases` + explicit `:8080` upstream) works but is
+fragile (deploy-time ClusterIP resolution, unfriendly hostname). See
+ADR-0016 "WebSocket login failure" for full analysis.
+
+**Trigger to revisit** (not on a recurring cadence):
+1. `openshift/oauth-proxy` merges a fix for the WebSocket `passHostHeader`
+   bug — check the repo's commit history / releases periodically
+2. `opendatahub-io/kube-auth-proxy` resyncs with the community fix and
+   becomes a viable drop-in replacement
+3. If neither happens within ~6 months, consider Option A (build a custom
+   patched image, ~15-line fix) or Option B (nginx `auth_request` split) from
+   the investigation documented in this project's chat history
+
+- [ ] Periodically check `openshift/oauth-proxy` for a WebSocket Host-header fix (watch repo releases or search for `passHostHeader` / `wsutil` changes)
+- [ ] If fixed upstream: switch back to a friendly Route hostname (`openclaw-ui.<APPS_DOMAIN>`), remove `hostAliases`, set `--pass-host-header=false`
+- [ ] If not fixed upstream within a reasonable window: evaluate building a custom patched image (Option A) or nginx auth_request split (Option B)
+
 ## Phase 14: Declarative Simplification + Shared-Cluster Coexistence
 
 **Status: COMPLETE** — Objective: port back the declarative patterns learned while building `agentops-example` from this project's stack, replacing imperative `oc`/script steps with Helm-native mechanisms, and enable both projects to coexist on one OCP cluster without losing or changing existing functionality (in particular, `trusted-proxy` auth stays untouched — no regression to a static gateway token).
@@ -518,4 +580,4 @@ Discovered from a real chat-session report (the agent successfully edited `AGENT
 - [OpenClaw health checks](https://docs.openclaw.ai/gateway/health)
 - [OpenClaw OpenAI-compatible API](https://docs.openclaw.ai/gateway/openai-http-api)
 - [agent-harness-in-a-box](https://github.com/rcarrata/agent-harness-in-a-box) (commit `76aca3b`)
-- [Red Hat Agent Sandbox](https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.12/html/deploying_red_hat_build_of_agent_sandbox/index)
+- [Red Hat build of Agent Sandbox (OSC 1.13)](https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.13/html/deploying_red_hat_build_of_agent_sandbox/)

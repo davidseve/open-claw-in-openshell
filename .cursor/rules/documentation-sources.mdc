@@ -34,7 +34,9 @@ All decisions about platform components MUST be validated against official docum
 
 ### Agent Sandbox (Red Hat build)
 
-- **Red Hat build of Agent Sandbox:** https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.12/html/deploying_red_hat_build_of_agent_sandbox/
+- **Red Hat build of Agent Sandbox (OSC 1.13):** https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.13/html/deploying_red_hat_build_of_agent_sandbox/
+- **Upstream:** https://github.com/kubernetes-sigs/agent-sandbox
+- **Blog (Aug 2026):** https://www.redhat.com/en/blog/whats-new-red-hat-openshift-confidential-computing-and-sandboxing
 - **Upstream:** https://github.com/kubernetes-sigs/agent-sandbox
 
 ### MaaS (Model Serving / inference provider)
