@@ -6,7 +6,7 @@
 #
 # RHOAI MLflow is the sole tracing/prompt-registry backend for this project
 # (docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md) — called unconditionally
-# from scripts/crc-lifecycle.sh's `deploy`/`full` commands, on every
+# from scripts/cluster-lifecycle.sh's `deploy`/`full` commands, on every
 # environment including CRC.
 #
 # ADR-0017's empirically-tested resource finding still applies on CRC: RHOAI

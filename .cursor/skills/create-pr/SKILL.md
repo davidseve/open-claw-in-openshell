@@ -65,7 +65,7 @@ Key findings during testing:
 **Test plan**:
 - Checklist with `- [ ]` (open) or `- [x]` (done before PR)
 - Include cluster name/context when tested on OCP or CRC
-- Reference scripts (`./scripts/crc-lifecycle.sh full`, `./scripts/verify.sh`, `make -C charts/rhoai deploy-all`)
+- Reference scripts (`./scripts/cluster-lifecycle.sh full`, `./scripts/verify.sh`, `make -C charts/rhoai deploy-all`)
 
 ## Workflow
 

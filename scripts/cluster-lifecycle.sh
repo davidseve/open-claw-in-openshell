@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 #
-# CRC lifecycle manager for OpenClaw-in-OpenShell.
-#
-# CRC is a local mirror of the AWS OCP deployment. The same scripts,
-# configs, and verification run on both environments. Only APPS_DOMAIN differs.
+# Cluster lifecycle manager for OpenClaw-in-OpenShell — despite the older
+# "crc-lifecycle.sh" name this file used to have, `deploy`/`verify`/
+# `teardown`/`full`/`status` are NOT CRC-specific: they run identically
+# against a local CRC VM or a real AWS/OCP cluster, driven purely by
+# whatever `oc`/`helm` are currently logged into (detect_environment in
+# common.sh only branches on APPS_DOMAIN to pick CRC vs. AWS values
+# overlays — it never shells out to the `crc` binary). Only `setup`/
+# `start`/`stop`/`delete` (and `full --fresh`) actually manage a local CRC
+# VM via `$CRC_BIN`; skip straight to `deploy`/`verify` against a
+# pre-existing real cluster instead.
 #
 # Usage:
-#   ./scripts/crc-lifecycle.sh setup       # configure + start CRC + oc login
-#   ./scripts/crc-lifecycle.sh start       # start existing CRC VM + oc login
-#   ./scripts/crc-lifecycle.sh deploy      # deploy full stack (bootstrap + openshell + openclaw)
-#   ./scripts/crc-lifecycle.sh verify      # run verification suite
-#   ./scripts/crc-lifecycle.sh teardown    # remove stack from CRC
-#   ./scripts/crc-lifecycle.sh stop        # stop CRC VM (preserves state)
-#   ./scripts/crc-lifecycle.sh delete      # destroy CRC VM entirely
-#   ./scripts/crc-lifecycle.sh full        # setup + deploy + verify (one-shot)
-#   ./scripts/crc-lifecycle.sh status      # show CRC and cluster status
+#   ./scripts/cluster-lifecycle.sh setup       # [CRC only] configure + start CRC VM + oc login
+#   ./scripts/cluster-lifecycle.sh start       # [CRC only] start existing CRC VM + oc login
+#   ./scripts/cluster-lifecycle.sh deploy      # deploy full stack (bootstrap + openshell + openclaw) — CRC or real cluster
+#   ./scripts/cluster-lifecycle.sh verify      # run verification suite — CRC or real cluster
+#   ./scripts/cluster-lifecycle.sh teardown    # remove stack from the current cluster
+#   ./scripts/cluster-lifecycle.sh stop        # [CRC only] stop CRC VM (preserves state)
+#   ./scripts/cluster-lifecycle.sh delete      # [CRC only] destroy CRC VM entirely
+#   ./scripts/cluster-lifecycle.sh full        # setup + deploy + verify (one-shot; setup step is CRC-only)
+#   ./scripts/cluster-lifecycle.sh status      # show CRC (if applicable) and cluster status
 #
 # Optional flags:
 #   --with-oidc    deploy: Deploy Keycloak OIDC. teardown: also remove Keycloak.
@@ -25,7 +31,7 @@
 #                  teardown: also remove the observability namespace.
 #
 # `teardown` also accepts scripts/teardown.sh's own --with-rhoai-mlflow /
-# --all flags directly (not wired through crc-lifecycle.sh's flag parser
+# --all flags directly (not wired through cluster-lifecycle.sh's flag parser
 # since RHOAI is unconditional on deploy) — call the script directly for
 # those: ./scripts/teardown.sh --all
 
@@ -222,7 +228,7 @@ cmd_stop() {
 
   step "Stopping CRC VM (state preserved)"
   "$CRC_BIN" stop
-  info "CRC stopped. Run './scripts/crc-lifecycle.sh start' to resume."
+  info "CRC stopped. Run './scripts/cluster-lifecycle.sh start' to resume."
 }
 
 cmd_delete() {
@@ -260,9 +266,9 @@ cmd_full() {
   info "CRC is running with OpenClaw-in-OpenShell deployed and verified."
   info "Control UI: https://${SANDBOX_NAME}--openclaw-ui.$(get_apps_domain)/"
   info "MLflow UI:  https://$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo '<run: oc get route mlflow -n redhat-ods-applications>')/"
-  info "Stop CRC:   ./scripts/crc-lifecycle.sh stop"
-  info "Teardown:   ./scripts/crc-lifecycle.sh teardown"
-  info "Delete VM:  ./scripts/crc-lifecycle.sh delete"
+  info "Stop CRC:   ./scripts/cluster-lifecycle.sh stop"
+  info "Teardown:   ./scripts/cluster-lifecycle.sh teardown"
+  info "Delete VM:  ./scripts/cluster-lifecycle.sh delete"
 }
 
 cmd_status() {
@@ -289,12 +295,12 @@ shift || true
 parse_flags "$@"
 
 # Token-efficient agent wrapper for long-running commands (see long-running-scripts skill).
-if [[ -f "${SCRIPT_DIR}/lib/agent-run.sh" && "${CRC_LIFECYCLE_AGENT_RUN:-}" != "1" ]]; then
+if [[ -f "${SCRIPT_DIR}/lib/agent-run.sh" && "${CLUSTER_LIFECYCLE_AGENT_RUN:-}" != "1" ]]; then
   case "$COMMAND" in
     deploy|verify|full)
       # shellcheck source=scripts/lib/agent-run.sh
       source "${SCRIPT_DIR}/lib/agent-run.sh"
-      agent_run "crc-lifecycle-${COMMAND}" env CRC_LIFECYCLE_AGENT_RUN=1 "$0" "${_ORIG_ARGS[@]}"
+      agent_run "cluster-lifecycle-${COMMAND}" env CLUSTER_LIFECYCLE_AGENT_RUN=1 "$0" "${_ORIG_ARGS[@]}"
       exit $?
       ;;
   esac
@@ -314,15 +320,15 @@ case "$COMMAND" in
     echo "Usage: $0 {setup|start|deploy|verify|teardown|stop|delete|full|status} [--with-oidc] [--with-obs]"
     echo ""
     echo "Commands:"
-    echo "  setup      Configure and start CRC VM, login to cluster"
-    echo "  start      Start existing CRC VM, login to cluster"
-    echo "  deploy     Deploy full stack (bootstrap + openshell + openclaw)"
-    echo "  verify     Run verification suite"
-    echo "  teardown   Remove stack from CRC cluster"
-    echo "  stop       Stop CRC VM (preserves state)"
-    echo "  delete     Destroy CRC VM entirely"
-    echo "  full       setup + deploy + verify (one-shot autonomous)"
-    echo "  status     Show CRC and cluster status"
+    echo "  setup      [CRC only] Configure and start CRC VM, login to cluster"
+    echo "  start      [CRC only] Start existing CRC VM, login to cluster"
+    echo "  deploy     Deploy full stack (bootstrap + openshell + openclaw) -- CRC or real cluster"
+    echo "  verify     Run verification suite -- CRC or real cluster"
+    echo "  teardown   Remove stack from the current cluster"
+    echo "  stop       [CRC only] Stop CRC VM (preserves state)"
+    echo "  delete     [CRC only] Destroy CRC VM entirely"
+    echo "  full       setup + deploy + verify (one-shot autonomous; setup step is CRC-only)"
+    echo "  status     Show CRC (if applicable) and cluster status"
     echo ""
     echo "Flags:"
     echo "  --with-oidc   Also deploy Keycloak OIDC"

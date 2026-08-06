@@ -391,7 +391,7 @@ commands require a valid OIDC token.
 **Workaround**: Increase the Keycloak access token TTL to 1800s (30 minutes)
 using the Keycloak admin API during deployment.
 
-**Scripts affected**: `scripts/crc-lifecycle.sh`, `scripts/configure-oidc.sh`
+**Scripts affected**: `scripts/cluster-lifecycle.sh`, `scripts/configure-oidc.sh`
 
 ## 10. Deploy Ordering
 
@@ -422,7 +422,7 @@ causes cascading authentication or "not found" failures.
 "missing authorization header", oauth-proxy has no backend, OpenClaw can't
 reach the model provider, RBAC binding fails ("service account not found").
 
-**Workaround**: Correct deploy order in `crc-lifecycle.sh cmd_deploy()` (RHOAI
+**Workaround**: Correct deploy order in `cluster-lifecycle.sh cmd_deploy()` (RHOAI
 + MLflow is unconditional since Phase 12/[ADR-0018](adrs/ADR-0018-rhoai-mlflow-sole-backend.md) — it is no longer gated behind `--with-obs`, which now only
 controls the separate Tempo/OTel Collector infrastructure stack):
 1. `bootstrap-ocp.sh` — namespace, SCCs, secrets
@@ -437,7 +437,7 @@ controls the separate Tempo/OTel Collector infrastructure stack):
 9. `deploy-oauth2-proxy.sh` — needs OpenShell only (OpenShift-native OAuth, ADR-0016)
 10. `launch-openclaw.sh` — everything ready
 
-**Scripts affected**: `scripts/crc-lifecycle.sh`, `scripts/deploy-openshell.sh`, `scripts/deploy-rhoai-mlflow.sh`, `scripts/wire-rhoai-mlflow-tracing.sh`, `scripts/common.sh`
+**Scripts affected**: `scripts/cluster-lifecycle.sh`, `scripts/deploy-openshell.sh`, `scripts/deploy-rhoai-mlflow.sh`, `scripts/wire-rhoai-mlflow-tracing.sh`, `scripts/common.sh`
 
 ## 11. Network Namespace — Process Start Location
 
@@ -519,7 +519,7 @@ while ! openshell status &>/dev/null; do
 done
 ```
 
-**Scripts affected**: `scripts/configure-oidc.sh`, `scripts/crc-lifecycle.sh` (Phase 5b)
+**Scripts affected**: `scripts/configure-oidc.sh`, `scripts/cluster-lifecycle.sh` (Phase 5b)
 
 ## 13. Workspace File Ownership After Root Operations
 
@@ -883,7 +883,7 @@ follow-up. Relevant OpenClaw internals: `gateway.reload.mode` config,
 
 ## 18. `openshell` CLI OIDC Token Refresh Fails on CRC — Self-Signed Router CA Not in System Trust Store
 
-**Context**: Found live during a fully fresh `crc-lifecycle.sh full --fresh`
+**Context**: Found live during a fully fresh `cluster-lifecycle.sh full --fresh`
 run (delete VM, recreate, redeploy everything). `scripts/verify.sh` and
 `scripts/smoke-test-e2e.sh`, run a few minutes after
 `scripts/configure-oidc.sh` (Phase 7) completed, both failed with a cascade
@@ -1007,7 +1007,7 @@ much milder race ("client error (Canceled) / connection was not ready") that
 resolves within seconds. The multi-minute "CertificateRequired" variant only
 showed up once the same `openshell` Helm release had already been installed
 and was being re-applied (`helm upgrade`) — i.e. normal single-shot
-`crc-lifecycle.sh full --fresh` runs are less likely to hit the slow path,
+`cluster-lifecycle.sh full --fresh` runs are less likely to hit the slow path,
 but repeated `deploy`/re-deploy cycles against a live cluster will.
 
 **Restarting the gateway pod was tried and did not prove reliably faster**:
@@ -1173,7 +1173,7 @@ state race #2 above left behind).
 **Context**: found live 2026-08-03 immediately after fixing constraint #21
 above — re-running `scripts/deploy-rhoai-mlflow.sh` to pick up that chart
 fix on an AWS cluster that had already completed a full
-`crc-lifecycle.sh deploy` (OpenShell + `wire-rhoai-mlflow-tracing.sh`
+`cluster-lifecycle.sh deploy` (OpenShell + `wire-rhoai-mlflow-tracing.sh`
 already run once).
 
 **Symptom**: `verify.sh` Layer 8 ("MLflow health returned HTTP 401") and

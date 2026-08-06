@@ -136,7 +136,7 @@ Three non-obvious integration bugs were found and permanently fixed while wiring
 ## Quick start
 
 The easiest way to run all of this in the right order is
-`./scripts/crc-lifecycle.sh full` (see `./scripts/crc-lifecycle.sh --help`).
+`./scripts/cluster-lifecycle.sh full` (see `./scripts/cluster-lifecycle.sh --help`).
 The individual steps it orchestrates, for reference or manual/partial runs:
 
 ```bash
@@ -181,7 +181,7 @@ cp secrets/secrets.template.env secrets/secrets.env
 
 ### Deploy ordering (why the steps above are in this order)
 
-The order is not arbitrary — each step binds RBAC or reads facts produced by an earlier one. Getting this wrong is the #1 source of confusing "not found" / "missing authorization" errors (see [`docs/constraints.md` #10](docs/constraints.md#10-deploy-ordering) for the full failure-mode catalog). `scripts/crc-lifecycle.sh full` encodes exactly this graph:
+The order is not arbitrary — each step binds RBAC or reads facts produced by an earlier one. Getting this wrong is the #1 source of confusing "not found" / "missing authorization" errors (see [`docs/constraints.md` #10](docs/constraints.md#10-deploy-ordering) for the full failure-mode catalog). `scripts/cluster-lifecycle.sh full` encodes exactly this graph:
 
 ```mermaid
 flowchart TD
@@ -220,7 +220,7 @@ eval $(crc oc-env)
 oc login -u kubeadmin -p $(crc console --credentials | grep kubeadmin | awk -F"'" '{print $2}')
 
 # Then follow the same quick start steps above (or just run
-# ./scripts/crc-lifecycle.sh full)
+# ./scripts/cluster-lifecycle.sh full)
 ```
 
 **Resource note (CRC only)**: running RHOAI+MLflow together with the rest of
@@ -254,7 +254,7 @@ the only Kubernetes-level entry point onto the Control UI.
 | `policies/openclaw-sandbox.yaml` | Sandbox FS + network policy (default-deny; MaaS allow; RHOAI MLflow `tls: skip`, exact-hostname-matched) |
 | `manifests/` | Plain manifests that aren't full charts: OpenShell Route, Agent Sandbox operator pin |
 | `prompts/` | 7 operator-controlled system prompt files (`AGENTS`, `SOUL`, `TOOLS`, `IDENTITY`, `USER`, `HEARTBEAT`, `BOOTSTRAP`), versioned in MLflow's Prompt Registry |
-| `scripts/` | Bootstrap → deploy → wire → launch → verify → teardown; `crc-lifecycle.sh` orchestrates the full graph; `common.sh` holds shared helpers (env detection, secret rendering, retries) |
+| `scripts/` | Bootstrap → deploy → wire → launch → verify → teardown; `cluster-lifecycle.sh` orchestrates the full graph; `common.sh` holds shared helpers (env detection, secret rendering, retries) |
 | `scripts/prompt-registry/` | Self-contained prompt versioning + trace-linking subsystem (seed, fetch, `prompt-trace-linker.js` sidecar) — its own `README.md` |
 | `tests/` | Playwright E2E suite: OIDC/OAuth login setup, Control UI chat, sandbox security, MLflow UI/trace validation |
 | `docs/adrs/` | Architecture Decision Records — the "why", one file per decision, superseded ones kept (not deleted) for history |
@@ -281,7 +281,7 @@ Tests are organized in four projects, run in dependency order:
 3. **security-tests** (`sandbox-security.spec.ts`): Sandbox isolation (egress blocking, credential protection, privilege escalation, tool policy enforcement)
 4. **mlflow-ui-tests** (`mlflow-ui.spec.ts`): RHOAI MLflow UI — GenAI Studio Prompts tab, Traces tab, and the "Prompt" column showing linked prompt versions (runs after the chat E2E test so a real trace exists to assert against)
 
-`scripts/verify.sh` runs a broader, non-browser check across 10 layers (infra → gateway → sandbox → security → OIDC → RHOAI MLflow → observability → UI → prompt/trace linkage) and is what `crc-lifecycle.sh full` calls automatically at the end of a deploy.
+`scripts/verify.sh` runs a broader, non-browser check across 10 layers (infra → gateway → sandbox → security → OIDC → RHOAI MLflow → observability → UI → prompt/trace linkage) and is what `cluster-lifecycle.sh full` calls automatically at the end of a deploy.
 
 ## Lessons learned — patterns worth reusing in other projects
 

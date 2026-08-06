@@ -21,7 +21,7 @@ After implementing, modifying, or validating functionality, **update project doc
 |---|---|
 | New platform component validated on cluster | RHOAI-managed MLflow, oauth-proxy OIDC path |
 | Existing component version or config changed | OpenShell chart version bump, new Helm values, operator CSV update |
-| Prerequisites or deploy path modified | New script, Makefile/`crc-lifecycle.sh` target, values file restructure |
+| Prerequisites or deploy path modified | New script, Makefile/`cluster-lifecycle.sh` target, values file restructure |
 | Verify or troubleshoot steps updated | New `verify.sh` health check, validated error workaround (candidate for `docs/constraints.md`) |
 | New script or installer added | `scripts/deploy-oauth2-proxy.sh` |
 | New Cursor skill added | e.g. a new `openshell-*` or `mlflow-*` skill |

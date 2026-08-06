@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Tear down what this project deployed. Mirrors crc-lifecycle.sh's deploy
+# Tear down what this project deployed. Mirrors cluster-lifecycle.sh's deploy
 # scope: the OpenShell/OpenClaw stack is always torn down; Keycloak,
 # observability (Tempo/OTel), and RHOAI+MLflow are opt-in via flags because
 # they can be shared/slow-to-recreate cluster resources — same flag names
-# as `crc-lifecycle.sh deploy` (--with-oidc, --with-obs), plus
+# as `cluster-lifecycle.sh deploy` (--with-oidc, --with-obs), plus
 # --with-rhoai-mlflow and --all as a shorthand for every flag.
 #
 # Usage:

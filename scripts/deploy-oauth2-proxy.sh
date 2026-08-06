@@ -12,7 +12,7 @@
 # Keycloak here.
 #
 # Prerequisites:
-#   - OpenShell deployed (scripts/crc-lifecycle.sh / deploy-openshell.sh)
+#   - OpenShell deployed (scripts/cluster-lifecycle.sh / deploy-openshell.sh)
 #   - OpenClaw sandbox running (scripts/launch-openclaw.sh)
 set -euo pipefail
 source "$(dirname "$0")/common.sh"

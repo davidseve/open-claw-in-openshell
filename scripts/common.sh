@@ -163,7 +163,7 @@ detect_environment() {
     # ExpiredSignature" — surfacing downstream as misleading "sandbox not
     # found" / "unexpected identity" failures in verify.sh/smoke tests, even
     # though the sandbox is still Ready. Found live during a fresh
-    # `crc-lifecycle.sh full --fresh` run. Not needed on AWS OCP (real certs).
+    # `cluster-lifecycle.sh full --fresh` run. Not needed on AWS OCP (real certs).
     # Do NOT export OPENSHELL_GATEWAY_INSECURE globally here — it disables
     # client-cert presentation and breaks mTLS `openshell status` against the
     # gateway Route (fatal alert: CertificateRequired). Scope it to OIDC-only

@@ -27,14 +27,14 @@
 #   3. Seed system prompts into the MLflow Prompt Registry (moved here from
 #      the removed standalone-MLflow deploy step).
 #
-# Called unconditionally from scripts/crc-lifecycle.sh's `deploy`/`full`
+# Called unconditionally from scripts/cluster-lifecycle.sh's `deploy`/`full`
 # commands, right after scripts/deploy-rhoai-mlflow.sh — not an opt-in
 # experiment anymore (see docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md).
 #
 # Prerequisites (both must already exist — this script does not create them):
 #   1. RHOAI + MLflow deployed: ./scripts/deploy-rhoai-mlflow.sh
 #   2. OpenShell namespace + openshell-sandbox SA deployed:
-#      ./scripts/crc-lifecycle.sh deploy
+#      ./scripts/cluster-lifecycle.sh deploy
 #
 # Outputs (written to .rendered/rhoai-mlflow/, already gitignored via
 # .rendered/):
@@ -64,12 +64,12 @@ detect_environment
 step "Verifying OpenShell namespace + ${SANDBOX_SA_NAME} SA exist"
 if ! oc get ns "$NAMESPACE" &>/dev/null; then
   error "Namespace '$NAMESPACE' not found."
-  error "Run ./scripts/crc-lifecycle.sh deploy first."
+  error "Run ./scripts/cluster-lifecycle.sh deploy first."
   exit 1
 fi
 if ! oc get sa "$SANDBOX_SA_NAME" -n "$NAMESPACE" &>/dev/null; then
   error "ServiceAccount '${SANDBOX_SA_NAME}' not found in namespace '$NAMESPACE'."
-  error "Run ./scripts/crc-lifecycle.sh deploy first."
+  error "Run ./scripts/cluster-lifecycle.sh deploy first."
   exit 1
 fi
 info "Namespace '$NAMESPACE' and SA '${SANDBOX_SA_NAME}' present"

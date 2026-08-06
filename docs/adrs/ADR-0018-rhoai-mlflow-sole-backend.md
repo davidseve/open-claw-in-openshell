@@ -14,7 +14,7 @@ opt-in/standalone-default scope decision in
 experiment": point the `mlflow-openclaw` plugin's tracing transport at
 RHOAI-managed MLflow (`charts/rhoai/`) instead of the standalone
 `ghcr.io/mlflow/mlflow` deployment ([ADR-0014](ADR-0014-agent-observability.md)), without touching the standalone deployment or the
-default `crc-lifecycle.sh` path. That experiment ran into, and eventually
+default `cluster-lifecycle.sh` path. That experiment ran into, and eventually
 fixed, three independent blockers on the same day (2026-07-25):
 
 1. A Node process-wide TLS trust conflict between the sandbox's L7 proxy
@@ -54,7 +54,7 @@ no-auth fallback remains anywhere in the codebase. Every deploy of this
 project, on every environment (CRC and AWS OCP alike), ends with RHOAI
 MLflow deployed and wired:
 
-- `scripts/crc-lifecycle.sh`'s `cmd_deploy`/`cmd_full` call
+- `scripts/cluster-lifecycle.sh`'s `cmd_deploy`/`cmd_full` call
   `scripts/deploy-rhoai-mlflow.sh` and `scripts/wire-rhoai-mlflow-tracing.sh`
   unconditionally (not gated behind `--with-obs`, which now only controls
   the separate, MLflow-unrelated Tempo/OTel Collector infrastructure

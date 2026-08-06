@@ -18,7 +18,7 @@
 # PROFILES (VERIFY_PROFILE env var):
 #   full  (default) — every check below, including the slow/deep ones
 #         (synthetic OTel->Tempo trace round-trip, MLflow Prompt Registry
-#         deep checks, Playwright browser UI test). What CI/`crc-lifecycle.sh
+#         deep checks, Playwright browser UI test). What CI/`cluster-lifecycle.sh
 #         full` runs.
 #   smoke — the fast, essential subset (infra/pods/routes/CLI/security/
 #         gateway health/LLM proxy connectivity) that finishes in seconds,

@@ -9,7 +9,7 @@ step "Creating namespace: $NAMESPACE"
 # opendatahub.io/dashboard=true marks this namespace as a Data Science
 # Project the RHOAI Dashboard (docs/constraints.md #20) will list under
 # Experiments/Prompts/Traces — applied declaratively here instead of a
-# one-off `oc label` so it survives a fresh `crc-lifecycle.sh full --fresh`.
+# one-off `oc label` so it survives a fresh `cluster-lifecycle.sh full --fresh`.
 cat <<EOF | oc apply -f -
 apiVersion: v1
 kind: Namespace

@@ -7,7 +7,7 @@ user_invocable: true
 
 Autonomous deployment of the complete OpenClaw-in-OpenShell stack, on either
 a local CRC cluster or an AWS-hosted OpenShift cluster. The scripts do the
-work (`scripts/crc-lifecycle.sh`) — the agent picks the target environment,
+work (`scripts/cluster-lifecycle.sh`) — the agent picks the target environment,
 runs one command, and verifies.
 
 ## CRITICAL: Read Constraints First
@@ -26,7 +26,7 @@ sandbox constraint discovered during deployment.
 
 | Aspect | CRC | AWS |
 |--------|-----|-----|
-| Setup phase | Yes (`crc-lifecycle.sh setup` starts the VM) | No (cluster already running — just `oc login`/`oc whoami`) |
+| Setup phase | Yes (`cluster-lifecycle.sh setup` starts the VM) | No (cluster already running — just `oc login`/`oc whoami`) |
 | `APPS_DOMAIN` | `apps-crc.testing` | Auto-detected from cluster |
 | OLM Operator install | CRDs applied directly | Subscription via OLM catalog (`installPlanApproval: Manual`, auto-approved for the pinned channel — see `charts/rhoai/Makefile`'s `wait-operators`) |
 | TLS certificates | Self-signed (CRC router) | Cluster-issued (trusted) |
@@ -66,11 +66,11 @@ If a VM already exists, ask the user: **reuse** or **fresh**?
 
 ```bash
 # Fresh (no existing VM, or user chose fresh):
-./scripts/crc-lifecycle.sh full --fresh
+./scripts/cluster-lifecycle.sh full --fresh
 
 # Reuse (existing VM):
-./scripts/crc-lifecycle.sh deploy --with-oidc --with-obs
-./scripts/crc-lifecycle.sh verify
+./scripts/cluster-lifecycle.sh deploy --with-oidc --with-obs
+./scripts/cluster-lifecycle.sh verify
 ```
 
 ### AWS
@@ -87,15 +87,15 @@ oc get nodes
 **Step 2 — Run the deploy command:**
 
 ```bash
-./scripts/crc-lifecycle.sh deploy --with-oidc --with-obs
-./scripts/crc-lifecycle.sh verify
+./scripts/cluster-lifecycle.sh deploy --with-oidc --with-obs
+./scripts/cluster-lifecycle.sh verify
 ```
 
 (No `setup`/`full --fresh` step on AWS — the cluster already exists.)
 
 ### Both: the 10-phase deploy sequence
 
-`cmd_deploy()` in `scripts/crc-lifecycle.sh` runs the same phases on both
+`cmd_deploy()` in `scripts/cluster-lifecycle.sh` runs the same phases on both
 environments (RHOAI + MLflow are unconditional, not gated behind
 `--with-obs` — see [ADR-0018](../../docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)):
 
@@ -126,7 +126,7 @@ If it fails — read the output, identify the failing phase, check
 ## Boundaries
 
 - Max 2 full retries (CRC) / 3 retries per phase, 3 verify cycles, 20 total iterations (AWS)
-- Do NOT re-implement script logic — just run `crc-lifecycle.sh`
+- Do NOT re-implement script logic — just run `cluster-lifecycle.sh`
 - Do NOT skip verification
 - On failure, read `docs/constraints.md` before diagnosing
 - If a script has a bug, fix the script (not a manual workaround)
@@ -141,9 +141,9 @@ After a successful deploy, if the user asks to monitor, use the
 
 Follow the global skill **`long-running-scripts`** (`~/.cursor/skills/long-running-scripts/`).
 
-- **One command:** `./scripts/crc-lifecycle.sh full --fresh` with high `block_until_ms` (≥ 900000) or background + `notify_on_output` `^AGENT_SCRIPT_DONE`
+- **One command:** `./scripts/cluster-lifecycle.sh full --fresh` with high `block_until_ms` (≥ 900000) or background + `notify_on_output` `^AGENT_SCRIPT_DONE`
 - **No polling** while it runs
-- **On success:** read `.agent-status/crc-lifecycle-full.json` and `.verify-status.json` — not full logs
+- **On success:** read `.agent-status/cluster-lifecycle-full.json` and `.verify-status.json` — not full logs
 - **Iteration:** `VERIFY_PROFILE=smoke ./scripts/verify.sh`; **full** verify only at deploy end
 - **On failure only:** `tail -50` of log path from status JSON
 

@@ -6,7 +6,7 @@
 (2026-07-25)**: once the "Resolution" section below confirmed a real trace
 landing end-to-end, the original opt-in/standalone-by-default scope decision
 was revisited and replaced — RHOAI MLflow is now wired unconditionally into
-`crc-lifecycle.sh`'s `deploy`/`full` commands and standalone MLflow was
+`cluster-lifecycle.sh`'s `deploy`/`full` commands and standalone MLflow was
 removed entirely (not kept as the default with RHOAI as an opt-in
 experiment, as originally decided here). The resource-budget finding (host
 memory drops to ~11 GiB combined on CRC) is unchanged and now an *accepted*
@@ -23,7 +23,7 @@ OpenClaw-in-OpenShell stack, it functionally works but breaches this
 project's own resource-safety floor for protecting the host machine (Cursor,
 desktop apps). Original decision: ship `charts/rhoai/` and
 `scripts/deploy-rhoai-mlflow.sh` as a proven, standalone, opt-in local
-experiment; do not wire it into `crc-lifecycle.sh`'s combined `deploy`/`full`
+experiment; do not wire it into `cluster-lifecycle.sh`'s combined `deploy`/`full`
 commands; treat AWS OCP as the primary target for running RHOAI MLflow
 together with the full stack.
 
@@ -99,7 +99,7 @@ everything else `Removed` — see "Charts" below) using the new
 
 ## Stage 2: full OpenClaw-in-OpenShell stack alongside RHOAI/MLflow
 
-Ran `./scripts/crc-lifecycle.sh deploy` (bootstrap + OpenShell + OpenClaw
+Ran `./scripts/cluster-lifecycle.sh deploy` (bootstrap + OpenShell + OpenClaw
 sandbox) on the *same* still-running CRC instance, deliberately **without**
 `--with-oidc --with-obs` — Stage 1 had already used up enough of the budget
 that adding Keycloak + a second, redundant standalone MLflow/Tempo/OTel
@@ -140,7 +140,7 @@ returned to 49 GiB).
    `charts/rhoai/` and `scripts/deploy-rhoai-mlflow.sh` as real, tested,
    standalone tooling. Either environment (CRC or AWS) can run it in
    isolation.
-2. **Do not wire `deploy-rhoai-mlflow.sh` into `crc-lifecycle.sh`'s combined
+2. **Do not wire `deploy-rhoai-mlflow.sh` into `cluster-lifecycle.sh`'s combined
    `deploy`/`full` commands.** Running it together with the rest of the
    OpenClaw-in-OpenShell stack on this hardware measurably squeezes the host
    below the margin this project reserves for keeping the development
@@ -637,8 +637,8 @@ not a reason to avoid combining the two stacks).
 
 Concretely, this reverses two of the four decision points in the original
 "## Decision" section above:
-- Point 2 ("do not wire `deploy-rhoai-mlflow.sh` into `crc-lifecycle.sh`'s
-  combined `deploy`/`full` commands") — reversed. `scripts/crc-lifecycle.sh`
+- Point 2 ("do not wire `deploy-rhoai-mlflow.sh` into `cluster-lifecycle.sh`'s
+  combined `deploy`/`full` commands") — reversed. `scripts/cluster-lifecycle.sh`
   now calls `deploy-rhoai-mlflow.sh` and `wire-rhoai-mlflow-tracing.sh`
   unconditionally in Phases 4 and 6 of `cmd_deploy`.
 - Point 4 ("the `mlflow-openclaw` plugin transport stays pointed at the
@@ -685,7 +685,7 @@ it via `helm --set-string` — the same pattern already used by
 
 ## Consequences
 
-- Local CRC development keeps its current, lighter default (`crc-lifecycle.sh
+- Local CRC development keeps its current, lighter default (`cluster-lifecycle.sh
   full`/`deploy`, standalone MLflow) as the everyday path — no regression to
   the existing local dev experience.
 - Anyone who wants to experiment with RHOAI MLflow locally can run

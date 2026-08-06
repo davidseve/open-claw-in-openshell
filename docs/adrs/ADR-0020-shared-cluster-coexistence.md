@@ -16,7 +16,7 @@ MLflow is the slowest, heaviest part of either deploy (operator
 subscription, DataScienceCluster reconciliation, a dedicated Postgres) and
 gains nothing from being duplicated. The goal is for either project to:
 
-1. Still be fully self-sufficient — `make deploy-all` / `crc-lifecycle.sh
+1. Still be fully self-sufficient — `make deploy-all` / `cluster-lifecycle.sh
    deploy` on a truly empty cluster installs everything from scratch, with
    no dependency on the other project.
 2. Detect when the other project already installed the shared platform
@@ -117,7 +117,7 @@ through every place that used to hardcode one or the other:
   `charts/oauth2-proxy` value `sandboxName`, new `common.sh`
   `render_template()` placeholder `__SANDBOX_NAME__`), not a hardcoded
   `openclaw-gw--openclaw-ui`.
-- `scripts/verify.sh`, `launch-openclaw.sh`, and `crc-lifecycle.sh`'s status
+- `scripts/verify.sh`, `launch-openclaw.sh`, and `cluster-lifecycle.sh`'s status
   output all read `$SANDBOX_NAME`/`$NAMESPACE` instead of the literal.
 
 To coexist with `agentops-example` (which keeps its default `openshell`
@@ -172,7 +172,7 @@ solo deploy `OPENSHELL_RELEASE_NAME` defaults to `openshell` and the two
 happen to look identical. Deploying a second instance with
 `OPENSHELL_RELEASE_NAME=openshell2` immediately exposed every one of these
 as a real bug, not just a design gap — each surfaced as its own confusing
-failure several steps into an otherwise-successful `crc-lifecycle.sh
+failure several steps into an otherwise-successful `cluster-lifecycle.sh
 deploy`, because `helm upgrade --install` itself always "succeeded" (wrong
 resource *names*, not template errors):
 
@@ -265,6 +265,38 @@ running. Concretely, this bit twice while testing:
    "$GATEWAY_NAME"` before doing anything else, so this project's own
    scripts are self-healing regardless of which gateway was last active.
 
+### This generalizes to N coexisting agent stacks, not just two
+
+Nothing above is hardcoded to "exactly one other project." Any number of
+independent OpenShell/OpenClaw agent deployments can share this same
+cluster-wide RHOAI + MLflow platform layer simultaneously:
+
+- The shared platform layer's detect-and-skip guards (`helm status
+  <release>` before installing) are a boolean check, indifferent to how
+  many other projects already skipped for the same reason.
+- Every per-project resource that must be cluster-wide unique
+  (`OPENSHELL_RELEASE_NAME`'s ClusterRole/ClusterRoleBinding, the Route
+  hostname derived from `NAMESPACE`/`SANDBOX_NAME`) is a plain env var — a
+  third, fourth, ... Nth deployment just needs its own values that don't
+  collide with any deployment already on the cluster, the same way the
+  second one avoids colliding with the first.
+- Per-project MLflow RBAC/token/experiment
+  (`charts/rhoai/openclaw-integration`) is its own Helm release scoped to
+  its own namespace/ServiceAccount every time — additive RoleBindings
+  against the shared MLflow instance, with no coordination needed between
+  any number of them.
+
+The one place this project's *own* tooling initially assumed exactly two
+coexisting parties was `charts/rhoai/Makefile`'s original `validate`/
+`validate-cleanup` (see "Detect-and-skip for the shared platform layer"
+above) — already fixed to check this project's own named releases
+individually rather than asserting a total `rhoai-*` count, specifically so
+a third project's own extra `rhoai-*`-prefixed release doesn't break it.
+`agentops-example`'s equivalent `validate`/`validate-cleanup` had the exact
+same latent bug (an exact-count assertion that only happened to work for
+two known parties) and was fixed the same way on 2026-08-06 — see its
+ADR-0002 addendum.
+
 ## Consequences
 - Either project can be deployed first on an empty cluster; the second
   reuses the shared RHOAI + MLflow layer automatically, no manual
@@ -297,7 +329,7 @@ running. Concretely, this bit twice while testing:
   (`NAMESPACE=openshell2 SANDBOX_NAME=openclaw-gw2 GATEWAY_NAME=openclaw2
   OPENSHELL_RELEASE_NAME=openshell2` for this project, defaults for
   `agentops-example`), sharing the same RHOAI installation and MLflow
-  instance. `./scripts/crc-lifecycle.sh verify` passed fully (55/56 checks —
+  instance. `./scripts/cluster-lifecycle.sh verify` passed fully (55/56 checks —
   the one failure was a flaky Playwright timing assertion, unrelated to
   coexistence and not reproducible on retry) including a live Playwright
   chat round-trip with MLflow traces, and `agentops-example`'s own `make -C

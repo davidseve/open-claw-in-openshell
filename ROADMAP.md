@@ -136,12 +136,12 @@ Decision: ADR-0010 — Keycloak as OIDC broker; users authenticate with OCP cred
 This project **always uses Keycloak** for the CLI/gRPC gateway auth path when `--with-oidc` is requested — `values-ocp-no-oidc.yaml.tpl` is not an alternative to Keycloak, it's a required transient bootstrap step, not a permanent config choice. There's a real chicken-and-egg dependency:
 
 1. The OIDC overlay (`values-ocp.yaml.tpl`) sets `openshell.server.oidc.caConfigMapName: openshell-oidc-ca` — a ConfigMap that `configure-oidc.sh` creates (from OCP's ingress CA) at OIDC-configuration time, **after** OpenShell and Keycloak both already exist. Installing OpenShell with the OIDC overlay from the very first `helm install` would reference a ConfigMap that doesn't exist yet.
-2. `scripts/crc-lifecycle.sh`'s `cmd_deploy()` therefore always runs Phase 5 (`deploy-openshell.sh`) with `WITH_OIDC=false` (using `values-ocp-no-oidc.yaml.tpl`, `allowUnauthenticatedUsers: true`), regardless of whether `--with-oidc` was passed to `crc-lifecycle.sh` itself.
+2. `scripts/cluster-lifecycle.sh`'s `cmd_deploy()` therefore always runs Phase 5 (`deploy-openshell.sh`) with `WITH_OIDC=false` (using `values-ocp-no-oidc.yaml.tpl`, `allowUnauthenticatedUsers: true`), regardless of whether `--with-oidc` was passed to `cluster-lifecycle.sh` itself.
 3. Only in Phase 7, if `--with-oidc` was requested, does `configure-oidc.sh` create the `openshell-oidc-ca` ConfigMap and then `helm upgrade` the *same* release with `values-ocp.yaml.tpl` (the OIDC overlay), flipping `allowUnauthenticatedUsers` to `false` and enabling Keycloak-backed JWT auth on the gateway.
 
-Net effect: on a `--with-oidc` deploy, the no-OIDC state only exists briefly between Phase 5 and Phase 7 — the final, steady state has Keycloak enforced. It only remains the *permanent* state when deploying without `--with-oidc` (e.g. `crc-lifecycle.sh deploy` with no flags, or `full --minimal`), which is a deliberately lighter, unauthenticated-CLI profile, not the recommended default.
+Net effect: on a `--with-oidc` deploy, the no-OIDC state only exists briefly between Phase 5 and Phase 7 — the final, steady state has Keycloak enforced. It only remains the *permanent* state when deploying without `--with-oidc` (e.g. `cluster-lifecycle.sh deploy` with no flags, or `full --minimal`), which is a deliberately lighter, unauthenticated-CLI profile, not the recommended default.
 
-**If this two-step bootstrap is ever changed** (e.g. by having the chart tolerate a missing `caConfigMapName` at install time, or by pre-creating the ConfigMap earlier in `bootstrap-ocp.sh`), update this section, the header comments in both `charts/openshell/values-ocp.yaml.tpl` / `values-ocp-no-oidc.yaml.tpl`, and `scripts/crc-lifecycle.sh`'s Phase 5 comment together — they currently all describe the same mechanism and would otherwise drift out of sync.
+**If this two-step bootstrap is ever changed** (e.g. by having the chart tolerate a missing `caConfigMapName` at install time, or by pre-creating the ConfigMap earlier in `bootstrap-ocp.sh`), update this section, the header comments in both `charts/openshell/values-ocp.yaml.tpl` / `values-ocp-no-oidc.yaml.tpl`, and `scripts/cluster-lifecycle.sh`'s Phase 5 comment together — they currently all describe the same mechanism and would otherwise drift out of sync.
 
 ## Phase 7b: OIDC Authentication for OpenClaw UI
 
@@ -320,7 +320,7 @@ Decision history: **[ADR-0017](docs/adrs/ADR-0017-rhoai-mlflow-scope.md)** (empi
 - Combined with the rest of the OpenShell + OpenClaw stack, host free memory drops to ~11 GiB and swap engages — functionally fine (no crashes, no pod evictions) but below this project's usual safety margin. **This is now an accepted trade-off**, not a reason to keep two backends (ADR-0018).
 - All three real integration blockers found while wiring the `mlflow-openclaw` plugin to RHOAI MLflow (Node-side TLS trust conflict with the OpenShell sandbox proxy, a hostname-matching bug in the `tls: skip` policy, and the pinned SDK missing the `X-MLFLOW-WORKSPACE` header) were root-caused and fixed for real — see ADR-0017's "Follow-up"/"Resolution" sections and `docs/constraints.md` #4b-#4e.
 - End-to-end validated live: a real chat message produced a real trace in RHOAI MLflow, picked up and tagged by `prompt-trace-linker.js` on its next poll cycle, with the MaaS chat path unaffected throughout.
-- **Result**: standalone MLflow was removed entirely (see Phase 12b below); RHOAI-managed MLflow (`charts/rhoai/`) is the sole tracing/prompt-registry backend on every environment, wired unconditionally into `crc-lifecycle.sh`.
+- **Result**: standalone MLflow was removed entirely (see Phase 12b below); RHOAI-managed MLflow (`charts/rhoai/`) is the sole tracing/prompt-registry backend on every environment, wired unconditionally into `cluster-lifecycle.sh`.
 
 ### Architecture change
 
@@ -369,14 +369,14 @@ Objective: once Phase 12 proved RHOAI MLflow works end-to-end, remove every refe
 - [x] `config/openclaw.json[.tpl]`: point `trackingUri` at RHOAI's endpoint
 - [x] `scripts/seed-mlflow-prompts.sh`, `scripts/fetch-prompts-from-mlflow.sh`: add Bearer token + `X-MLFLOW-WORKSPACE` + CA auth support, default URL to RHOAI's endpoint
 - [x] `scripts/wire-rhoai-mlflow-tracing.sh`: drop "opt-in experiment" framing; call `seed-mlflow-prompts.sh` at the end (moved from the removed standalone deploy step)
-- [x] `scripts/crc-lifecycle.sh`: make `deploy-rhoai-mlflow.sh` + `wire-rhoai-mlflow-tracing.sh` unconditional steps in `cmd_deploy`/`cmd_full`
+- [x] `scripts/cluster-lifecycle.sh`: make `deploy-rhoai-mlflow.sh` + `wire-rhoai-mlflow-tracing.sh` unconditional steps in `cmd_deploy`/`cmd_full`
 - [x] `scripts/launch-openclaw.sh`: make RHOAI MLflow wiring unconditional (drop the `--rhoai-mlflow` flag)
 - [x] `scripts/test-tracing.sh`, `scripts/smoke-test-e2e.sh`, `scripts/verify.sh`: point all MLflow checks at RHOAI's Route/namespace with proper auth; drop SQLite-specific introspection (RHOAI's MLflow runs on Postgres, no local DB file to open)
 - [x] ADR-0014, ADR-0015 marked Superseded; ADR-0017 scope-decision section updated; ADR-0018 created
 - [x] `ROADMAP.md`: this section, plus closing out Phase 12 and marking 13.3 obsolete
 - [x] `docs/constraints.md`: constraint #4b marked Resolved with the real fix
 - [x] `docs/constraints.md`: constraint #12 and other standalone-MLflow-specific references reviewed; constraint #10 (deploy ordering) updated for the new mandatory RHOAI phases; new constraint #17 documents an unrelated live-testing finding (verify.sh's synthetic chatCompletions test is a pre-existing false-positive, not an RHOAI MLflow regression)
-- [x] `README.md` + skills (`deploy-full-aws`, `deploy-full-crc`, `crc-local-dev`, `monitor-deployment`) updated to remove standalone MLflow references; CRC sizing bumped to 16 vCPU/40 GiB (RHOAI-validated, `scripts/crc-lifecycle.sh`)
+- [x] `README.md` + skills (`deploy-full-aws`, `deploy-full-crc`, `crc-local-dev`, `monitor-deployment`) updated to remove standalone MLflow references; CRC sizing bumped to 16 vCPU/40 GiB (RHOAI-validated, `scripts/cluster-lifecycle.sh`)
 - [x] `prompts/TOOLS.md` (and any other prompt file referencing the MLflow endpoint) updated
 
 ## Phase 13 (future): Security Hardening — Auth Simplification + MLflow Auth
@@ -459,7 +459,7 @@ it doesn't cover every way the key text could be reshaped before being echoed).
 `OPENSHELL_GATEWAY_INSECURE=true` (skip TLS server-cert verification for the
 `openshell` CLI) globally whenever `CRC_MODE=true`, to work around CRC's
 self-signed router wildcard cert not being in the system trust store
-(constraint #18). During a live `crc-lifecycle.sh full --fresh` run
+(constraint #18). During a live `cluster-lifecycle.sh full --fresh` run
 (2026-07-27), this was found to also break **mTLS gateway registration**
 (`openshell status` failing for 5+ minutes with `CertificateRequired`/"peer
 sent no certificates") — the blanket global export was scoped down to a new
@@ -473,9 +473,9 @@ certs).
 
 - [x] Scope `OPENSHELL_GATEWAY_INSECURE` to OIDC-only flows, unset it before mTLS gateway registration (`scripts/common.sh`, `scripts/deploy-openshell.sh`, `scripts/configure-oidc.sh`) — done 2026-07-27, still `CRC_MODE`-gated, never set on AWS
 - [ ] **Root cause not fully confirmed**: the working hypothesis (insecure-mode short-circuits the client-cert identity resolver, not just server-cert verification) is plausible but based on a ~1-minute A/B test that overlaps with constraint #19's own documented time-based recovery window (10s–8min, attributed there to host memory pressure, not to this flag). Re-validate with a cleaner, longer, repeated-trial experiment (or find/read the `openshell` CLI's TLS client source) before treating this as fully proven — the *practical* fix (unset before mTLS) is safe to keep either way, since it can only narrow, never widen, where verification is skipped
-- [ ] **Known gap introduced by this fix**: `cmd_verify()` in `scripts/crc-lifecycle.sh` (and any other caller of `verify.sh`/`smoke-test-e2e.sh` that doesn't first call `ensure_oidc_token`) no longer benefits from the old global export, so a standalone `./scripts/crc-lifecycle.sh verify` run long after the last `configure-oidc.sh` (OIDC access token expired, refresh-token call needed) could hit constraint #18 again on CRC. Not fixed yet — call `ensure_oidc_token` at the top of `cmd_verify()` (matching the pattern the `monitor-deployment` skill already uses manually) before this bites in practice
+- [ ] **Known gap introduced by this fix**: `cmd_verify()` in `scripts/cluster-lifecycle.sh` (and any other caller of `verify.sh`/`smoke-test-e2e.sh` that doesn't first call `ensure_oidc_token`) no longer benefits from the old global export, so a standalone `./scripts/cluster-lifecycle.sh verify` run long after the last `configure-oidc.sh` (OIDC access token expired, refresh-token call needed) could hit constraint #18 again on CRC. Not fixed yet — call `ensure_oidc_token` at the top of `cmd_verify()` (matching the pattern the `monitor-deployment` skill already uses manually) before this bites in practice
 - [ ] `docs/constraints.md` #18/#19 need a new/updated entry documenting this interaction — the code comments in `common.sh`/`deploy-openshell.sh` currently reference "constraints.md #18/#19" as if already covering this, but the doc text itself is stale
-- [x] **AWS follow-up — confirmed 2026-08-03 on a real AWS OCP cluster (`sandbox659.opentlc.com`, Let's Encrypt-issued router wildcard cert)**: `enable_openshell_oidc_insecure()` is strictly gated on `CRC_MODE=true` (`scripts/common.sh`), so `OPENSHELL_GATEWAY_INSECURE` was never exported anywhere during a full `crc-lifecycle.sh deploy --with-oidc --with-obs` + `verify.sh` (full profile) run — confirmed via `env | grep OPENSHELL_GATEWAY_INSECURE` (empty) throughout. This entire workaround was indeed a complete no-op on AWS, exactly as predicted: mTLS gateway registration, `openshell status`, OIDC token refresh against Keycloak, and the oauth-proxy OAuth login flow (real `redhat` HTPasswd user) all passed with zero TLS trust issues — Let's Encrypt's publicly-trusted chain needs no special handling, unlike CRC's self-signed router cert (constraint #18). No AWS-side gap found; no code changes needed for this item.
+- [x] **AWS follow-up — confirmed 2026-08-03 on a real AWS OCP cluster (`sandbox659.opentlc.com`, Let's Encrypt-issued router wildcard cert)**: `enable_openshell_oidc_insecure()` is strictly gated on `CRC_MODE=true` (`scripts/common.sh`), so `OPENSHELL_GATEWAY_INSECURE` was never exported anywhere during a full `cluster-lifecycle.sh deploy --with-oidc --with-obs` + `verify.sh` (full profile) run — confirmed via `env | grep OPENSHELL_GATEWAY_INSECURE` (empty) throughout. This entire workaround was indeed a complete no-op on AWS, exactly as predicted: mTLS gateway registration, `openshell status`, OIDC token refresh against Keycloak, and the oauth-proxy OAuth login flow (real `redhat` HTPasswd user) all passed with zero TLS trust issues — Let's Encrypt's publicly-trusted chain needs no special handling, unlike CRC's self-signed router cert (constraint #18). No AWS-side gap found; no code changes needed for this item.
 - [ ] Stronger long-term fix (CRC-only, optional): replace the insecure-skip approach entirely by importing CRC's actual router CA into the CLI's trust store (or passing it explicitly, if the `openshell` CLI supports a custom CA flag), so CRC never needs `OPENSHELL_GATEWAY_INSECURE` either — would close the residual OIDC-path exposure window without needing an insecure flag at all
 
 ### 13.6 Prompt file "read-only" protection (`chmod 444`) is bypassable — needs a directory-level fix
@@ -505,7 +505,7 @@ Discovered from a real chat-session report (the agent successfully edited `AGENT
 - [x] **Cursor governance ported**: `.cursor/rules/` (`adr-alignment`, `documentation-sources`, `no-secrets`, `technology-usage-docs`) and `.cursor/skills/` (`adr`, `no-secrets`, `document-feature`, `create-pr`) adapted from `agentops-example` to this repo's doc structure (`docs/adrs/`, `README.md` ADR index, `docs/constraints.md`)
 - [x] ADR-0020: shared-cluster coexistence strategy (namespaces, hostnames, detect-and-skip, what stays independent per project)
 - [x] Confirmed **no functional regression**: `trusted-proxy` auth (ADR-0012) is unchanged — this project already had no static gateway token, unlike `agentops-example`, which had regressed to `auth.mode: "none"` for unrelated environment reasons and was explicitly left untouched by this work
-- [ ] Cluster validation: `helm lint`/`helm template` for `charts/openshell` and `charts/rhoai/openclaw-integration`, then a full solo `crc-lifecycle.sh full --fresh` smoke test
+- [ ] Cluster validation: `helm lint`/`helm template` for `charts/openshell` and `charts/rhoai/openclaw-integration`, then a full solo `cluster-lifecycle.sh full --fresh` smoke test
 - [ ] Coexistence validation: deploy this project with an alternate `NAMESPACE`/`SANDBOX_NAME` on a cluster where `agentops-example` is already live; confirm both UIs, both CLIs, and both MLflow trace streams work simultaneously
 
 ## References

@@ -116,7 +116,7 @@ if [[ "$GATEWAY_ALREADY_REGISTERED" != "true" ]] || ! openshell status &>/dev/nu
   step "Extracting mTLS client certificates"
   MTLS_DIR="$HOME/.config/openshell/gateways/${GATEWAY_NAME}/mtls"
   # Wipe any stale bundle first: a leftover client.p12 built against a
-  # previous cluster's CA (e.g. after `crc-lifecycle.sh full --fresh`, which
+  # previous cluster's CA (e.g. after `cluster-lifecycle.sh full --fresh`, which
   # only recreates the VM and doesn't touch this host-local CLI state) will
   # not match the newly issued server CA, causing an mTLS handshake failure
   # ("fatal alert: CertificateRequired") on `openshell status`.
@@ -153,7 +153,7 @@ done
 
 step "Creating MaaS provider (best-effort)"
 # Provider creation may fail here if OIDC auth is required but not yet
-# configured. In that case crc-lifecycle.sh will create it after
+# configured. In that case cluster-lifecycle.sh will create it after
 # configure-oidc.sh obtains the OIDC token (Phase 5b).
 if create_provider 2>/dev/null; then
   info "Provider ready"

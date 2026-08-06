@@ -23,7 +23,7 @@ CRC is a local mirror of the AWS OCP deployment, not a different environment. Th
 
 ```bash
 cd /home/dseveria/git/ai/agents/open-claw-in-openshell
-./scripts/crc-lifecycle.sh full
+./scripts/cluster-lifecycle.sh full
 ```
 
 This runs: `setup` -> `deploy` -> `verify` in sequence.
@@ -31,25 +31,25 @@ This runs: `setup` -> `deploy` -> `verify` in sequence.
 ## Commands
 
 ```bash
-./scripts/crc-lifecycle.sh setup       # Configure CRC (16 vCPU, 40 GB RAM, 100 GB disk — sized for RHOAI+MLflow, see ADR-0017/ADR-0018), run preflight, start VM, login
-./scripts/crc-lifecycle.sh start       # Start existing CRC VM + oc login
-./scripts/crc-lifecycle.sh deploy      # Deploy full stack: bootstrap + RHOAI/MLflow + openshell + openclaw
-./scripts/crc-lifecycle.sh verify      # Run verification suite (all layers)
-./scripts/crc-lifecycle.sh teardown    # Remove stack from CRC (keep VM)
-./scripts/crc-lifecycle.sh stop        # Stop CRC VM (preserves state)
-./scripts/crc-lifecycle.sh delete      # Destroy CRC VM entirely
-./scripts/crc-lifecycle.sh status      # Show CRC and cluster status
-./scripts/crc-lifecycle.sh full        # setup + deploy + verify (autonomous)
+./scripts/cluster-lifecycle.sh setup       # Configure CRC (16 vCPU, 40 GB RAM, 100 GB disk — sized for RHOAI+MLflow, see ADR-0017/ADR-0018), run preflight, start VM, login
+./scripts/cluster-lifecycle.sh start       # Start existing CRC VM + oc login
+./scripts/cluster-lifecycle.sh deploy      # Deploy full stack: bootstrap + RHOAI/MLflow + openshell + openclaw
+./scripts/cluster-lifecycle.sh verify      # Run verification suite (all layers)
+./scripts/cluster-lifecycle.sh teardown    # Remove stack from CRC (keep VM)
+./scripts/cluster-lifecycle.sh stop        # Stop CRC VM (preserves state)
+./scripts/cluster-lifecycle.sh delete      # Destroy CRC VM entirely
+./scripts/cluster-lifecycle.sh status      # Show CRC and cluster status
+./scripts/cluster-lifecycle.sh full        # setup + deploy + verify (autonomous)
 ```
 
 ### Optional Flags
 
 ```bash
-./scripts/crc-lifecycle.sh deploy --with-oidc    # Also deploy Keycloak OIDC
-./scripts/crc-lifecycle.sh deploy --with-obs     # Also deploy infra observability (Tempo/OTel Collector — logs/metrics only)
-./scripts/crc-lifecycle.sh full                  # Full stack with everything (OIDC+obs by default)
-./scripts/crc-lifecycle.sh full --minimal        # Full stack without OIDC and infra observability
-./scripts/crc-lifecycle.sh full --fresh          # Delete existing VM and start from scratch
+./scripts/cluster-lifecycle.sh deploy --with-oidc    # Also deploy Keycloak OIDC
+./scripts/cluster-lifecycle.sh deploy --with-obs     # Also deploy infra observability (Tempo/OTel Collector — logs/metrics only)
+./scripts/cluster-lifecycle.sh full                  # Full stack with everything (OIDC+obs by default)
+./scripts/cluster-lifecycle.sh full --minimal        # Full stack without OIDC and infra observability
+./scripts/cluster-lifecycle.sh full --fresh          # Delete existing VM and start from scratch
 ```
 
 RHOAI + MLflow (the sole tracing/prompt-registry backend, see
@@ -91,7 +91,7 @@ Three differences, all isolated:
 
 1. **OLM operator**: CRC skips OLM subscription (single-node may lack catalog). CRDs are applied directly. Controlled by `CRC_MODE` in `bootstrap-ocp.sh`.
 2. **Keycloak/infra observability**: Opt-in on CRC via `--with-oidc` / `--with-obs` flags. Always deployed on AWS.
-3. **RHOAI-managed MLflow**: mandatory on **both** CRC and AWS since [ADR-0018](../../docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md) — it is the sole tracing/prompt-registry backend, wired unconditionally by `crc-lifecycle.sh`'s `deploy`/`full` commands (not gated behind any flag). Empirically validated on CRC (not just inferred from docs) — see [ADR-0017](../../docs/adrs/ADR-0017-rhoai-mlflow-scope.md): RHOAI + minimal MLflow alone fits fine on a 16 vCPU / 40 GiB CRC VM; combined with the full OpenShell + OpenClaw stack, host free memory drops to ~11 GiB and swap engages — functionally fine (no crashes/evictions), but tight on a shared dev laptop. This is now an **accepted trade-off** (ADR-0018), not a reason to keep the two paths separate — there is no lightweight standalone-MLflow fallback anymore.
+3. **RHOAI-managed MLflow**: mandatory on **both** CRC and AWS since [ADR-0018](../../docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md) — it is the sole tracing/prompt-registry backend, wired unconditionally by `cluster-lifecycle.sh`'s `deploy`/`full` commands (not gated behind any flag). Empirically validated on CRC (not just inferred from docs) — see [ADR-0017](../../docs/adrs/ADR-0017-rhoai-mlflow-scope.md): RHOAI + minimal MLflow alone fits fine on a 16 vCPU / 40 GiB CRC VM; combined with the full OpenShell + OpenClaw stack, host free memory drops to ~11 GiB and swap engages — functionally fine (no crashes/evictions), but tight on a shared dev laptop. This is now an **accepted trade-off** (ADR-0018), not a reason to keep the two paths separate — there is no lightweight standalone-MLflow fallback anymore.
 
 ## Known Issues
 
@@ -116,19 +116,19 @@ oc get pods -n openshell
 openshell sandbox connect openclaw-gw
 
 # Re-deploy after changes
-./scripts/crc-lifecycle.sh teardown
-./scripts/crc-lifecycle.sh deploy
+./scripts/cluster-lifecycle.sh teardown
+./scripts/cluster-lifecycle.sh deploy
 
 # Full reset
-./scripts/crc-lifecycle.sh delete
-./scripts/crc-lifecycle.sh full
+./scripts/cluster-lifecycle.sh delete
+./scripts/cluster-lifecycle.sh full
 ```
 
 ## File Map
 
 | File | Purpose |
 |------|---------|
-| `scripts/crc-lifecycle.sh` | CRC VM lifecycle manager |
+| `scripts/cluster-lifecycle.sh` | Cluster + stack lifecycle manager (deploy/verify/teardown work against CRC or a real cluster identically; setup/start/stop/delete are CRC VM-only) |
 | `scripts/common.sh` | Shared vars, `detect_environment()`, `render_template()` |
 | `charts/openshell/values-ocp.yaml.tpl` | Helm values template |
 | `config/openclaw.json.tpl` | OpenClaw config template |
