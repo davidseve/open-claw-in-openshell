@@ -7,6 +7,35 @@ NAMESPACE="${NAMESPACE:-openshell}"
 OPENSHELL_CHART_VERSION="${OPENSHELL_CHART_VERSION:-0.0.83}"
 SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw}"
 PROVIDER_NAME="${PROVIDER_NAME:-maas-litellm}"
+# CLI-local (per-machine) gateway alias name — deliberately separate from
+# NAMESPACE/SANDBOX_NAME. `openshell gateway add/remove/select` and the mTLS
+# cert cache under ~/.config/openshell/gateways/<name>/ are keyed by this
+# name, not by any cluster resource. A second, coexisting deploy of this
+# project on the same machine (e.g. testing alongside another
+# OpenShell/OpenClaw project's own "ocp" alias) needs its own GATEWAY_NAME,
+# or `openshell gateway remove ocp` in deploy-openshell.sh/configure-oidc.sh
+# would silently delete the other project's local CLI registration —
+# a real gap ADR-0020 didn't cover (it only addresses cluster-side
+# namespace/hostname collisions, not this machine-local CLI state).
+GATEWAY_NAME="${GATEWAY_NAME:-ocp}"
+# Helm release name for charts/openshell (the wrapper chart). Distinct from
+# NAMESPACE: the vendored OCI subchart (ghcr.io/nvidia/openshell) mints
+# CLUSTER-SCOPED RBAC (ClusterRole/ClusterRoleBinding
+# "<release-name>-node-reader") named after the Helm *release name*, not the
+# namespace — so two coexisting deploys in different namespaces still
+# collide on that ClusterRole unless each uses its own release name too.
+# Found live coexisting with another project's own "openshell" release
+# (`Error: unable to continue with install: ClusterRole
+# "openshell-node-reader" ... exists and cannot be imported into the
+# current release`). Default "openshell" keeps a solo deploy unchanged.
+OPENSHELL_RELEASE_NAME="${OPENSHELL_RELEASE_NAME:-openshell}"
+# Sandbox ServiceAccount name the subchart creates by default:
+# "<release-name>-sandbox" (charts/openshell/templates/_helpers.tpl's
+# sandboxSA, mirroring the vendored subchart's own sandboxServiceAccountName
+# helper) — NOT a fixed "openshell-sandbox" literal once OPENSHELL_RELEASE_NAME
+# differs from the "openshell" default. Consumed by wire-rhoai-mlflow-tracing.sh
+# (RBAC subject) and verify.sh.
+SANDBOX_SA_NAME="${SANDBOX_SA_NAME:-${OPENSHELL_RELEASE_NAME}-sandbox}"
 
 CRC_BIN="${CRC_BIN:-$(command -v crc || echo crc)}"
 CRC_MODE="${CRC_MODE:-false}"
@@ -14,6 +43,15 @@ APPS_DOMAIN="${APPS_DOMAIN:-}"
 
 RENDERED_DIR="${PROJECT_DIR}/.rendered"
 CURL_OPTS="${CURL_OPTS:-}"
+
+# Empty Docker config to avoid `credsStore: desktop`/keychain lookups when
+# pulling the OpenShell OCI chart dependency (charts/openshell/Chart.yaml)
+# on Podman-based hosts. Exported so every `helm dependency ...`/`helm
+# upgrade --install` invocation against that chart picks it up.
+DOCKER_CONFIG="${DOCKER_CONFIG:-/tmp/helm-nodocker-openclaw}"
+mkdir -p "$DOCKER_CONFIG"
+[[ -f "${DOCKER_CONFIG}/config.json" ]] || printf '{}' > "${DOCKER_CONFIG}/config.json"
+export DOCKER_CONFIG
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -150,7 +188,13 @@ render_template() {
     exit 1
   fi
   mkdir -p "$(dirname "$dest")"
-  sed "s/__APPS_DOMAIN__/${APPS_DOMAIN}/g" "$src" > "$dest"
+  # __SANDBOX_NAME__ mirrors __APPS_DOMAIN__: parametrizes the OpenClaw UI's
+  # public hostname/CORS origin so a second, differently-named sandbox
+  # deploy can coexist with another project's on the same cluster without
+  # an OpenShift Route hostname collision (docs/adrs/ADR-0020).
+  sed -e "s/__APPS_DOMAIN__/${APPS_DOMAIN}/g" \
+      -e "s/__SANDBOX_NAME__/${SANDBOX_NAME}/g" \
+      "$src" > "$dest"
 }
 
 # render_openclaw_config renders config/openclaw.json.tpl like any other
@@ -240,13 +284,6 @@ check_openshell_cli() {
   info "openshell CLI found: $(command -v openshell)"
 }
 
-grant_privileged_scc() {
-  local ns="$1"
-  step "Granting privileged SCC to openshell-sandbox SA"
-  oc adm policy add-scc-to-user privileged -z openshell-sandbox -n "$ns"
-  info "SCC binding applied"
-}
-
 wait_for_pod_ready() {
   local ns="$1" label="$2" timeout="${3:-120}"
   step "Waiting for pod ($label) to be ready (timeout: ${timeout}s)"
@@ -308,6 +345,15 @@ load_secrets() {
 
 
 sandbox_run() {
+  # The openshell CLI's "active gateway" is local machine state shared
+  # across every project driving it from this same host. If another
+  # project's own gateway alias (or a previous run's) is currently active,
+  # `sandbox connect "$SANDBOX_NAME"` looks for that name on the WRONG
+  # gateway and fails with a misleading "sandbox not found" — found live
+  # while validating shared-cluster coexistence (ADR-0020). Re-select
+  # unconditionally (cheap, local-only) before every call instead of
+  # trusting whatever was last selected.
+  openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
   printf '%s && exit\n' "$1" \
     | timeout 15 openshell sandbox connect "$SANDBOX_NAME" 2>&1 || true
 }
@@ -319,6 +365,7 @@ sandbox_run() {
 # so we test `sandbox list` which requires a valid bearer token.
 ensure_oidc_token() {
   enable_openshell_oidc_insecure
+  openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
   if openshell sandbox list &>/dev/null; then return 0; fi
   if [[ -x "${SCRIPT_DIR}/configure-oidc.sh" ]]; then
     info "OIDC token expired, refreshing..."

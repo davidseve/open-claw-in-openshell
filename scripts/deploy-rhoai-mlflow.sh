@@ -61,28 +61,8 @@ else
   fail "RHOAI-managed MLflow validation failed - see 'make -C charts/rhoai validate' output above"
 fi
 
-# Re-running this script after OpenShell + wire-rhoai-mlflow-tracing.sh have
-# already run once (e.g. to pick up a chart fix, like the genAiStudio
-# CRD-race fix in charts/rhoai/Makefile) is otherwise destructive: the plain
-# `helm upgrade --install rhoai-mlflow` above computes values from the
-# chart's own defaults + HELM_OPTS only (neither this call nor
-# wire-rhoai-mlflow-tracing.sh's own separate `helm upgrade` for the same
-# release uses `--reuse-values`), so it silently resets
-# `openclawIntegration.enabled` back to its chart default (false) —
-# deleting the RoleBinding + declarative SA token Secret
-# (openshell-sandbox-mlflow-token) that wire-rhoai-mlflow-tracing.sh had
-# created. Any cached token in .rendered/rhoai-mlflow/wiring.env instantly
-# becomes invalid (the backing Secret is gone), breaking mlflow-openclaw
-# tracing and every verify.sh Layer 8/8b/10 MLflow API check with a 401 —
-# confirmed live on a real AWS OCP deploy. Detect that wiring already
-# happened (openshell-sandbox SA exists) and transparently re-wire so this
-# script stays safe to re-run at any point in the deploy lifecycle, not just
-# as the very first, one-shot pre-OpenShell step.
-if oc get sa openshell-sandbox -n "${NAMESPACE:-openshell}" &>/dev/null; then
-  step "openshell-sandbox SA already exists — re-wiring RHOAI MLflow integration"
-  info "(the helm upgrade above resets openclawIntegration.enabled to false;"
-  info "re-running wire-rhoai-mlflow-tracing.sh restores RBAC/token/experiment)"
-  "${SCRIPT_DIR}/wire-rhoai-mlflow-tracing.sh"
-fi
-
 step "RHOAI MLflow deploy script complete"
+info "Re-running this script no longer disturbs OpenClaw's own MLflow wiring:"
+info "RBAC/token/experiment now live in their own release (openclaw-mlflow-integration,"
+info "charts/rhoai/openclaw-integration/) instead of being --set on rhoai-mlflow itself"
+info "— see docs/adrs/ADR-0020-shared-cluster-coexistence.md."

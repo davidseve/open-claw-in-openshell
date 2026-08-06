@@ -7,7 +7,13 @@ check_openshell_cli
 detect_environment
 render_all_templates
 KC_ISSUER="https://keycloak-openshell-keycloak.${APPS_DOMAIN}/realms/openshell"
-GW_URL="https://openshell-gw-openshell.${APPS_DOMAIN}"
+# Namespace-derived, not hardcoded to "openshell": the gRPC Route
+# (charts/openshell/templates/route.yaml) uses .Release.Namespace, so its
+# default OpenShift hostname ("<route-name>-<namespace>.<apps-domain>")
+# tracks whatever $NAMESPACE this deploy actually used — required for a
+# second, differently-namespaced deploy to coexist with another project on
+# the same cluster.
+GW_URL="https://openshell-gw-${NAMESPACE}.${APPS_DOMAIN}"
 
 step "Verifying Keycloak OIDC discovery is reachable"
 DISCOVERY=$(curl -sk "${KC_ISSUER}/.well-known/openid-configuration" 2>/dev/null || true)
@@ -31,34 +37,37 @@ else
 fi
 
 step "Running Helm upgrade with OIDC configuration"
-helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version "$OPENSHELL_CHART_VERSION" \
+helm dependency build "${PROJECT_DIR}/charts/openshell"
+helm upgrade "$OPENSHELL_RELEASE_NAME" "${PROJECT_DIR}/charts/openshell" \
   --namespace "$NAMESPACE" \
-  -f "${RENDERED_DIR}/values-ocp.yaml"
+  -f "${RENDERED_DIR}/values-ocp.yaml" \
+  --set global.appsDomain="${APPS_DOMAIN}" \
+  --set-string "openshell.pkiInitJob.serverDnsNames[0]=openshell-gw-${NAMESPACE}.${APPS_DOMAIN}" \
+  --set-string "openshell.pkiInitJob.serverDnsNames[1]=*.${APPS_DOMAIN}"
 
 step "Waiting for gateway rollout"
-oc -n "$NAMESPACE" rollout status statefulset/openshell --timeout=180s
+oc -n "$NAMESPACE" rollout status "statefulset/${OPENSHELL_RELEASE_NAME}" --timeout=180s
 
 step "Re-registering gateway with OIDC"
 enable_openshell_oidc_insecure
-openshell gateway remove ocp 2>/dev/null || true
+openshell gateway remove "$GATEWAY_NAME" 2>/dev/null || true
 
-GW_CONFIG_DIR="${HOME}/.config/openshell/gateways/ocp"
+GW_CONFIG_DIR="${HOME}/.config/openshell/gateways/${GATEWAY_NAME}"
 mkdir -p "$GW_CONFIG_DIR"
 
 if [[ -t 0 ]] && [[ "${OPENSHELL_HEADLESS:-}" != "1" ]]; then
   openshell gateway add "$GW_URL" \
-    --name ocp \
+    --name "$GATEWAY_NAME" \
     --oidc-issuer "$KC_ISSUER" \
     --oidc-client-id "openshell-cli"
+  openshell gateway select "$GATEWAY_NAME"
   info "Gateway registered with OIDC (browser login)"
 else
   info "Headless mode: registering gateway and obtaining token via password grant"
 
   cat > "${GW_CONFIG_DIR}/metadata.json" << EOF
 {
-  "name": "ocp",
+  "name": "${GATEWAY_NAME}",
   "gateway_endpoint": "${GW_URL}",
   "is_remote": false,
   "gateway_port": 0,
@@ -101,7 +110,7 @@ EOF
 }
 EOF
   chmod 600 "${GW_CONFIG_DIR}/oidc_token.json"
-  openshell gateway select ocp
+  openshell gateway select "$GATEWAY_NAME"
   info "OIDC token obtained via password grant (expires in ${EXPIRES_IN}s)"
 fi
 
@@ -132,7 +141,7 @@ info "OIDC Issuer: $KC_ISSUER"
 info "Auth: Bearer JWT (no client cert needed)"
 echo ""
 if [[ -t 0 ]] && [[ "${OPENSHELL_HEADLESS:-}" != "1" ]]; then
-  info "To re-login: openshell gateway login ocp"
+  info "To re-login: openshell gateway login ${GATEWAY_NAME}"
 else
   info "Headless mode: token auto-refreshes via refresh_token"
   info "To force re-auth: KC_USER=admin KC_PASS=admin ./scripts/configure-oidc.sh"

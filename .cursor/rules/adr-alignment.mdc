@@ -1,0 +1,48 @@
+---
+description: "Architecture decisions are binding. Read ADRs before changing stack, deploy, or platform behavior."
+alwaysApply: true
+---
+
+# ADR Alignment
+
+Accepted Architecture Decision Records (ADRs) are the **binding source of truth** for this project. Do not contradict them without updating the ADR first.
+
+## Before You Act
+
+1. Read the ADR index in [README.md](../../README.md) (near the bottom) for a one-line summary of every ADR and its current status.
+2. Open the linked ADR(s) in [docs/adrs/](../../docs/adrs/) for the layer you're touching (deployment, auth, MLflow/tracing, OpenClaw sandbox security, etc.).
+3. Check version pins and constraints against [docs/constraints.md](../../docs/constraints.md) — the deepest "how this actually works" reference (symptom → root cause → fix) — before changing scripts, Helm values, or operator versions.
+
+## Status Rules
+
+| Status | Agent behavior |
+|---|---|
+| **Accepted** | Follow strictly. If the task conflicts, stop and propose an ADR update (use the `adr` skill) — do not silently override. |
+| **Proposed** | Treat as direction, not locked. Flag conflicts with Accepted ADRs; suggest accepting, amending, or superseding. |
+| **Superseded** (noted inline in the README ADR index) | Ignore; follow the superseding ADR instead. |
+
+## When to Create or Update an ADR
+
+Use the `adr` skill when the task would:
+
+- Add, remove, or swap a platform component (RHOAI/MLflow, Agent Sandbox operator, OpenShell chart, oauth2-proxy/Keycloak, sandbox policies)
+- Change deployment topology, namespace/sandbox-name parametrization, or version pinning policy
+- Reverse an Accepted decision (e.g., re-enable a previously retired auth mode)
+
+Implementation-only work (bug fixes, docs typos, scripts that follow existing ADRs) does **not** require a new ADR.
+
+## Conflict Resolution
+
+Priority order:
+
+1. **Accepted ADRs** in `docs/adrs/`
+2. Official docs per [documentation-sources.mdc](./documentation-sources.mdc)
+3. `AGENTS.md`, `README.md`, `docs/constraints.md` — link to ADRs; do not restate full rationale inline
+
+## After Architectural Changes
+
+When code or deploy manifests change stack behavior:
+
+- Update the relevant ADR (or add an Addendum section, the pattern already used in this repo — see ADR-0006/ADR-0018) instead of silently drifting from it
+- Add the new/changed ADR to the index line in `README.md`
+- Cite the ADR number in commit/PR descriptions when the change implements a decision

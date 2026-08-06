@@ -1,0 +1,24 @@
+OpenShell gateway deployed for OpenClaw-in-OpenShell.
+
+This is a single Helm release ({{ .Release.Name }}, namespace {{ .Release.Namespace }})
+that renders both this wrapper's OpenShift extras (privileged SCC RoleBinding, Route)
+and the upstream OpenShell gateway itself (subchart dependency, image tag
+{{ .Values.openshell.image.tag }}) together — see scripts/deploy-openshell.sh and
+Chart.yaml's `dependencies:` block for the pinned upstream version.
+{{- if .Values.openshift.scc.privilegedSandbox }}
+SCC:       privileged → {{ include "openclaw-openshell.sandboxSA" . }} (namespace {{ .Release.Namespace }})
+{{- end }}
+
+Verify:
+  oc -n {{ .Release.Namespace }} rollout status statefulset/openshell
+  oc -n {{ .Release.Namespace }} get pods,secret | grep -E 'NAME|openshell'
+{{- if .Values.openshift.scc.privilegedSandbox }}
+  oc -n {{ .Release.Namespace }} get rolebinding | grep privileged
+{{- end }}
+{{- if .Values.route.enabled }}
+  oc -n {{ .Release.Namespace }} get route {{ .Values.route.name }}
+{{- end }}
+
+Documentation:
+  docs/adrs/ADR-0009-external-service-routing.md
+  docs/adrs/ADR-0006-scc-privileged-sandbox.md

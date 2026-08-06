@@ -62,6 +62,18 @@ VERIFY_PROFILE="${VERIFY_PROFILE:-full}"
 detect_environment
 info "Verification profile: ${VERIFY_PROFILE} (set VERIFY_PROFILE=smoke for the fast subset)"
 
+# The openshell CLI's "active gateway" is local machine state shared across
+# every project driving it from this same host (agentops-example's "ocp"
+# alias, this project's own $GATEWAY_NAME, etc.). Every `openshell
+# status`/`sandbox ...` check below implicitly targets whatever gateway is
+# currently active, not necessarily this project's own — re-select
+# unconditionally so this script's result doesn't depend on which project's
+# tooling last ran in this terminal/session. See
+# docs/adrs/ADR-0020-shared-cluster-coexistence.md.
+if command -v openshell &>/dev/null; then
+  openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
+fi
+
 # =============================================================================
 # Layer 1: OCP Infrastructure
 # =============================================================================
@@ -88,13 +100,21 @@ oc get ns "$NAMESPACE" &>/dev/null \
   && pass "Namespace $NAMESPACE exists" \
   || fail "Namespace $NAMESPACE not found"
 
-oc get rolebinding -n "$NAMESPACE" system:openshift:scc:privileged &>/dev/null \
-  && pass "SCC binding active for openshell-sandbox (RBAC RoleBinding)" \
-  || { oc get scc privileged -o json 2>/dev/null | grep -q "openshell-sandbox" \
-    && pass "SCC binding active for openshell-sandbox (SCC users list)" \
-    || fail "SCC binding not found"; }
+# The declarative RoleBinding (charts/openshell/templates/scc-rolebinding.yaml,
+# ADR-0006 addendum) is named "<wrapper-fullname>-sandbox-privileged-scc", not
+# a fixed literal — match on its roleRef instead of guessing its metadata.name.
+# Falls back to the pre-ADR-0019 imperative `oc adm policy add-scc-to-user`
+# SCC-users-list check for clusters that still used that mechanism.
+if oc get rolebinding -n "$NAMESPACE" -o json 2>/dev/null \
+    | jq -e '.items[] | select(.roleRef.name=="system:openshift:scc:privileged")' >/dev/null 2>&1; then
+  pass "SCC binding active for openshell-sandbox (RBAC RoleBinding)"
+elif oc get scc privileged -o json 2>/dev/null | grep -q "openshell-sandbox"; then
+  pass "SCC binding active for openshell-sandbox (SCC users list)"
+else
+  fail "SCC binding not found"
+fi
 
-for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
+for secret in openshell-server-tls openshell-client-tls "${OPENSHELL_RELEASE_NAME}-jwt-keys"; do
   oc -n "$NAMESPACE" get secret "$secret" &>/dev/null \
     && pass "PKI secret $secret exists" \
     || fail "PKI secret $secret not found"
@@ -415,7 +435,7 @@ HEREDOC
   # The proxy logs every denied connection with the reason.
   # Even a single DENIED entry means the gateway is failing silently.
   # (See root cause #3 above)
-  DENY_LOGS=$(openshell logs openclaw-gw 2>&1 | grep "DENIED.*maas" | tail -5 || true)
+  DENY_LOGS=$(openshell logs "$SANDBOX_NAME" 2>&1 | grep "DENIED.*maas" | tail -5 || true)
   DENY_COUNT=$(echo "$DENY_LOGS" | grep -c "DENIED" || true)
   if [[ "$DENY_COUNT" -eq 0 ]]; then
     pass "No DENIED proxy entries for MaaS"
@@ -462,7 +482,7 @@ step "Layer 7b: oauth-proxy OpenShift-native OAuth UI Authentication"
 # Hostname must equal OpenShell's {sandbox}--{service} pattern -- see
 # charts/oauth2-proxy/templates/route.yaml for why (WebSocket Host-header bug
 # in this oauth-proxy fork, ADR-0016).
-OAUTH_PROXY_HOST="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
+OAUTH_PROXY_HOST="${SANDBOX_NAME}--openclaw-ui.${APPS_DOMAIN}"
 
 if oc -n "$NAMESPACE" get route openclaw-ui-auth &>/dev/null; then
   pass "oauth-proxy route exists"
@@ -849,7 +869,7 @@ else
 
   TEST_DIR="${PROJECT_DIR}/tests"
   if command -v npx &>/dev/null && [[ -d "${TEST_DIR}/node_modules/@playwright" ]]; then
-    OAUTH_ROUTE="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
+    OAUTH_ROUTE="${SANDBOX_NAME}--openclaw-ui.${APPS_DOMAIN}"
     OPENCLAW_BASE_URL="https://${OAUTH_ROUTE}"
     info "Using oauth-proxy route for Playwright: ${OPENCLAW_BASE_URL}"
 

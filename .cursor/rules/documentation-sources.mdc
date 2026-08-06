@@ -1,0 +1,68 @@
+---
+description: "Authoritative documentation sources: Red Hat docs are the single source of truth for all platform decisions."
+globs: "**"
+alwaysApply: true
+---
+
+# Documentation as Source of Truth
+
+All decisions about platform components MUST be validated against official documentation. Do NOT rely on training data or assumptions — fetch and verify.
+
+## Source Priority (highest to lowest)
+
+1. **Red Hat Official Documentation** — GA status, supported configs, operator setup
+2. **Upstream project documentation** — API reference, CRD fields, feature details
+3. **Upstream source code** — conflict resolution, CRD source of truth
+
+## Authoritative References by Component
+
+### RHOAI (Platform, MLflow, tracing/prompt registry)
+
+- **RHOAI 3.x docs:** https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/
+- **Supported configs:** https://access.redhat.com/articles/rhoai-supported-configs-3.x
+- **RHOAI MLflow Operator:** https://github.com/opendatahub-io/mlflow-operator
+- **MLflow docs:** https://mlflow.org/docs/latest/
+
+### OpenShell (gateway/sandbox harness)
+
+- **OpenShell on OpenShift:** https://docs.nvidia.com/openshell/kubernetes/openshift
+- **Installation:** https://docs.nvidia.com/openshell/about/installation
+
+### OpenClaw (agent harness inside the sandbox)
+
+- Vendored/config-driven — see `config/openclaw.json.tpl` and `docs/adrs/ADR-0002-openclaw-in-sandbox.md`, `ADR-0007-openclaw-inside-sandbox.md` for the integration decisions and their sources.
+
+### Agent Sandbox (Red Hat build)
+
+- **Red Hat build of Agent Sandbox:** https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.12/html/deploying_red_hat_build_of_agent_sandbox/
+- **Upstream:** https://github.com/kubernetes-sigs/agent-sandbox
+
+### MaaS (Model Serving / inference provider)
+
+- **MaaS guide:** https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html-single/govern_llm_access_with_models-as-a-service/index
+- **Upstream:** https://opendatahub-io.github.io/models-as-a-service/latest/
+
+### Keycloak / OIDC (CLI/gRPC auth) and OpenShift-native OAuth (UI auth)
+
+- **Keycloak docs:** https://www.keycloak.org/documentation
+- **OpenShift OAuth server:** https://docs.redhat.com/en/documentation/openshift_container_platform/latest/html/authentication_and_authorization/index
+- **`ose-oauth-proxy` (oauth2-proxy OpenShift fork):** https://github.com/openshift/oauth-proxy
+
+## Validation Rules
+
+1. **Do NOT guess** CRD fields, operator versions, or API endpoints — look them up.
+2. **Use `WebFetch`** or MCP tools to retrieve current docs when implementing changes.
+3. **Cite the source** in ADRs, commit messages, and docs when a decision is based on official docs.
+4. **Conflict resolution**: Red Hat docs win. If upstream has a feature not in Red Hat docs, treat it as TP/unsupported until confirmed.
+5. **Version pinning**: Always verify the exact operator version/channel and chart version from official docs before setting it in `charts/*/values*.yaml` or a script.
+
+## When to Consult
+
+| Question | Where to look |
+|----------|---------------|
+| Is feature X GA? | Red Hat docs release notes |
+| What CRD fields are available? | Upstream docs or CRD definitions (`oc explain <crd>`) |
+| What operator channel to use? | Red Hat docs |
+| How to configure component Y? | Red Hat docs first, then upstream |
+| Bug / unexpected behavior? | Upstream repo issues/PRs, then `docs/constraints.md` for this project's own prior findings |
+| Supported RHOAI version matrix? | access.redhat.com supported configs |

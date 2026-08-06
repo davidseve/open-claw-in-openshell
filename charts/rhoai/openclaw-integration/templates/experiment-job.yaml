@@ -1,35 +1,29 @@
-# Idempotent get-by-name-or-create for the openclaw-tracing MLflow experiment,
-# run as a Helm post-install/post-upgrade hook instead of a separate
-# imperative script step (see values.yaml's openclawIntegration block and
-# docs/adrs/ADR-0017-rhoai-mlflow-scope.md).
+# Idempotent get-by-name-or-create for the tracing MLflow experiment, run as
+# a Helm post-install/post-upgrade hook. MLflow experiments are a
+# "pseudo-resource" (no CRD — created purely via the MLflow REST API), so
+# this can't be a plain declarative manifest; wrapping it as a Job keeps it
+# inside the chart's normal install/upgrade lifecycle instead of a hand-run
+# script step.
 #
-# MLflow experiments are a "pseudo-resource" (no CRD — created purely via the
-# MLflow REST API), so this can't be a plain declarative manifest; wrapping
-# it as a Job keeps it inside the chart's normal install/upgrade lifecycle
-# instead of a hand-run script step.
-#
-# Auth: uses the SA token Secret from openclaw-integration-rbac.yaml (same
-# Bearer token the sandbox's mlflow-openclaw plugin uses at runtime) plus the
+# Auth: uses the SA token Secret from rbac.yaml (same Bearer token the
+# sandbox's mlflow-openclaw plugin uses at runtime) plus the
 # X-MLFLOW-WORKSPACE header RHOAI's MLflow requires (--enable-workspaces is
 # always on). curl -k (skip verify) is intentional and safe here: this Job
 # talks to MLflow's in-cluster Service directly over normal pod networking —
-# it never goes through the OpenShell sandbox's L7 proxy (tls: skip in
-# policies/openclaw-sandbox.yaml is a separate, sandbox-only concern) — and
-# it never leaves the cluster network.
+# it never goes through the OpenShell sandbox's L7 proxy — and never leaves
+# the cluster network.
 #
 # Result is written to stdout as `experiment_id=<N>`; the caller
-# (scripts/wire-rhoai-mlflow-tracing.sh) reads it back with
-# `oc logs job/<name>` rather than needing kubectl/oc inside this minimal
-# curl-only image.
-{{- if .Values.openclawIntegration.enabled }}
+# (scripts/wire-rhoai-mlflow-tracing.sh) reads it back with `oc logs
+# job/<name>` rather than needing kubectl/oc inside this minimal curl-only
+# image.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: openclaw-mlflow-experiment-{{ .Release.Revision }}
-  namespace: {{ .Values.openclawIntegration.namespace }}
+  namespace: {{ .Values.namespace }}
   labels:
-    {{- include "mlflow.labels" . | nindent 4 }}
-    app.kubernetes.io/part-of: openclaw-in-openshell
+    {{- include "openclaw-mlflow-integration.labels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "1"
@@ -39,20 +33,20 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "mlflow.labels" . | nindent 8 }}
+        {{- include "openclaw-mlflow-integration.labels" . | nindent 8 }}
     spec:
       restartPolicy: Never
       containers:
         - name: create-experiment
-          image: {{ .Values.openclawIntegration.jobImage }}
+          image: {{ .Values.jobImage }}
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -e
               TOKEN=$(cat /var/run/secrets/mlflow-token/token)
-              MLFLOW_URL="https://mlflow.{{ .Values.openclawIntegration.mlflowNamespace }}.svc.cluster.local:8443"
-              WORKSPACE="{{ .Values.openclawIntegration.namespace }}"
-              EXP_NAME="{{ .Values.openclawIntegration.experimentName }}"
+              MLFLOW_URL="https://mlflow.{{ .Values.mlflowNamespace }}.svc.cluster.local:8443"
+              WORKSPACE="{{ .Values.namespace }}"
+              EXP_NAME="{{ .Values.experimentName }}"
 
               # NOTE: MLflow's JSON responses pretty-print with a space after
               # the colon ("experiment_id": "1") — the extraction regex below
@@ -88,5 +82,4 @@ spec:
       volumes:
         - name: mlflow-token
           secret:
-            secretName: {{ .Values.openclawIntegration.serviceAccountName }}-mlflow-token
-{{- end }}
+            secretName: {{ .Values.serviceAccountName }}-mlflow-token

@@ -5,8 +5,8 @@
 # Keycloak broker required for this path. See ADR-0016.
 #
 # `--pass-host-header=true` + the public Route hostname
-# (openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}, matching OpenShell's
-# {sandbox}--{service} routing pattern) work around a real bug in this
+# ({{ .Values.sandboxName }}--openclaw-ui.{{ .Values.appsDomain }}, matching
+# OpenShell's {sandbox}--{service} routing pattern) work around a real bug in this
 # fork's WebSocket reverse proxy: `NewWebSocketOrRestReverseProxy` in
 # oauthproxy.go never applies `setProxyUpstreamHostHeader` to the
 # `wsutil`-based WebSocket proxy (only to the plain HTTP one), so WebSocket
@@ -19,7 +19,7 @@
 # HTTP and WebSocket traffic instead of depending on host rewriting at all.
 # See ADR-0016 "WebSocket login failure" section.
 {{- /*
-The public Route (openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}, see
+The public Route ({{ .Values.sandboxName }}--openclaw-ui.{{ .Values.appsDomain }}, see
 route.yaml) points at THIS Deployment's Service, not at the `openshell`
 Service anymore -- so --upstream can no longer resolve that hostname through
 the Route without looping back into this same Deployment. A hostAlias below
@@ -32,9 +32,9 @@ template`/`--dry-run`, only real `helm upgrade --install` runs, which is all
 scripts/deploy-oauth2-proxy.sh ever does) instead of a `sed -i` on a
 rendered manifest.
 */}}
-{{- $openshellSvc := lookup "v1" "Service" .Values.namespace "openshell" }}
+{{- $openshellSvc := lookup "v1" "Service" .Values.namespace .Values.openshellServiceName }}
 {{- if not $openshellSvc }}
-{{- fail (printf "Service 'openshell' not found in namespace '%s' — deploy OpenShell first (scripts/deploy-openshell.sh)" .Values.namespace) }}
+{{- fail (printf "Service '%s' not found in namespace '%s' — deploy OpenShell first (scripts/deploy-openshell.sh)" .Values.openshellServiceName .Values.namespace) }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -57,7 +57,7 @@ spec:
       hostAliases:
         - ip: {{ $openshellSvc.spec.clusterIP }}
           hostnames:
-            - openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}
+            - {{ .Values.sandboxName }}--openclaw-ui.{{ .Values.appsDomain }}
       containers:
         - name: oauth-proxy
           image: {{ .Values.image }}
@@ -73,7 +73,7 @@ spec:
             # explicit port oauth-proxy dials 10.x.x.x:443, which nothing
             # listens on, and every proxied request (including WebSocket
             # upgrades) hangs until it times out.
-            - --upstream=https://openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}:8080
+            - --upstream=https://{{ .Values.sandboxName }}--openclaw-ui.{{ .Values.appsDomain }}:8080
             - --ssl-insecure-skip-verify=true
             - --upstream-ca=/etc/openshell/ca.crt
             - --https-address=:8443

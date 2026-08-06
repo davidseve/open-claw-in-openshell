@@ -1,0 +1,26 @@
+# Namespace where OpenShell/the openshell-sandbox SA lives — NOT the shared
+# MLflow instance's own namespace (redhat-ods-applications, see
+# mlflowNamespace below). The RoleBinding must live here because RHOAI
+# MLflow's self_subject_access_review RBAC check
+# (MLFLOW_K8S_AUTH_AUTHORIZATION_MODE) is scoped by namespace, and the
+# X-MLFLOW-WORKSPACE header value used at runtime must match it.
+namespace: openshell
+serviceAccountName: openshell-sandbox
+
+# mlflow-integration ClusterRole name varies by operator build (observed
+# form: a generated name ending in "-mlflow-integration") and is
+# auto-detected via Helm's `lookup` in templates/rbac.yaml. Only set this to
+# override the auto-detection (e.g. against a cluster where more than one
+# ClusterRole happens to match "mlflow-integration").
+clusterRoleName: ""
+
+experimentName: openclaw-tracing
+
+# The shared MLflow instance's own namespace/Service — same value regardless
+# of which project's rhoai-mlflow release actually owns it, since RHOAI
+# always deploys MLflow into redhat-ods-applications.
+mlflowNamespace: redhat-ods-applications
+
+# Small, version-pinned image with curl — the experiment-provisioning Job
+# only needs to speak HTTPS to MLflow's REST API, not a full toolchain.
+jobImage: "docker.io/curlimages/curl:8.10.1"

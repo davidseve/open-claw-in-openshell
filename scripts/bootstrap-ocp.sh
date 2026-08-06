@@ -66,7 +66,11 @@ EOF
   fi
 fi
 
-grant_privileged_scc "$NAMESPACE"
+# Privileged SCC binding for the openshell-sandbox SA is no longer granted
+# here imperatively (`oc adm policy add-scc-to-user`) — it's now a
+# declarative RoleBinding template in charts/openshell (scc-rolebinding.yaml),
+# applied by scripts/deploy-openshell.sh as part of the same Helm release
+# that creates the SA itself. See docs/adrs/ADR-0006-scc-privileged-sandbox.md.
 
 step "Verifying CRDs"
 if oc get crd sandboxes.agents.x-k8s.io &>/dev/null; then

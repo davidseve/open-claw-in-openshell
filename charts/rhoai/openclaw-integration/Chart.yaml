@@ -1,0 +1,19 @@
+# Standalone chart for wiring OpenClaw's mlflow-openclaw plugin to a shared
+# RHOAI-managed MLflow instance: RBAC (RoleBinding), a declarative SA-token
+# Secret, and MLflow experiment provisioning (post-install/post-upgrade Job).
+#
+# Extracted out of charts/rhoai/mlflow's own release on 2026-08-05 (see
+# docs/adrs/ADR-0020-shared-cluster-coexistence.md) so it can be installed
+# as its OWN Helm release, independent of whichever project's `rhoai-mlflow`
+# release actually owns the base MLflow server on a shared cluster. Before
+# this, scripts/wire-rhoai-mlflow-tracing.sh ran `helm upgrade rhoai-mlflow
+# --set openclawIntegration.enabled=true ...` directly against the shared
+# base chart — safe with exactly one consumer, but a second project doing
+# the same against the SAME release would silently overwrite the first
+# project's namespace/ServiceAccount values (Helm has no notion of "add one
+# more RBAC binding" via plain --set on a single-value block).
+apiVersion: v2
+name: openclaw-mlflow-integration
+description: RBAC + SA token + experiment provisioning for one OpenClaw consumer of a shared RHOAI MLflow instance
+type: application
+version: 0.1.0

@@ -13,16 +13,18 @@
 #
 # RBAC (RoleBinding), the SA token (Secret), and MLflow experiment creation
 # are all declarative Helm resources owned by charts/rhoai/mlflow/ (see its
-# values.yaml openclawIntegration block and templates/openclaw-integration-*.yaml). This script's job is:
-#   1. Detect the live mlflow-integration ClusterRole name (still imperative
-#      by necessity — it's an operator-generated name, not something a Helm
-#      template should hardcode/guess).
-#   2. Re-run `helm upgrade` with openclawIntegration.enabled=true, which
+# values.yaml openclawIntegration block and
+# templates/openclaw-integration-*.yaml). The mlflow-integration ClusterRole
+# (an operator-generated, random-suffixed name) is auto-detected inside that
+# template via Helm's `lookup` function — no imperative `oc get clusterroles`
+# step needed here anymore (ported from agentops-example, 2026-08-05).
+# This script's job is now just:
+#   1. Re-run `helm upgrade` with openclawIntegration.enabled=true, which
 #      creates/updates the RoleBinding + token Secret and runs the
 #      experiment-provisioning Job as a post-upgrade hook.
-#   3. Read the results back (SA token from the Secret, experiment_id from
+#   2. Read the results back (SA token from the Secret, experiment_id from
 #      the hook Job's logs) and stage them for scripts/launch-openclaw.sh.
-#   4. Seed system prompts into the MLflow Prompt Registry (moved here from
+#   3. Seed system prompts into the MLflow Prompt Registry (moved here from
 #      the removed standalone-MLflow deploy step).
 #
 # Called unconditionally from scripts/crc-lifecycle.sh's `deploy`/`full`
@@ -53,70 +55,50 @@ RHOAI_NS="redhat-ods-applications"
 EXPERIMENT_NAME="openclaw-tracing"
 WORKSPACE="${NAMESPACE}"
 OUT_DIR="${PROJECT_DIR}/.rendered/rhoai-mlflow"
-MLFLOW_CHART_DIR="${PROJECT_DIR}/charts/rhoai/mlflow"
-MLFLOW_RELEASE="rhoai-mlflow"
+INTEGRATION_CHART_DIR="${PROJECT_DIR}/charts/rhoai/openclaw-integration"
+INTEGRATION_RELEASE="openclaw-mlflow-integration"
 
 check_prereqs
 detect_environment
 
-step "Locating mlflow-integration ClusterRole"
-MLFLOW_INTEGRATION_CLUSTERROLE=$(oc get clusterroles -o name 2>/dev/null \
-  | grep -i 'mlflow-integration$' | sed 's#clusterrole.rbac.authorization.k8s.io/##' | head -1)
-if [[ -z "$MLFLOW_INTEGRATION_CLUSTERROLE" ]]; then
-  error "No ClusterRole matching '*mlflow-integration' found."
-  error "Is RHOAI MLflow deployed? Run ./scripts/deploy-rhoai-mlflow.sh first."
-  exit 1
-fi
-info "ClusterRole: ${MLFLOW_INTEGRATION_CLUSTERROLE}"
-
-step "Verifying OpenShell namespace + openshell-sandbox SA exist"
+step "Verifying OpenShell namespace + ${SANDBOX_SA_NAME} SA exist"
 if ! oc get ns "$NAMESPACE" &>/dev/null; then
   error "Namespace '$NAMESPACE' not found."
   error "Run ./scripts/crc-lifecycle.sh deploy first."
   exit 1
 fi
-if ! oc get sa openshell-sandbox -n "$NAMESPACE" &>/dev/null; then
-  error "ServiceAccount 'openshell-sandbox' not found in namespace '$NAMESPACE'."
+if ! oc get sa "$SANDBOX_SA_NAME" -n "$NAMESPACE" &>/dev/null; then
+  error "ServiceAccount '${SANDBOX_SA_NAME}' not found in namespace '$NAMESPACE'."
   error "Run ./scripts/crc-lifecycle.sh deploy first."
   exit 1
 fi
-info "Namespace '$NAMESPACE' and SA 'openshell-sandbox' present"
+info "Namespace '$NAMESPACE' and SA '${SANDBOX_SA_NAME}' present"
 
-step "Enabling openclawIntegration (RoleBinding + token Secret + experiment Job) via helm upgrade"
-if ! helm status "$MLFLOW_RELEASE" &>/dev/null; then
-  error "Helm release '${MLFLOW_RELEASE}' not found. Run ./scripts/deploy-rhoai-mlflow.sh first."
+step "Verifying shared MLflow instance is reachable (redhat-ods-applications)"
+if ! oc get mlflow mlflow -n "$RHOAI_NS" &>/dev/null; then
+  error "No MLflow CR found in namespace '${RHOAI_NS}'."
+  error "Run ./scripts/deploy-rhoai-mlflow.sh first (or confirm another project on this cluster already deployed it)."
   exit 1
 fi
-# NOTE: deliberately NOT using --reuse-values. Helm's --reuse-values reuses
-# the *previous release's fully-computed* values as the new base — for keys
-# that were never part of any earlier revision's values.yaml (like this
-# chart's whole openclawIntegration block, added after this project's first
-# `deploy-rhoai-mlflow.sh` run), that base has no entry at all, so
-# --reuse-values + a partial --set silently drops every openclawIntegration
-# sub-key not explicitly passed here (confirmed live: serviceAccountName
-# came back empty, breaking the token Secret's name/annotation). Passing the
-# chart's values.yaml explicitly with -f avoids this class of bug entirely.
-SECRETS_FILE="${PROJECT_DIR}/secrets/secrets.env"
-if [[ -f "$SECRETS_FILE" ]]; then
-  set -a; source "$SECRETS_FILE"; set +a
-fi
-if [[ -z "${MLFLOW_DB_PASSWORD:-}" ]]; then
-  error "MLFLOW_DB_PASSWORD not found in ${SECRETS_FILE}. Run ./scripts/deploy-rhoai-mlflow.sh first."
-  exit 1
-fi
-helm upgrade "$MLFLOW_RELEASE" "$MLFLOW_CHART_DIR" \
-  -f "${MLFLOW_CHART_DIR}/values.yaml" \
-  --set-string database.password="${MLFLOW_DB_PASSWORD}" \
-  --set-string postgresql.password="${MLFLOW_DB_PASSWORD}" \
-  --set openclawIntegration.enabled=true \
-  --set openclawIntegration.namespace="${NAMESPACE}" \
-  --set-string openclawIntegration.clusterRoleName="${MLFLOW_INTEGRATION_CLUSTERROLE}" \
-  --set openclawIntegration.experimentName="${EXPERIMENT_NAME}" \
+info "Shared MLflow instance found in ${RHOAI_NS} (installed by whichever project's rhoai-mlflow release got there first)"
+
+step "Installing RBAC + token Secret + experiment Job (own release, independent of rhoai-mlflow)"
+# A standalone Helm release (not a --set on the shared rhoai-mlflow
+# release) so this project's wiring never depends on — or clobbers — a
+# co-tenant project's own openclaw-mlflow-integration release against the
+# same shared MLflow instance. See charts/rhoai/openclaw-integration/Chart.yaml
+# and docs/adrs/ADR-0020-shared-cluster-coexistence.md.
+helm upgrade --install "$INTEGRATION_RELEASE" "$INTEGRATION_CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  --set namespace="${NAMESPACE}" \
+  --set serviceAccountName="${SANDBOX_SA_NAME}" \
+  --set experimentName="${EXPERIMENT_NAME}" \
+  --set mlflowNamespace="${RHOAI_NS}" \
   --wait --timeout 2m
 pass "RoleBinding + SA token Secret applied, experiment-provisioning Job ran as a post-upgrade hook"
 
 step "Reading experiment_id from the hook Job's logs"
-RELEASE_REVISION=$(helm status "$MLFLOW_RELEASE" -o json 2>/dev/null \
+RELEASE_REVISION=$(helm status "$INTEGRATION_RELEASE" -n "$NAMESPACE" -o json 2>/dev/null \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])")
 JOB_NAME="openclaw-mlflow-experiment-${RELEASE_REVISION}"
 oc -n "$NAMESPACE" wait --for=condition=complete "job/${JOB_NAME}" --timeout=60s
@@ -131,10 +113,10 @@ pass "MLflow experiment ready: ${EXPERIMENT_NAME} (id=${EXPERIMENT_ID})"
 
 step "Reading SA token from the declarative Secret"
 mkdir -p "$OUT_DIR"
-SA_TOKEN=$(oc get secret "openshell-sandbox-mlflow-token" -n "$NAMESPACE" \
+SA_TOKEN=$(oc get secret "${SANDBOX_SA_NAME}-mlflow-token" -n "$NAMESPACE" \
   -o jsonpath='{.data.token}' 2>/dev/null | base64 -d)
 if [[ -z "$SA_TOKEN" ]]; then
-  error "Could not read token from Secret 'openshell-sandbox-mlflow-token' in namespace '${NAMESPACE}'"
+  error "Could not read token from Secret '${SANDBOX_SA_NAME}-mlflow-token' in namespace '${NAMESPACE}'"
   error "The token controller may not have populated it yet — retry in a few seconds."
   exit 1
 fi

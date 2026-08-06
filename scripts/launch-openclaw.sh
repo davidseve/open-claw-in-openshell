@@ -517,7 +517,7 @@ openshell service expose "$SANDBOX_NAME" 18789 openclaw-ui 2>/dev/null \
 RHOAI_MLFLOW_ROUTE=$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
 step "OpenClaw launch complete"
 echo ""
-info "Control UI (via oauth-proxy): https://openclaw-gw--openclaw-ui.${APPS_DOMAIN}/"
+info "Control UI (via oauth-proxy): https://${SANDBOX_NAME}--openclaw-ui.${APPS_DOMAIN}/"
 info "  Login: any OCP cluster identity (OpenShift-native OAuth, ADR-0016)"
 echo ""
 info "Observability:"

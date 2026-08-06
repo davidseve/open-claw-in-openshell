@@ -11,12 +11,14 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
 check_prereqs
+detect_environment
+render_all_templates
 
 step "Cleaning up any previous certgen job"
 oc -n "$NAMESPACE" delete job openshell-certgen 2>/dev/null && info "Deleted stale certgen job" || true
 
 step "Deleting existing PKI secrets to trigger regeneration"
-for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
+for secret in openshell-server-tls openshell-client-tls "${OPENSHELL_RELEASE_NAME}-jwt-keys"; do
   if oc -n "$NAMESPACE" get secret "$secret" &>/dev/null; then
     oc -n "$NAMESPACE" delete secret "$secret"
     info "Deleted $secret"
@@ -26,14 +28,16 @@ for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
 done
 
 step "Running Helm upgrade to trigger pkiInitJob"
-helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version "$OPENSHELL_CHART_VERSION" \
+helm dependency build "${PROJECT_DIR}/charts/openshell"
+helm upgrade "$OPENSHELL_RELEASE_NAME" "${PROJECT_DIR}/charts/openshell" \
   --namespace "$NAMESPACE" \
-  -f "${PROJECT_DIR}/charts/openshell/values-ocp.yaml"
+  -f "${RENDERED_DIR}/values-ocp.yaml" \
+  --set global.appsDomain="${APPS_DOMAIN}" \
+  --set-string "openshell.pkiInitJob.serverDnsNames[0]=openshell-gw-${NAMESPACE}.${APPS_DOMAIN}" \
+  --set-string "openshell.pkiInitJob.serverDnsNames[1]=*.${APPS_DOMAIN}"
 
 step "Waiting for PKI secrets to be recreated"
-for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
+for secret in openshell-server-tls openshell-client-tls "${OPENSHELL_RELEASE_NAME}-jwt-keys"; do
   retries=0
   while ! oc -n "$NAMESPACE" get secret "$secret" &>/dev/null; do
     if [[ $retries -ge 60 ]]; then
@@ -47,10 +51,10 @@ for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
 done
 
 step "Waiting for gateway pod restart"
-oc -n "$NAMESPACE" rollout status statefulset/openshell --timeout=180s
+oc -n "$NAMESPACE" rollout status "statefulset/${OPENSHELL_RELEASE_NAME}" --timeout=180s
 
 step "Re-extracting mTLS client certificates"
-MTLS_DIR="$HOME/.config/openshell/gateways/ocp/mtls"
+MTLS_DIR="$HOME/.config/openshell/gateways/${GATEWAY_NAME}/mtls"
 mkdir -p "$MTLS_DIR"
 oc -n "$NAMESPACE" get secret openshell-client-tls \
   -o jsonpath='{.data.ca\.crt}'  | base64 -d > "$MTLS_DIR/ca.crt"

@@ -23,6 +23,7 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 - Review deny logs from the sandbox proxy (`openshell logs`) for unauthorized access attempts.
 - Never use `gateway.auth.mode: "none"` or `"token"` in sandbox environments. Use `trusted-proxy` with oauth-proxy (ADR-0012, ADR-0016).
 - Use `__APPS_DOMAIN__` template placeholders in all manifests and configs. Never hardcode cluster-specific domains.
+- Parametrize namespace and `SANDBOX_NAME` (`__SANDBOX_NAME__` placeholder) in every Route hostname and CORS origin, so this stack can coexist with other OpenShell/OpenClaw deployments (e.g. `agentops-example`) on the same cluster without hostname collisions — see [ADR-0020](docs/adrs/ADR-0020-shared-cluster-coexistence.md).
 
 ---
 
@@ -37,7 +38,7 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 **Tools**: `helm`, `oc`, `kubectl`, `helm-diff`.
 
 **Responsibilities**:
-- Maintain `charts/openshell/values-ocp.yaml` with version-pinned overrides.
+- Maintain the declarative `charts/openshell/` wrapper chart (SCC RoleBinding, Route, and OpenShell subchart values in `values.yaml`/`values-ocp*.yaml.tpl` — see [ADR-0019](docs/adrs/ADR-0019-declarative-openshell-wrapper-chart.md)) with version-pinned overrides.
 - Validate chart upgrades against OpenShift SCC admission before applying.
 - Ensure no hardcoded secrets in values files (use `${ENV_VAR}` references or external secrets).
 - Review Helm release diffs before upgrade to detect unintended permission escalations.
@@ -48,10 +49,10 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 
 **Skills**: OpenShift SCCs, RBAC, NetworkPolicy, OLM operators, certificate management, audit logging.
 
-**Tools**: `oc`, `oc adm policy`, `oc adm inspect`, OpenShift web console.
+**Tools**: `oc`, `oc adm inspect`, `helm`, OpenShift web console.
 
 **Responsibilities**:
-- Manage SCC bindings (privileged scope limited to `openshell-sandbox` SA only).
+- Manage SCC bindings declaratively via the `charts/openshell` wrapper chart's `RoleBinding` to `system:openshift:scc:privileged` (privileged scope limited to `openshell-sandbox` SA only). No imperative `oc adm policy add-scc-to-user` — see [ADR-0006](docs/adrs/ADR-0006-scc-privileged-sandbox.md) addendum.
 - Review and approve OLM operator InstallPlans before upgrades.
 - Maintain JWT signing secrets (Ed25519 keypair rotation).
 - Audit namespace RBAC to ensure no over-privileged ServiceAccounts.

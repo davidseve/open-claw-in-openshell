@@ -46,15 +46,32 @@ PLATFORM_RELEASE  := rhoai-platform
 DATABASE_RELEASE  := rhoai-database
 MLFLOW_RELEASE    := rhoai-mlflow
 
-.PHONY: deploy-operators wait-operators deploy-platform wait-dashboard-crd adopt-dashboard-config wait-llamastack wait-llamastack-and-refresh-dashboard deploy-database
+.PHONY: deploy-operators wait-operators deploy-platform deploy-platform-fresh ensure-mlflowoperator-managed wait-dashboard-crd adopt-dashboard-config wait-llamastack wait-llamastack-and-refresh-dashboard deploy-database
 .PHONY: wait-mlflow-crd deploy-mlflow deploy-all
 .PHONY: undeploy-apps purge-dsci undeploy-operators cleanup-orphans undeploy-all
 .PHONY: template lint validate validate-cleanup
 
 # --- Deploy targets (ordered) ---
+#
+# Cluster coexistence (docs/adrs/ADR-0020-shared-cluster-coexistence.md):
+# RHOAI, its DataScienceCluster, the Postgres backend, and MLflow itself are
+# cluster-wide/shared resources — if another project (e.g. agentops-example)
+# already deployed them with the exact same release names in the `default`
+# namespace (both projects vendor virtually the same charts/rhoai/* trees),
+# re-running `helm upgrade --install` here would be redundant at best and
+# values-resetting churn at worst. Each target below skips the Helm
+# upgrade/install if its release already exists, reusing whatever is live
+# instead. deploy-platform additionally ensures `mlflowoperator: Managed`
+# on the shared DataScienceCluster via a minimal `oc patch` (not a full
+# `helm upgrade`, which could reset an unrelated setting a co-tenant project
+# configured, e.g. dashboard/genAiStudio) if it isn't already.
 
 deploy-operators:
-	$(HELM) upgrade --install $(OPERATORS_RELEASE) $(OPERATORS_CHART) $(HELM_OPTS)
+	@if $(HELM) status $(OPERATORS_RELEASE) >/dev/null 2>&1; then \
+		echo "Release '$(OPERATORS_RELEASE)' already deployed (shared cluster resource) — skipping install."; \
+	else \
+		$(HELM) upgrade --install $(OPERATORS_RELEASE) $(OPERATORS_CHART) $(HELM_OPTS); \
+	fi
 
 wait-operators: deploy-operators
 	@echo "Waiting for RHOAI operator CSV..."
@@ -90,6 +107,29 @@ wait-operators: deploy-operators
 	done
 
 deploy-platform: wait-operators
+	@if $(HELM) status $(PLATFORM_RELEASE) >/dev/null 2>&1; then \
+		echo "Release '$(PLATFORM_RELEASE)' already deployed (shared cluster resource) — skipping helm upgrade, reconciling mlflowoperator only."; \
+		$(MAKE) ensure-mlflowoperator-managed; \
+	else \
+		$(MAKE) deploy-platform-fresh; \
+	fi
+
+# Minimal, non-destructive reconciliation for a DataScienceCluster this
+# project doesn't own the Helm release for: only touches
+# spec.components.mlflowoperator (a merge patch, not a full `helm upgrade`
+# with this project's own values-crc.yaml/values-aws.yaml, which could
+# silently flip an unrelated component another project configured, e.g.
+# dashboard/genAiStudio — see docs/adrs/ADR-0020).
+ensure-mlflowoperator-managed:
+	@CURRENT=$$(oc get datasciencecluster default-dsc -o jsonpath='{.spec.components.mlflowoperator.managementState}' 2>/dev/null || true); \
+	if [ "$$CURRENT" = "Managed" ]; then \
+		echo "mlflowoperator already Managed on the shared DataScienceCluster."; \
+	else \
+		echo "Patching shared DataScienceCluster: mlflowoperator -> Managed (was '$$CURRENT')..."; \
+		oc patch datasciencecluster default-dsc --type merge -p '{"spec":{"components":{"mlflowoperator":{"managementState":"Managed"}}}}'; \
+	fi
+
+deploy-platform-fresh:
 	@CURRENT_DASHBOARD=$$(oc get datasciencecluster default-dsc -o jsonpath='{.spec.components.dashboard.managementState}' 2>/dev/null || true); \
 	if [ "$(PLATFORM_ENV_VALUES)" = "platform/values-aws.yaml" ] && [ "$$CURRENT_DASHBOARD" != "Managed" ]; then \
 		echo "Fresh Dashboard enable detected: sequencing llamastackoperator BEFORE"; \
@@ -226,7 +266,11 @@ wait-llamastack-and-refresh-dashboard: wait-llamastack
 	fi
 
 deploy-database:
-	$(HELM) upgrade --install $(DATABASE_RELEASE) $(DATABASE_CHART) $(HELM_OPTS)
+	@if $(HELM) status $(DATABASE_RELEASE) >/dev/null 2>&1; then \
+		echo "Release '$(DATABASE_RELEASE)' already deployed (shared cluster resource) — skipping install."; \
+	else \
+		$(HELM) upgrade --install $(DATABASE_RELEASE) $(DATABASE_CHART) $(HELM_OPTS); \
+	fi
 
 wait-mlflow-crd:
 	@echo "Waiting for MLflow CRD..."
@@ -235,7 +279,11 @@ wait-mlflow-crd:
 	done
 
 deploy-mlflow: deploy-database wait-mlflow-crd
-	$(HELM) upgrade --install $(MLFLOW_RELEASE) $(MLFLOW_CHART) $(HELM_OPTS)
+	@if $(HELM) status $(MLFLOW_RELEASE) >/dev/null 2>&1; then \
+		echo "Release '$(MLFLOW_RELEASE)' already deployed (shared cluster resource) — skipping install, reusing shared MLflow instance."; \
+	else \
+		$(HELM) upgrade --install $(MLFLOW_RELEASE) $(MLFLOW_CHART) $(HELM_OPTS); \
+	fi
 
 deploy-all: deploy-platform deploy-database deploy-mlflow
 	@echo "Minimal RHOAI + MLflow stack deployed."
@@ -291,8 +339,13 @@ lint:
 
 validate:
 	@echo "=== Helm releases ==="
-	@test $$(helm list -f '^rhoai-' -q | wc -l | tr -d ' ') -eq 4
-	@echo "OK: 4 rhoai-* releases deployed"
+	@for r in $(OPERATORS_RELEASE) $(PLATFORM_RELEASE) $(DATABASE_RELEASE) $(MLFLOW_RELEASE); do \
+		$(HELM) status "$$r" >/dev/null 2>&1 || { echo "FAIL: release '$$r' not deployed"; exit 1; }; \
+	done
+	@echo "OK: all 4 expected rhoai-* releases deployed"
+	@echo "    (not asserting an exact total 'rhoai-*' count: a coexisting project"
+	@echo "     on this shared cluster, e.g. agentops-example, may have its own"
+	@echo "     extra releases sharing the same prefix -- see ADR-0020)"
 	@echo "=== RHOAI operator ==="
 	@oc get csv -n redhat-ods-operator -o jsonpath='{.items[?(@.spec.displayName=="Red Hat OpenShift AI")].status.phase}{"\n"}' | grep -q Succeeded
 	@oc wait --for=condition=Ready pod -l name=rhods-operator -n redhat-ods-operator --timeout=60s >/dev/null
@@ -304,8 +357,13 @@ validate:
 	done
 	@echo "OK: MLflow operator component ready"
 	@echo "=== Database ==="
-	@oc wait --for=condition=Available deployment/mlflow-db -n redhat-ods-applications --timeout=60s >/dev/null
-	@echo "OK: PostgreSQL mlflow-db Available"
+	@DB_NAME=$$($(HELM) get values $(DATABASE_RELEASE) -a -o json 2>/dev/null | jq -r '.service.name // "mlflow-db"' 2>/dev/null || echo mlflow-db); \
+	echo "  (Deployment name resolved from $(DATABASE_RELEASE)'s own values.service.name --"; \
+	echo "   defaults to 'mlflow-db' in this project's own database/values.yaml, but a"; \
+	echo "   coexisting project may own the live release with a different name, e.g."; \
+	echo "   agentops-example's 'maas-db' -- see ADR-0020)"; \
+	oc wait --for=condition=Available deployment/$$DB_NAME -n redhat-ods-applications --timeout=60s >/dev/null; \
+	echo "OK: PostgreSQL $$DB_NAME Available"
 	@echo "=== MLflow ==="
 	@i=0; until oc get pods -l app=mlflow -n redhat-ods-applications --no-headers 2>/dev/null | grep -q .; do \
 		i=$$((i+1)); if [ $$i -ge 18 ]; then echo "FAIL: no mlflow pod created after 90s"; exit 1; fi; \
@@ -337,11 +395,18 @@ validate:
 
 validate-cleanup:
 	@echo "=== Helm releases ==="
-	@RHOAI_COUNT=$$(helm list -f '^rhoai-' -q 2>/dev/null | wc -l | tr -d ' '); \
-	if [ "$$RHOAI_COUNT" -eq 0 ]; then \
-		echo "OK: no rhoai-* releases"; \
+	@REMAINING=""; \
+	for r in $(OPERATORS_RELEASE) $(PLATFORM_RELEASE) $(DATABASE_RELEASE) $(MLFLOW_RELEASE); do \
+		$(HELM) status "$$r" >/dev/null 2>&1 && REMAINING="$$REMAINING $$r"; \
+	done; \
+	if [ -z "$$REMAINING" ]; then \
+		echo "OK: none of this project's 4 rhoai-* releases remain"; \
+		echo "    (not asserting a global 'rhoai-*' count of 0: a coexisting"; \
+		echo "     project's own releases sharing the prefix, e.g."; \
+		echo "     agentops-example's rhoai-evalhub, are intentionally untouched"; \
+		echo "     by undeploy-all -- see ADR-0020)"; \
 	else \
-		echo "FAIL: $$RHOAI_COUNT rhoai-* releases still present"; exit 1; \
+		echo "FAIL: releases still present:$$REMAINING"; exit 1; \
 	fi
 	@echo "=== DSCInitialization ==="
 	@if oc get dscinitialization --no-headers 2>/dev/null | grep -q .; then \

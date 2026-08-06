@@ -258,7 +258,7 @@ cmd_full() {
   echo ""
   step "Full lifecycle complete"
   info "CRC is running with OpenClaw-in-OpenShell deployed and verified."
-  info "Control UI: https://openclaw-gw--openclaw-ui.$(get_apps_domain)/"
+  info "Control UI: https://${SANDBOX_NAME}--openclaw-ui.$(get_apps_domain)/"
   info "MLflow UI:  https://$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo '<run: oc get route mlflow -n redhat-ods-applications>')/"
   info "Stop CRC:   ./scripts/crc-lifecycle.sh stop"
   info "Teardown:   ./scripts/crc-lifecycle.sh teardown"

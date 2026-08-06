@@ -24,7 +24,11 @@ render_all_templates # needed for ${RENDERED_DIR}/openclaw.json in Step 3 below
 # Public hostname must equal OpenShell's {sandbox}--{service} service-routing
 # pattern -- see charts/oauth2-proxy/templates/route.yaml and deployment.yaml
 # for why (WebSocket Host-header bug in this oauth-proxy fork, ADR-0016).
-OAUTH_PROXY_ROUTE_HOST="openclaw-gw--openclaw-ui.${APPS_DOMAIN}"
+# Derived from $SANDBOX_NAME (not hardcoded "openclaw-gw") so a second,
+# differently-named deploy of this project's OpenClaw stack can coexist with
+# another project's on the same cluster without an OpenShift Route hostname
+# collision -- see docs/adrs/ADR-0020-shared-cluster-coexistence.md.
+OAUTH_PROXY_ROUTE_HOST="${SANDBOX_NAME}--openclaw-ui.${APPS_DOMAIN}"
 
 # ── Step 1: Session secret (Kubernetes Secret from host env var) ──────────────
 # Created out-of-band (not a Helm-templated resource) so it survives
@@ -53,6 +57,8 @@ helm upgrade --install oauth2-proxy "${PROJECT_DIR}/charts/oauth2-proxy" \
   --namespace "$NAMESPACE" --create-namespace \
   --set appsDomain="${APPS_DOMAIN}" \
   --set namespace="${NAMESPACE}" \
+  --set sandboxName="${SANDBOX_NAME}" \
+  --set openshellServiceName="${OPENSHELL_RELEASE_NAME}" \
   --wait --timeout 120s
 pass "oauth-proxy deployment ready"
 

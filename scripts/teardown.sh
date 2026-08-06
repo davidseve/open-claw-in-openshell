@@ -51,31 +51,30 @@ if command -v openshell &>/dev/null; then
 fi
 
 step "Uninstalling OpenShell + oauth-proxy Helm releases"
-helm uninstall openshell -n "$NAMESPACE" 2>/dev/null && info "openshell Helm release removed" || info "openshell Helm release not found"
+# The gRPC Route and the SCC RoleBinding are now rendered as part of the
+# "openshell" release itself (charts/openshell/templates/route.yaml,
+# scc-rolebinding.yaml) — `helm uninstall` removes both, no separate `oc
+# delete -f manifests/openshell-route.yaml` / `oc adm policy remove-scc-...`
+# needed anymore.
+helm uninstall "$OPENSHELL_RELEASE_NAME" -n "$NAMESPACE" 2>/dev/null && info "openshell Helm release removed" || info "openshell Helm release not found"
 helm uninstall oauth2-proxy -n "$NAMESPACE" 2>/dev/null && info "oauth2-proxy Helm release removed" || info "oauth2-proxy Helm release not found"
 
-step "Removing OpenShift Routes"
-oc delete -f "${PROJECT_DIR}/manifests/openshell-route.yaml" 2>/dev/null || true
+step "Removing legacy openclaw-ui Route (safety net)"
 # openclaw-ui (unauthenticated static-token Route) was retired in ADR-0016;
 # this delete is only a safety net for clusters still running the old manifest.
-# oauth-proxy's own Route/Deployment/Service/SA are cleaned up below by the
-# namespace deletion.
 oc -n "$NAMESPACE" delete route openclaw-ui 2>/dev/null || true
 
 step "Removing PKI and JWT secrets"
-oc -n "$NAMESPACE" delete secret openshell-server-tls openshell-client-tls openshell-jwt-keys 2>/dev/null || true
-
-step "Removing SCC binding"
-oc adm policy remove-scc-from-user privileged -z openshell-sandbox -n "$NAMESPACE" 2>/dev/null || true
+oc -n "$NAMESPACE" delete secret openshell-server-tls openshell-client-tls "${OPENSHELL_RELEASE_NAME}-jwt-keys" 2>/dev/null || true
 
 step "Deleting namespace: $NAMESPACE"
 oc delete ns "$NAMESPACE" --wait=false 2>/dev/null && info "Namespace deletion initiated" || info "Namespace not found"
 
 step "Removing local gateway registration and mTLS certs"
 if command -v openshell &>/dev/null; then
-  openshell gateway remove ocp 2>/dev/null || true
+  openshell gateway remove "$GATEWAY_NAME" 2>/dev/null || true
 fi
-rm -rf "$HOME/.config/openshell/gateways/ocp" 2>/dev/null || true
+rm -rf "$HOME/.config/openshell/gateways/${GATEWAY_NAME}" 2>/dev/null || true
 
 step "Cleaning up rendered templates"
 rm -rf "${RENDERED_DIR}" 2>/dev/null || true

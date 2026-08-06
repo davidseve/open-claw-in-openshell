@@ -76,7 +76,7 @@
     "trustedProxies": ["127.0.0.1", "::1", "10.217.0.0/22", "10.217.4.0/23", "192.168.0.0/16"],
     "controlUi": {
       "allowedOrigins": [
-        "https://openclaw-gw--openclaw-ui.__APPS_DOMAIN__"
+        "https://__SANDBOX_NAME__--openclaw-ui.__APPS_DOMAIN__"
       ],
       "dangerouslyDisableDeviceAuth": true
     },

@@ -131,6 +131,18 @@ Decision: ADR-0010 — Keycloak as OIDC broker; users authenticate with OCP cred
 - [x] ADR-0010: Document OIDC + OCP federation architecture decision
 - [x] Fix OpenClaw UI `allowedOrigins` for external access (`gateway.controlUi.allowedOrigins`)
 
+### Why OpenShell is first installed *without* OIDC (`values-ocp-no-oidc.yaml.tpl`)
+
+This project **always uses Keycloak** for the CLI/gRPC gateway auth path when `--with-oidc` is requested — `values-ocp-no-oidc.yaml.tpl` is not an alternative to Keycloak, it's a required transient bootstrap step, not a permanent config choice. There's a real chicken-and-egg dependency:
+
+1. The OIDC overlay (`values-ocp.yaml.tpl`) sets `openshell.server.oidc.caConfigMapName: openshell-oidc-ca` — a ConfigMap that `configure-oidc.sh` creates (from OCP's ingress CA) at OIDC-configuration time, **after** OpenShell and Keycloak both already exist. Installing OpenShell with the OIDC overlay from the very first `helm install` would reference a ConfigMap that doesn't exist yet.
+2. `scripts/crc-lifecycle.sh`'s `cmd_deploy()` therefore always runs Phase 5 (`deploy-openshell.sh`) with `WITH_OIDC=false` (using `values-ocp-no-oidc.yaml.tpl`, `allowUnauthenticatedUsers: true`), regardless of whether `--with-oidc` was passed to `crc-lifecycle.sh` itself.
+3. Only in Phase 7, if `--with-oidc` was requested, does `configure-oidc.sh` create the `openshell-oidc-ca` ConfigMap and then `helm upgrade` the *same* release with `values-ocp.yaml.tpl` (the OIDC overlay), flipping `allowUnauthenticatedUsers` to `false` and enabling Keycloak-backed JWT auth on the gateway.
+
+Net effect: on a `--with-oidc` deploy, the no-OIDC state only exists briefly between Phase 5 and Phase 7 — the final, steady state has Keycloak enforced. It only remains the *permanent* state when deploying without `--with-oidc` (e.g. `crc-lifecycle.sh deploy` with no flags, or `full --minimal`), which is a deliberately lighter, unauthenticated-CLI profile, not the recommended default.
+
+**If this two-step bootstrap is ever changed** (e.g. by having the chart tolerate a missing `caConfigMapName` at install time, or by pre-creating the ConfigMap earlier in `bootstrap-ocp.sh`), update this section, the header comments in both `charts/openshell/values-ocp.yaml.tpl` / `values-ocp-no-oidc.yaml.tpl`, and `scripts/crc-lifecycle.sh`'s Phase 5 comment together — they currently all describe the same mechanism and would otherwise drift out of sync.
+
 ## Phase 7b: OIDC Authentication for OpenClaw UI
 
 Run: `./scripts/deploy-oauth2-proxy.sh`
@@ -480,6 +492,21 @@ Discovered from a real chat-session report (the agent successfully edited `AGENT
 - [ ] Verify OpenClaw's startup-context loader can still find these files if relocated (symlinks from `/sandbox/workspace/*.md` into the protected subdir, or a config option pointing at a custom prompt directory)
 - [ ] Add a real write/delete attempt (not just a `stat` mode check) to `scripts/verify.sh` Layer 8b, mirroring the existing Landlock write-test pattern already used for `/sandbox/.openclaw/`
 - [ ] Re-run the live repro from `docs/constraints.md` #24 against the fix to confirm both the in-place-write AND unlink+recreate vectors are blocked
+
+## Phase 14: Declarative Simplification + Shared-Cluster Coexistence
+
+**Status: COMPLETE** — Objective: port back the declarative patterns learned while building `agentops-example` from this project's stack, replacing imperative `oc`/script steps with Helm-native mechanisms, and enable both projects to coexist on one OCP cluster without losing or changing existing functionality (in particular, `trusted-proxy` auth stays untouched — no regression to a static gateway token).
+
+- [x] **Declarative OpenShell wrapper chart** (`charts/openshell/`): SCC `RoleBinding` and gRPC `Route` now ship as Helm templates instead of `scripts/common.sh`'s `grant_privileged_scc()` and `manifests/openshell-route.yaml`'s `oc apply`. `helm uninstall` now cleanly removes them too. Decision: [ADR-0019](docs/adrs/ADR-0019-declarative-openshell-wrapper-chart.md)
+- [x] **MLflow RBAC auto-detection**: the `mlflow-integration` `ClusterRole` lookup (previously `oc get clusterroles` in `scripts/wire-rhoai-mlflow-tracing.sh`) is now a Helm `lookup` call inside the chart template
+- [x] **`openclaw-mlflow-integration` standalone chart** (`charts/rhoai/openclaw-integration/`): RBAC, SA-token Secret, and experiment-creation Job extracted out of the shared `rhoai-mlflow` release into their own release, so re-running `wire-rhoai-mlflow-tracing.sh` (or a second project's install) can no longer reset `openclawIntegration.enabled` and delete tokens on the shared release
+- [x] **Detect-and-skip for shared RHOAI/MLflow** (`charts/rhoai/Makefile`): each target (`deploy-operators`, `deploy-platform`, `deploy-database`, `deploy-mlflow`) checks `helm status` first and skips if already installed by another project on the same cluster; `ensure-mlflowoperator-managed` idempotently patches the shared `DataScienceCluster` without disturbing other components
+- [x] **Namespace/`SANDBOX_NAME` parametrization**: oauth2-proxy's Route host and CORS `allowedOrigins`, and the OpenClaw config's `allowedOrigins`, now derive from `${SANDBOX_NAME}`/`__SANDBOX_NAME__` instead of a hardcoded `openclaw-gw`, so a second coexisting deployment can pick a different sandbox name and namespace without a hostname collision
+- [x] **Cursor governance ported**: `.cursor/rules/` (`adr-alignment`, `documentation-sources`, `no-secrets`, `technology-usage-docs`) and `.cursor/skills/` (`adr`, `no-secrets`, `document-feature`, `create-pr`) adapted from `agentops-example` to this repo's doc structure (`docs/adrs/`, `README.md` ADR index, `docs/constraints.md`)
+- [x] ADR-0020: shared-cluster coexistence strategy (namespaces, hostnames, detect-and-skip, what stays independent per project)
+- [x] Confirmed **no functional regression**: `trusted-proxy` auth (ADR-0012) is unchanged — this project already had no static gateway token, unlike `agentops-example`, which had regressed to `auth.mode: "none"` for unrelated environment reasons and was explicitly left untouched by this work
+- [ ] Cluster validation: `helm lint`/`helm template` for `charts/openshell` and `charts/rhoai/openclaw-integration`, then a full solo `crc-lifecycle.sh full --fresh` smoke test
+- [ ] Coexistence validation: deploy this project with an alternate `NAMESPACE`/`SANDBOX_NAME` on a cluster where `agentops-example` is already live; confirm both UIs, both CLIs, and both MLflow trace streams work simultaneously
 
 ## References
 

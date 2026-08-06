@@ -1,0 +1,23 @@
+{{- if .Values.openshift.scc.privilegedSandbox }}
+# Declarative replacement for `oc adm policy add-scc-to-user privileged -z
+# openshell-sandbox` (scripts/common.sh's old grant_privileged_scc()). Applied
+# as a normal resource in the same release as the gateway itself — the
+# referenced ServiceAccount subject doesn't need to pre-exist for the
+# RoleBinding to apply successfully, and both are part of this one release.
+# See docs/adrs/ADR-0006-scc-privileged-sandbox.md.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openclaw-openshell.fullname" . }}-sandbox-privileged-scc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openclaw-openshell.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openclaw-openshell.sandboxSA" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

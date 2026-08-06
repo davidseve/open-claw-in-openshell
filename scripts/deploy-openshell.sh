@@ -18,19 +18,35 @@ if [[ "${WITH_OIDC:-true}" == "false" ]]; then
   VALUES_FILE="${RENDERED_DIR}/values-ocp-no-oidc.yaml"
 fi
 
-step "Installing OpenShell Helm chart v${OPENSHELL_CHART_VERSION}"
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version "$OPENSHELL_CHART_VERSION" \
+step "Resolving OpenShell chart dependency (pinned in Chart.yaml/Chart.lock)"
+helm dependency build "${PROJECT_DIR}/charts/openshell"
+
+step "Installing OpenShell (single release: namespace extras + gateway, v${OPENSHELL_CHART_VERSION})"
+# The server's mTLS cert is minted by the subchart's own certgen Job with
+# only default SANs (localhost/cluster-internal names) — the external Route
+# hostname must be added explicitly via pkiInitJob.serverDnsNames, or
+# CLI/gRPC clients connecting through the Route fail with "certificate not
+# valid for name ...". Computed here (not in values-ocp*.yaml.tpl) because it
+# depends on BOTH namespace and apps domain: a second, differently-namespaced
+# deploy of this chart (coexisting with another project on the same cluster)
+# needs its own correct SAN instead of a hardcoded "openshell" literal. Each
+# SAN is its own --set-string with an indexed path rather than one --set
+# with a brace list — found live (agentops-example, 2026-08-05) that a
+# literal comma inside a single value confuses some shells/Make argument
+# parsing, silently truncating the value.
+helm upgrade --install "$OPENSHELL_RELEASE_NAME" "${PROJECT_DIR}/charts/openshell" \
   --namespace "$NAMESPACE" \
   --create-namespace \
-  -f "$VALUES_FILE"
+  -f "$VALUES_FILE" \
+  --set global.appsDomain="${APPS_DOMAIN}" \
+  --set-string "openshell.pkiInitJob.serverDnsNames[0]=openshell-gw-${NAMESPACE}.${APPS_DOMAIN}" \
+  --set-string "openshell.pkiInitJob.serverDnsNames[1]=*.${APPS_DOMAIN}"
 
 step "Waiting for gateway rollout (up to 600s for initial image pull)"
-oc -n "$NAMESPACE" rollout status statefulset/openshell --timeout=600s
+oc -n "$NAMESPACE" rollout status "statefulset/${OPENSHELL_RELEASE_NAME}" --timeout=600s
 
 step "Waiting for PKI secrets (created by init job)"
-for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
+for secret in openshell-server-tls openshell-client-tls "${OPENSHELL_RELEASE_NAME}-jwt-keys"; do
   retries=0
   while ! oc -n "$NAMESPACE" get secret "$secret" &>/dev/null; do
     if [[ $retries -ge 60 ]]; then
@@ -42,9 +58,6 @@ for secret in openshell-server-tls openshell-client-tls openshell-jwt-keys; do
   done
   info "Secret $secret exists"
 done
-
-step "Applying OpenShift Routes (passthrough TLS)"
-oc apply -f "${PROJECT_DIR}/manifests/openshell-route.yaml"
 
 step "Detecting gateway Route hostname"
 GW_ROUTE=""
@@ -80,10 +93,28 @@ step "Registering gateway with CLI (mTLS)"
 # likely host-side memory pressure/scheduling delays on the box running the
 # CRC VM, not anything wrong with the certs/route/pod itself).
 # Global OPENSHELL_GATEWAY_INSECURE breaks client-cert mTLS (constraints #18/#19).
+#
+# `openshell status` alone is NOT enough to decide whether to skip
+# re-registration: it only reports on whatever gateway alias is *currently
+# selected/active* in the CLI, which — when coexisting with another
+# project's own gateway registered under a different alias on this same
+# machine — could easily be that OTHER project's alias, not ours. Found
+# live: with agentops-example's "ocp" alias already selected and healthy,
+# this check used to report "already connected" without ever registering or
+# selecting THIS project's own $GATEWAY_NAME, silently leaving every
+# subsequent `openshell` CLI call (provider creation, sandbox launch) aimed
+# at the wrong project's gateway. Explicitly select $GATEWAY_NAME first so
+# `openshell status` below can only report on the gateway we actually care
+# about.
 unset OPENSHELL_GATEWAY_INSECURE
-if ! openshell status &>/dev/null; then
+GATEWAY_ALREADY_REGISTERED=false
+if openshell gateway list 2>/dev/null | awk -v n="$GATEWAY_NAME" 'NR>1 { g=$1; sub(/^\*/,"",g); if (g==n) found=1 } END{exit !found}'; then
+  GATEWAY_ALREADY_REGISTERED=true
+  openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
+fi
+if [[ "$GATEWAY_ALREADY_REGISTERED" != "true" ]] || ! openshell status &>/dev/null; then
   step "Extracting mTLS client certificates"
-  MTLS_DIR="$HOME/.config/openshell/gateways/ocp/mtls"
+  MTLS_DIR="$HOME/.config/openshell/gateways/${GATEWAY_NAME}/mtls"
   # Wipe any stale bundle first: a leftover client.p12 built against a
   # previous cluster's CA (e.g. after `crc-lifecycle.sh full --fresh`, which
   # only recreates the VM and doesn't touch this host-local CLI state) will
@@ -99,8 +130,13 @@ if ! openshell status &>/dev/null; then
     -o jsonpath='{.data.tls\.key}' | base64 -d > "$MTLS_DIR/tls.key"
   info "Certificates saved to $MTLS_DIR"
 
-  openshell gateway remove ocp 2>/dev/null || true
-  openshell gateway add "https://${GW_ROUTE}" --local --name ocp
+  openshell gateway remove "$GATEWAY_NAME" 2>/dev/null || true
+  openshell gateway add "https://${GW_ROUTE}" --local --name "$GATEWAY_NAME"
+  # Explicit, not relying on `add` to auto-select: on a machine with more
+  # than one registered gateway (coexistence), the CLI's "active" gateway
+  # after `add` shouldn't be assumed — select it by name so every command
+  # below (`openshell status`, create_provider) definitely targets this one.
+  openshell gateway select "$GATEWAY_NAME"
 fi
 
 retries=0

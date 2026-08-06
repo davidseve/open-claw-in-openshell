@@ -1,0 +1,39 @@
+---
+description: Enforce usage-documentation updates whenever a stack technology is added or modified
+alwaysApply: true
+---
+
+# Technology Usage Documentation
+
+When a session **adds or modifies** a technology in the stack, the agent MUST create or update its usage documentation in `docs/` **in the same session** by following the `document-feature` skill.
+
+## Triggers
+
+| Change type | Examples |
+|---|---|
+| New component added | Helm chart, operator subscription, script, plugin/policy integration |
+| Version or image changed | Chart version bump (e.g. OpenShell `0.0.83` pin), operator CSV update, image tag/digest change |
+| Deploy path or prereqs changed | New/renamed script, Makefile target, values file restructure, new dependency |
+| Verify / troubleshoot updated | New `verify.sh` check, validated error workaround (candidate for `docs/constraints.md`) |
+| First cluster validation | Component deployed and confirmed working for the first time |
+
+## Required action
+
+1. Read the `document-feature` skill and follow its full checklist.
+2. Create or update the primary guide (`docs/<component>-installation.md`, `docs/constraints.md`, or a new ADR under `docs/adrs/` if it's an architectural decision rather than an implementation note).
+3. Complete cross-links (README.md's ADR index / component table, AGENTS.md, ROADMAP.md).
+4. Record validated versions and cite official sources per the `documentation-sources` rule.
+
+## Scope boundaries
+
+| Concern | Handled by |
+|---|---|
+| Architecture decisions (add/swap/remove component) | `adr` skill + `adr-alignment` rule |
+| CRD fields, operator channels, API endpoints | `documentation-sources` rule |
+| Install/verify/troubleshoot procedures, constraint entries | **This rule** + `document-feature` skill |
+
+## Exceptions
+
+- Typo-only or formatting-only fixes to existing docs
+- Refactors that do not change external behavior, versions, or deploy steps (e.g. a mechanism change already covered by an ADR Addendum, like ADR-0019's imperative→declarative SCC binding)
+- Changes scoped entirely to ADR or doc files that are already aligned

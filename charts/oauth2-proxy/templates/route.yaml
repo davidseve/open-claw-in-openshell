@@ -24,7 +24,7 @@ metadata:
   annotations:
     haproxy.router.openshift.io/timeout: 3600s
 spec:
-  host: openclaw-gw--openclaw-ui.{{ .Values.appsDomain }}
+  host: {{ .Values.sandboxName }}--openclaw-ui.{{ .Values.appsDomain }}
   to:
     kind: Service
     name: oauth-proxy
