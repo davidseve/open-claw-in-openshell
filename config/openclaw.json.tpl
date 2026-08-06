@@ -7,8 +7,26 @@
         "api": "openai-completions",
         "models": [
           {
+            "id": "gpt-oss-120b",
+            "name": "GPT-OSS 120B",
+            "reasoning": true,
+            "input": ["text"],
+            "contextWindow": 32768,
+            "maxTokens": 8192,
+            "compat": { "supportsStore": false }
+          },
+          {
+            "id": "llama-scout-17b",
+            "name": "Llama Scout 17B",
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 400000,
+            "maxTokens": 8192,
+            "compat": { "supportsStore": false }
+          },
+          {
             "id": "claude-sonnet-4-6",
-            "name": "Claude Sonnet 4.6",
+            "name": "Claude Sonnet 4.6 (backup)",
             "reasoning": true,
             "input": ["text", "image"],
             "contextWindow": 200000,
@@ -21,7 +39,15 @@
   },
   "agents": {
     "defaults": {
-      "model": { "primary": "maas/claude-sonnet-4-6" },
+      "model": {
+        "primary": "maas/gpt-oss-120b",
+        "fallbacks": ["maas/llama-scout-17b"]
+      },
+      "models": {
+        "maas/gpt-oss-120b": { "alias": "GPT-OSS" },
+        "maas/llama-scout-17b": { "alias": "Scout-fallback" },
+        "maas/claude-sonnet-4-6": { "alias": "Sonnet-backup" }
+      },
       "workspace": "/sandbox/workspace"
     }
   },

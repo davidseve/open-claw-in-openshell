@@ -5,7 +5,7 @@ This file is for your specifics — the stuff that's unique to this deployment.
 ## Environment
 
 - **Platform**: OpenShift Container Platform (OCP)
-- **Inference**: Red Hat MaaS (LiteLLM) → Claude Sonnet 4.6
+- **Inference**: Red Hat MaaS (LiteLLM) → GPT-OSS 120B (`maas/gpt-oss-120b`; Claude Sonnet 4.6 kept as disabled backup)
 - **Observability**: RHOAI-managed MLflow (traces + prompt registry) + OTel Collector + Tempo (infra logs/metrics only)
 - **Auth**: OpenShift-native OAuth via oauth-proxy (browser UI, ADR-0016); Keycloak OIDC remains for the CLI/gRPC gateway path only
 

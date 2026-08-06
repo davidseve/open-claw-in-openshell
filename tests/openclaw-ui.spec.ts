@@ -8,7 +8,7 @@ test.describe('OpenClaw Control UI', () => {
     await page.goto('/');
     await expect(page).toHaveTitle('OpenClaw Control');
     await expect(page.getByPlaceholder(/Message/)).toBeVisible();
-    await expect(page.getByText(/claude-sonnet|Claude Sonnet/).first()).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText(/gpt-oss|GPT-OSS/).first()).toBeVisible({ timeout: 10000 });
   });
 
   test('sidebar navigation is present', async ({ page }) => {
@@ -27,7 +27,7 @@ test.describe('OpenClaw Control UI', () => {
     await expect(sendButton).toBeVisible();
   });
 
-  test('E2E chat: Claude responds via MaaS', async ({ page }) => {
+  test('E2E chat: model responds via MaaS', async ({ page }) => {
     await page.goto('/');
 
     const messageInput = page.getByPlaceholder(/Message/);
@@ -52,7 +52,7 @@ test.describe('OpenClaw Control UI', () => {
   test('chat completions HTTP API is disabled', async ({ request }) => {
     const resp = await request.post('/v1/chat/completions', {
       data: {
-        model: 'claude-sonnet-4-6',
+        model: 'gpt-oss-120b',
         messages: [{ role: 'user', content: 'ping' }],
       },
     });
