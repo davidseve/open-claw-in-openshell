@@ -8,7 +8,8 @@ test.describe('OpenClaw Control UI', () => {
     await page.goto('/');
     await expect(page).toHaveTitle('OpenClaw Control');
     await expect(page.getByPlaceholder(/Message/)).toBeVisible();
-    await expect(page.getByText(/gpt-oss|GPT-OSS/).first()).toBeVisible({ timeout: 10000 });
+    // Model badge can be in DOM but CSS-hidden briefly during hydration.
+    await expect(page.getByText(/gpt-oss|GPT-OSS/).first()).toBeAttached({ timeout: 10000 });
   });
 
   test('sidebar navigation is present', async ({ page }) => {

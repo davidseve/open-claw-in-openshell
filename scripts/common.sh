@@ -354,24 +354,110 @@ sandbox_run() {
   # unconditionally (cheap, local-only) before every call instead of
   # trusting whatever was last selected.
   openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
-  printf '%s && exit\n' "$1" \
-    | timeout 15 openshell sandbox connect "$SANDBOX_NAME" 2>&1 || true
+  local out
+  out=$(printf '%s && exit\n' "$1" \
+    | timeout 15 openshell sandbox connect "$SANDBOX_NAME" 2>&1 || true)
+  # Long verify runs outlive the ~5m access_token; refresh once and retry.
+  if echo "$out" | grep -qiE "OIDC token|invalid token|ExpiredSignature|valid authentication credentials|Token is not active"; then
+    ensure_oidc_token >/dev/null 2>&1 || true
+    out=$(printf '%s && exit\n' "$1" \
+      | timeout 15 openshell sandbox connect "$SANDBOX_NAME" 2>&1 || true)
+  fi
+  printf '%s\n' "$out"
 }
 
-# Refresh OIDC token if expired. Call before any openshell CLI command
-# that requires authentication (provider create, sandbox list, etc.).
-# Uses headless password grant — no browser needed.
-# NOTE: `openshell status` returns 0 even with expired OIDC (uses mTLS),
-# so we test `sandbox list` which requires a valid bearer token.
+# Lightweight OIDC password-grant refresh (no Helm upgrade). Writes
+# ~/.config/openshell/gateways/$GATEWAY_NAME/oidc_token.json so the CLI can
+# call sandbox/provider APIs again after access_token expiry (~5m).
+# Requires APPS_DOMAIN (call detect_environment first). Returns 0 on success.
+_refresh_oidc_password_grant() {
+  local kc_issuer gw_url gw_config_dir kc_user kc_pass token_response
+  local access_token refresh_token expires_in now expires_at
+
+  if [[ -z "${APPS_DOMAIN:-}" ]]; then
+    detect_environment
+  fi
+
+  kc_issuer="https://keycloak-openshell-keycloak.${APPS_DOMAIN}/realms/openshell"
+  gw_url="https://openshell-gw-${NAMESPACE}.${APPS_DOMAIN}"
+  gw_config_dir="${HOME}/.config/openshell/gateways/${GATEWAY_NAME}"
+  mkdir -p "$gw_config_dir"
+
+  # Ensure local gateway metadata exists (CLI registration). Do NOT run
+  # configure-oidc.sh here — that re-runs helm upgrade + rollout.
+  if [[ ! -f "${gw_config_dir}/metadata.json" ]]; then
+    cat > "${gw_config_dir}/metadata.json" << EOF
+{
+  "name": "${GATEWAY_NAME}",
+  "gateway_endpoint": "${gw_url}",
+  "is_remote": false,
+  "gateway_port": 0,
+  "auth_mode": "oidc",
+  "oidc": {
+    "issuer": "${kc_issuer}",
+    "client_id": "openshell-cli"
+  }
+}
+EOF
+  fi
+
+  kc_user="${KC_USER:-admin}"
+  kc_pass="${KC_PASS:-admin}"
+  token_response=$(curl -sk -X POST "${kc_issuer}/protocol/openid-connect/token" \
+    -d "client_id=openshell-cli" \
+    -d "username=${kc_user}" \
+    -d "password=${kc_pass}" \
+    -d "grant_type=password" 2>/dev/null || true)
+
+  access_token=$(echo "$token_response" | jq -r '.access_token // empty' 2>/dev/null || true)
+  refresh_token=$(echo "$token_response" | jq -r '.refresh_token // empty' 2>/dev/null || true)
+  expires_in=$(echo "$token_response" | jq -r '.expires_in // 300' 2>/dev/null || echo 300)
+
+  if [[ -z "$access_token" || "$access_token" == "null" ]]; then
+    error "OIDC password grant failed: $(echo "$token_response" | jq -r '.error_description // .error // "unknown"' 2>/dev/null || echo unknown)"
+    return 1
+  fi
+
+  now=$(date +%s)
+  expires_at=$((now + expires_in))
+  cat > "${gw_config_dir}/oidc_token.json" << EOF
+{
+  "access_token": "${access_token}",
+  "refresh_token": "${refresh_token}",
+  "expires_at": ${expires_at},
+  "issuer": "${kc_issuer}",
+  "client_id": "openshell-cli"
+}
+EOF
+  chmod 600 "${gw_config_dir}/oidc_token.json"
+  openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
+  return 0
+}
+
+# Ensure openshell CLI has a usable OIDC bearer token. Call before any
+# openshell command that needs auth (sandbox list/connect, provider, …).
+# NOTE: `openshell status` can succeed with expired OIDC (mTLS) — probe
+# `sandbox list` instead. On expiry, refreshes via Keycloak password grant
+# only (no Helm). Returns 0 if sandbox list works, 1 otherwise.
 ensure_oidc_token() {
   enable_openshell_oidc_insecure
   openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
-  if openshell sandbox list &>/dev/null; then return 0; fi
-  if [[ -x "${SCRIPT_DIR}/configure-oidc.sh" ]]; then
-    info "OIDC token expired, refreshing..."
-    OPENSHELL_HEADLESS=1 KC_USER="${KC_USER:-admin}" KC_PASS="${KC_PASS:-admin}" \
-      "${SCRIPT_DIR}/configure-oidc.sh" >/dev/null 2>&1 || warn "OIDC refresh failed"
+  if openshell sandbox list &>/dev/null; then
+    return 0
   fi
+
+  info "OIDC token missing/expired — refreshing via Keycloak password grant..."
+  if ! _refresh_oidc_password_grant; then
+    return 1
+  fi
+
+  if openshell sandbox list &>/dev/null; then
+    info "OIDC token refreshed (sandbox list OK)"
+    return 0
+  fi
+
+  error "OIDC refresh wrote a token but sandbox list still fails (gateway/OIDC misconfigured?)"
+  return 1
 }
 
 # Create the MaaS provider. Idempotent — skips if already exists.

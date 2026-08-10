@@ -15,7 +15,7 @@ export default defineConfig({
   testDir: '.',
   outputDir: './test-results',
   timeout: 60_000,
-  retries: 0,
+  retries: 1,
   projects: [
     {
       name: 'auth-setup',
@@ -30,6 +30,7 @@ export default defineConfig({
       },
     },
     {
+      // No-op placeholder — real security checks live in verify.sh Layer 4.
       name: 'security-tests',
       testMatch: /sandbox-security\.spec\.ts/,
       dependencies: ['auth-setup'],

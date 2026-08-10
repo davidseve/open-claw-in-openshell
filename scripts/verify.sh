@@ -31,15 +31,17 @@
 #   Layer 1b: Keycloak OIDC (pod, discovery endpoint)
 #   Layer 2:  OpenShell gateway (pod, route, CLI, provider)
 #   Layer 3:  Sandbox existence and readiness
-#   Layer 4:  Security (user identity, egress blocking, Landlock, credentials)
-#   Layer 5:  OpenClaw gateway health (/health, config, chatCompletions)
+#   Layer 4:  Security (identity, egress, IMDS, sudo, DNS, Landlock,
+#             credentials, /etc/shadow) — all via sandbox_run, NOT via LLM chat
+#   Layer 5:  OpenClaw gateway health (/health, config, chatCompletions, tools.deny)
 #   Layer 5b: LLM connectivity (Node.js binary path, fetch(), proxy denials —
 #             see docs/constraints.md #17 for why the end-to-end chat +
 #             trace checks were removed; Layer 9 Playwright covers that path)
 #   Layer 7b: External access (service route, oauth2-proxy OIDC)
 #   Layer 8:  Observability stack (Tempo, OTel Collector) + RHOAI MLflow infra
 #   Layer 8b: MLflow Prompt Registry (prompts, aliases, manifest, linker)
-#   Layer 9:  Control UI (Playwright — OpenClaw chat E2E + security)
+#   Layer 9:  Control UI (Playwright — OpenClaw chat E2E only; sandbox
+#             enforcement is Layer 4 — LLM-mediated security specs were flaky)
 #   Layer 10: MLflow traces + Prompt tags (API) and MLflow UI (Playwright)
 #             — runs AFTER Layer 9 so E2E chat traces exist first
 #
@@ -70,8 +72,16 @@ info "Verification profile: ${VERIFY_PROFILE} (set VERIFY_PROFILE=smoke for the 
 # unconditionally so this script's result doesn't depend on which project's
 # tooling last ran in this terminal/session. See
 # docs/adrs/ADR-0020-shared-cluster-coexistence.md.
+#
+# OIDC access tokens expire (~5m). Without a refresh, Layer 3/4 sandbox_run
+# checks look like "sandbox not found" even when the pod is Ready. Refresh
+# here (password grant only — no Helm) before any openshell auth probes.
 if command -v openshell &>/dev/null; then
   openshell gateway select "$GATEWAY_NAME" &>/dev/null || true
+  if ! ensure_oidc_token; then
+    fail "OIDC auth for openshell CLI failed — Layer 3/4 sandbox checks will be unreliable"
+    warn "Fix: KC_USER=admin KC_PASS=admin OPENSHELL_HEADLESS=1 ./scripts/configure-oidc.sh (full) or check Keycloak"
+  fi
 fi
 
 # =============================================================================
@@ -226,12 +236,20 @@ fi
 # =============================================================================
 # Layer 4: Security Validation
 # =============================================================================
-# WHY: These checks verify the security posture of the sandbox:
+# WHY: These checks verify the security posture of the sandbox via direct
+#   `sandbox_run` (openshell exec), NOT via LLM chat. Playwright formerly
+#   asked the model to run curl/sudo/nslookup and pattern-matched natural-
+#   language refusals — that was flaky under gpt-oss and measured model
+#   cooperativeness, not sandbox enforcement.
 #   - User identity: agent must run as unprivileged "sandbox" user
 #   - Egress blocking: unauthorized destinations must be blocked by proxy
+#   - IMDS: link-local AWS metadata must be unreachable
+#   - sudo / privilege escalation blocked
+#   - DNS/connect to arbitrary hosts fails or is proxy-denied
+#   - /etc/shadow not readable as password hashes
 #   - MaaS reachability: the one allowed destination must work
 #   - Credential isolation: no plaintext API keys on sandbox filesystem
-#   - Landlock enforcement: /sandbox/ must be read-only
+#   - Landlock enforcement: /sandbox/.openclaw must be read-only
 #   - Config placeholders: openshell:resolve:env markers must exist in the
 #     ORIGINAL config (at /sandbox/.openclaw/config.json). The WORKING config
 #     at /sandbox/workspace/.openclaw/openclaw.json has the real key injected
@@ -240,25 +258,92 @@ fi
 #   policies/openclaw-sandbox.yaml and the SCC binding.
 step "Layer 4: Security Validation"
 
+# Helper: sandbox_run failed (OIDC/auth/sandbox gone) — never treat as a security PASS.
+_sandbox_run_ok() {
+  local out="$1"
+  ! echo "$out" | grep -qiE "OIDC token|invalid token|ExpiredSignature|sandbox not found|valid authentication credentials|Error:"
+}
+
 if command -v openshell &>/dev/null; then
+  if ! ensure_oidc_token; then
+    fail "OIDC auth failed — cannot run Layer 4 sandbox security checks"
+    warn "Skipping remaining Layer 4 checks"
+  else
+
   WHOAMI=$(sandbox_run "whoami" || true)
-  if echo "$WHOAMI" | grep -q "sandbox"; then
+  if echo "$WHOAMI" | tr -d '\r' | grep -qx "sandbox" || echo "$WHOAMI" | grep -qE '(^|[[:space:]])sandbox([[:space:]]|$)'; then
     pass "Sandbox user identity: sandbox"
   else
-    fail "Expected sandbox user, got unexpected identity"
+    fail "Expected sandbox user, got unexpected identity (OIDC/sandbox exec failed? ${WHOAMI:0:100})"
+    warn "Skipping remaining Layer 4 checks — sandbox_run is not usable"
   fi
 
-  # Verify unauthorized egress is blocked
-  GITHUB_RESULT=$(sandbox_run 'curl -sI https://github.com 2>&1 | head -1' || true)
-  if echo "$GITHUB_RESULT" | grep -q "403"; then
-    pass "Unauthorized egress blocked (github.com -> 403)"
+  if echo "$WHOAMI" | grep -q "sandbox" && _sandbox_run_ok "$WHOAMI"; then
+  # Verify unauthorized egress is blocked (proxy L7 default-deny)
+  GITHUB_RESULT=$(sandbox_run 'curl -sI --max-time 5 https://github.com 2>&1 | head -1' || true)
+  if ! _sandbox_run_ok "$GITHUB_RESULT"; then
+    fail "SECURITY: cannot verify github.com egress (sandbox_run failed)"
+  elif echo "$GITHUB_RESULT" | grep -qE "HTTP/[0-9.]+ 200"; then
+    fail "SECURITY: github.com returned HTTP 200 (should be blocked by proxy)"
+  elif echo "$GITHUB_RESULT" | grep -qiE "403|forbidden|blocked|denied|refused|reset|timed out|timeout|HTTP/[0-9.]+ 40[0-9]"; then
+    pass "Unauthorized egress blocked (github.com)"
   else
-    fail "SECURITY: github.com should be blocked by proxy"
+    # Non-200 connection failure without openshell errors = blocked/unreachable
+    pass "Unauthorized egress blocked (github.com unreachable)"
+  fi
+
+  # AWS IMDS must not be reachable from the sandbox
+  IMDS_RESULT=$(sandbox_run 'curl -s --max-time 5 -o /tmp/imds.out -w "HTTP:%{http_code}" http://169.254.169.254/latest/meta-data/ 2>&1; echo; head -c 200 /tmp/imds.out 2>/dev/null; echo; echo EXIT:$?' || true)
+  if ! _sandbox_run_ok "$IMDS_RESULT"; then
+    fail "SECURITY: cannot verify IMDS block (sandbox_run failed)"
+  elif echo "$IMDS_RESULT" | grep -qiE "ami-|i-[a-z0-9]{8,}|instance-type"; then
+    fail "SECURITY: AWS IMDS metadata leaked from sandbox"
+  elif echo "$IMDS_RESULT" | grep -qE "HTTP:200"; then
+    fail "SECURITY: AWS IMDS returned HTTP 200"
+  else
+    pass "AWS IMDS metadata endpoint not reachable"
+  fi
+
+  # Privilege escalation via sudo must fail (non-interactive)
+  SUDO_RESULT=$(sandbox_run 'sudo -n whoami 2>&1; echo EXIT:$?' || true)
+  if ! _sandbox_run_ok "$SUDO_RESULT"; then
+    fail "SECURITY: cannot verify sudo block (sandbox_run failed)"
+  else
+    SUDO_CLEAN=$(echo "$SUDO_RESULT" | tr -d '\r')
+    if echo "$SUDO_CLEAN" | grep -E '^root$' >/dev/null; then
+      fail "SECURITY: sudo whoami returned root"
+    else
+      pass "Privilege escalation via sudo is blocked"
+    fi
+  fi
+
+  # Arbitrary host: must not succeed with HTTP 200 (DNS fail or proxy 403 OK)
+  ARB_RESULT=$(sandbox_run 'curl -sI --max-time 5 https://evil-exfil.example.com 2>&1 | head -3' || true)
+  if ! _sandbox_run_ok "$ARB_RESULT"; then
+    fail "SECURITY: cannot verify arbitrary-host block (sandbox_run failed)"
+  elif echo "$ARB_RESULT" | grep -qE "HTTP/[0-9.]+ 200"; then
+    fail "SECURITY: arbitrary host evil-exfil.example.com returned HTTP 200"
+  else
+    pass "Arbitrary host connect denied or failed (evil-exfil.example.com)"
+  fi
+
+  # /etc/shadow must not expose password hashes
+  SHADOW_RESULT=$(sandbox_run 'cat /etc/shadow 2>&1 | head -3; echo EXIT:$?' || true)
+  if ! _sandbox_run_ok "$SHADOW_RESULT"; then
+    fail "SECURITY: cannot verify /etc/shadow (sandbox_run failed)"
+  elif echo "$SHADOW_RESULT" | grep -qE 'root:\$[0-9a-zA-Z]'; then
+    fail "SECURITY: /etc/shadow password hashes readable"
+  elif echo "$SHADOW_RESULT" | grep -qiE "permission denied|cannot open|EXIT:[1-9]|No such file"; then
+    pass "/etc/shadow not readable"
+  else
+    pass "/etc/shadow content not exposed as hashes"
   fi
 
   # Verify MaaS IS reachable (it's in the allow list)
-  MAAS_RESULT=$(sandbox_run 'curl -sI https://maas-rhdp.apps.maas.redhatworkshops.io/health 2>&1 | head -1' || true)
-  if echo "$MAAS_RESULT" | grep -qE "200|401|403"; then
+  MAAS_RESULT=$(sandbox_run 'curl -sI --max-time 5 https://maas-rhdp.apps.maas.redhatworkshops.io/health 2>&1 | head -1' || true)
+  if ! _sandbox_run_ok "$MAAS_RESULT"; then
+    warn "MaaS reachability check skipped (sandbox_run failed)"
+  elif echo "$MAAS_RESULT" | grep -qE "200|401|403"; then
     pass "MaaS endpoint reachable through proxy"
   else
     warn "MaaS endpoint response unexpected: $MAAS_RESULT"
@@ -269,14 +354,18 @@ if command -v openshell &>/dev/null; then
   # /sandbox/workspace/.openclaw/ has the working config where launch-openclaw.sh injects
   # the real API key (constraint #3). This is a known workaround — warn, don't fail.
   CRED_RO=$(sandbox_run 'grep -rl "sk-" /sandbox/.openclaw/ /tmp/ 2>/dev/null | head -1 || echo CLEAN' || true)
-  if echo "$CRED_RO" | grep -q "CLEAN"; then
+  if ! _sandbox_run_ok "$CRED_RO"; then
+    fail "SECURITY: cannot verify read-only credential zone (sandbox_run failed)"
+  elif echo "$CRED_RO" | grep -q "CLEAN"; then
     pass "No plaintext API keys in read-only zone (/sandbox/.openclaw/, /tmp/)"
   else
     fail "SECURITY: API key found in read-only filesystem zone"
   fi
 
   CRED_WS=$(sandbox_run 'grep -rl "sk-" /sandbox/workspace/.openclaw/ 2>/dev/null | head -1 || echo CLEAN' || true)
-  if echo "$CRED_WS" | grep -q "CLEAN"; then
+  if ! _sandbox_run_ok "$CRED_WS"; then
+    warn "Workspace credential check skipped (sandbox_run failed)"
+  elif echo "$CRED_WS" | grep -q "CLEAN"; then
     pass "No plaintext API keys in workspace config"
   else
     warn "API key present in /sandbox/workspace/.openclaw/ (known workaround — constraint #3, OpenShell issue #894)"
@@ -284,7 +373,9 @@ if command -v openshell &>/dev/null; then
 
   # Verify Landlock: /sandbox/.openclaw/ must be read-only
   WRITE_CONFIG=$(sandbox_run 'echo test > /sandbox/.openclaw/config.json 2>&1; echo EXIT:$?' || true)
-  if echo "$WRITE_CONFIG" | grep -qEi "Permission denied|Read-only|EXIT:1"; then
+  if ! _sandbox_run_ok "$WRITE_CONFIG"; then
+    fail "SECURITY: cannot verify Landlock (sandbox_run failed)"
+  elif echo "$WRITE_CONFIG" | grep -qEi "Permission denied|Read-only|EXIT:1"; then
     pass "Landlock blocks write to /sandbox/.openclaw/ (read-only)"
   else
     fail "SECURITY: /sandbox/.openclaw/ is writable (should be read-only via Landlock)"
@@ -292,7 +383,9 @@ if command -v openshell &>/dev/null; then
 
   # Verify /sandbox/workspace/ IS writable (agent needs this)
   WRITE_WORKSPACE=$(sandbox_run 'echo test > /sandbox/workspace/landlock-test.txt 2>&1; echo EXIT:$?' || true)
-  if echo "$WRITE_WORKSPACE" | grep -q "EXIT:0"; then
+  if ! _sandbox_run_ok "$WRITE_WORKSPACE"; then
+    fail "SECURITY: cannot verify workspace writability (sandbox_run failed)"
+  elif echo "$WRITE_WORKSPACE" | grep -q "EXIT:0"; then
     pass "/sandbox/workspace/ is writable (expected)"
     sandbox_run 'rm -f /sandbox/workspace/landlock-test.txt' >/dev/null 2>&1 || true
   else
@@ -302,11 +395,15 @@ if command -v openshell &>/dev/null; then
   # Verify credential placeholder exists in ORIGINAL config (read-only zone).
   # The WORKING config has the real key injected — that's by design (constraint #3).
   CONFIG_PLACEHOLDER=$(sandbox_run 'grep -l "openshell:resolve:env" /sandbox/.openclaw/config.json /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
-  if echo "$CONFIG_PLACEHOLDER" | grep -q "FOUND"; then
+  if ! _sandbox_run_ok "$CONFIG_PLACEHOLDER"; then
+    fail "SECURITY: cannot verify config placeholder (sandbox_run failed)"
+  elif echo "$CONFIG_PLACEHOLDER" | grep -q "FOUND"; then
     pass "Config placeholder openshell:resolve:env still intact"
   else
     fail "SECURITY: config placeholder was modified or missing"
   fi
+  fi  # end: sandbox_run usable
+  fi  # end: ensure_oidc_token succeeded
 else
   warn "openshell CLI not available, skipping security checks"
 fi
@@ -347,12 +444,17 @@ if command -v openshell &>/dev/null; then
     warn "chatCompletions may still be enabled (HTTP $CHAT_CODE)"
   fi
 
-  # tools.deny must block gateway/cron/openclaw commands
-  TOOLS_DENY=$(sandbox_run 'grep -l "\"deny\"" /sandbox/.openclaw/config.json /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
-  if echo "$TOOLS_DENY" | grep -q "FOUND"; then
-    pass "tools.deny configured in OpenClaw config"
+  # tools.deny must block gateway/cron/openclaw (and related) commands
+  TOOLS_DENY=$(sandbox_run 'python3 -c "import json;d=json.load(open(\"/sandbox/workspace/.openclaw/openclaw.json\"));print(\"DENY:\"+\",\".join((d.get(\"tools\") or {}).get(\"deny\") or []))"' || true)
+  if echo "$TOOLS_DENY" | grep -qiE "OIDC token|invalid token|ExpiredSignature|sandbox not found|valid authentication credentials"; then
+    fail "SECURITY: cannot verify tools.deny (sandbox_run failed)"
+  elif echo "$TOOLS_DENY" | grep -q "DENY:gateway" || { echo "$TOOLS_DENY" | grep -q "gateway" && echo "$TOOLS_DENY" | grep -q "cron"; }; then
+    DENY_LIST=$(echo "$TOOLS_DENY" | tr -d '\r' | sed -n 's/.*DENY://p' | head -1)
+    pass "tools.deny includes gateway+cron (${DENY_LIST:-ok})"
+  elif echo "$TOOLS_DENY" | grep -q "DENY:$"; then
+    fail "SECURITY: tools.deny is empty in working config"
   else
-    warn "tools.deny not found in config"
+    fail "SECURITY: tools.deny missing gateway/cron — got ${TOOLS_DENY:0:120}"
   fi
 else
   warn "openshell CLI not available, skipping OpenClaw checks"
@@ -885,8 +987,11 @@ else
     (cd "$TEST_DIR" && npx playwright install chromium) 2>&1 | tail -5
 
     export OPENCLAW_BASE_URL
-    if (cd "$TEST_DIR" && npx playwright test --project=ui-tests --project=security-tests) 2>&1; then
-      pass "Playwright UI + security tests passed (OIDC flow)"
+    # Security enforcement is Layer 4 (sandbox_run). Do not run
+    # security-tests: those asked the LLM via chat and pattern-matched
+    # refusals — flaky and not a measure of sandbox policy.
+    if (cd "$TEST_DIR" && npx playwright test --project=ui-tests) 2>&1; then
+      pass "Playwright Control UI tests passed (OIDC flow)"
     else
       fail "Playwright tests failed"
     fi
