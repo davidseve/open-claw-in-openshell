@@ -3,21 +3,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-NAMESPACE="${NAMESPACE:-openshell}"
+NAMESPACE="${NAMESPACE:-openshell2}"
 OPENSHELL_CHART_VERSION="${OPENSHELL_CHART_VERSION:-0.0.83}"
-SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw}"
+SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw2}"
 PROVIDER_NAME="${PROVIDER_NAME:-maas-litellm}"
 # CLI-local (per-machine) gateway alias name — deliberately separate from
 # NAMESPACE/SANDBOX_NAME. `openshell gateway add/remove/select` and the mTLS
 # cert cache under ~/.config/openshell/gateways/<name>/ are keyed by this
-# name, not by any cluster resource. A second, coexisting deploy of this
-# project on the same machine (e.g. testing alongside another
-# OpenShell/OpenClaw project's own "ocp" alias) needs its own GATEWAY_NAME,
-# or `openshell gateway remove ocp` in deploy-openshell.sh/configure-oidc.sh
-# would silently delete the other project's local CLI registration —
-# a real gap ADR-0020 didn't cover (it only addresses cluster-side
-# namespace/hostname collisions, not this machine-local CLI state).
-GATEWAY_NAME="${GATEWAY_NAME:-ocp}"
+# name, not by any cluster resource. agentops-example is the fixed base
+# tenant and keeps its own "ocp" alias, so this project defaults to its own
+# "openclaw2" alias — avoiding the historical gap where `openshell gateway
+# remove ocp` in deploy-openshell.sh/configure-oidc.sh would otherwise
+# silently delete the other project's local CLI registration.
+GATEWAY_NAME="${GATEWAY_NAME:-openclaw2}"
+if [[ -n "${GATEWAY_NAME:-}" && "${GATEWAY_NAME}" != "openclaw2" ]]; then
+  echo "[common.sh] NOTE: GATEWAY_NAME=${GATEWAY_NAME} (from environment, default is 'openclaw2')" >&2
+fi
 # Helm release name for charts/openshell (the wrapper chart). Distinct from
 # NAMESPACE: the vendored OCI subchart (ghcr.io/nvidia/openshell) mints
 # CLUSTER-SCOPED RBAC (ClusterRole/ClusterRoleBinding
@@ -27,8 +28,11 @@ GATEWAY_NAME="${GATEWAY_NAME:-ocp}"
 # Found live coexisting with another project's own "openshell" release
 # (`Error: unable to continue with install: ClusterRole
 # "openshell-node-reader" ... exists and cannot be imported into the
-# current release`). Default "openshell" keeps a solo deploy unchanged.
-OPENSHELL_RELEASE_NAME="${OPENSHELL_RELEASE_NAME:-openshell}"
+# current release`). Default is now "openshell2" (ADR-0020 addendum):
+# agentops-example is the fixed base tenant on "openshell"/"openshell", so
+# this project defaults to the non-colliding "second instance" identity
+# instead — deploy-order-agnostic coexistence with zero manual overrides.
+OPENSHELL_RELEASE_NAME="${OPENSHELL_RELEASE_NAME:-openshell2}"
 # Sandbox ServiceAccount name the subchart creates by default:
 # "<release-name>-sandbox" (charts/openshell/templates/_helpers.tpl's
 # sandboxSA, mirroring the vendored subchart's own sandboxServiceAccountName

@@ -52,7 +52,7 @@ sequenceDiagram
   participant GW as OpenShell Gateway
   participant OC as OpenClaw
 
-  User->>Browser: https://openclaw-gw--openclaw-ui.apps.domain
+  User->>Browser: https://openclaw-gw2--openclaw-ui.apps.domain
   Browser->>OAuthProxy: GET /
   OAuthProxy->>OCP: OAuth redirect (SA-based client, no Keycloak)
   OCP-->>Browser: login form (HTPasswd/LDAP/federated IdP)
@@ -232,7 +232,7 @@ observed), but tight. This is an accepted trade-off, not a bug — see
 ## Browser access
 
 ```
-https://openclaw-gw--openclaw-ui.<APPS_DOMAIN>/
+https://openclaw-gw2--openclaw-ui.<APPS_DOMAIN>/
 ```
 
 Login with any OpenShift cluster identity (HTPasswd, LDAP, or a federated corporate IdP) — authenticated directly against OCP's own OAuth server, no Keycloak involved ([ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)). No token needed.
@@ -249,6 +249,7 @@ the only Kubernetes-level entry point onto the Control UI.
 |------|---------|
 | `charts/openshell/` | OpenShell Helm chart overrides — `values-ocp.yaml.tpl` (OIDC, PKI SANs, no GPU) and `values-ocp-no-oidc.yaml.tpl` (bootstrap phase, before OIDC exists) |
 | `charts/rhoai/` | Vendored, trimmed RHOAI Helm charts (`operators`, `platform`, `database`, `mlflow`) — RHOAI operator + minimal MLflow-only DataScienceCluster, the sole tracing/prompt-registry backend ([ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md)); declarative RBAC + SA-token + experiment creation via Helm hook Jobs, no imperative `oc apply`/`oc create token` |
+| `charts/agent-sandbox/` | Own, independent Helm chart (`operators/`) + Makefile for the Red Hat build of Agent Sandbox Operator (OLM `agent-sandbox-operator`, channel `preview-0.9`) on OCP/RHPDS — not shared with `agentops-example`'s equivalent chart ([ADR-0004](docs/adrs/ADR-0004-agent-sandbox-redhat.md)); CRC still uses the raw upstream manifest fallback in `manifests/` |
 | `charts/keycloak/`, `charts/oauth2-proxy/`, `charts/observability/` | Helm charts (converted from sed-templated YAML) for the CLI/gRPC OIDC issuer, browser OAuth proxy, and infra logs/metrics (Tempo + OTel Collector) |
 | `config/openclaw.json.tpl` | OpenClaw config template — `trusted-proxy` auth, MaaS provider, `mlflow-openclaw` plugin, `tools.deny`/`plugins.deny` hardening |
 | `policies/openclaw-sandbox.yaml` | Sandbox FS + network policy (default-deny; MaaS allow; RHOAI MLflow `tls: skip`, exact-hostname-matched) |
@@ -272,7 +273,7 @@ The Playwright test suite validates the full user flow through OpenShift-native 
 
 ```bash
 cd tests && npm install && npx playwright install chromium
-OPENCLAW_BASE_URL="https://openclaw-gw--openclaw-ui.<APPS_DOMAIN>" npx playwright test
+OPENCLAW_BASE_URL="https://openclaw-gw2--openclaw-ui.<APPS_DOMAIN>" npx playwright test
 ```
 
 Tests are organized in four projects, run in dependency order:

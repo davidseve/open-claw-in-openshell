@@ -48,6 +48,16 @@ If the base image or install method ever changes the Node.js binary path
 again, add the new path to the `binaries` list instead of reintroducing a
 relocation workaround.
 
+**Revisit when the base image upgrades Node.js**: this whole constraint only
+exists because the sandbox base image ships an older Node.js than OpenClaw
+requires, forcing `launch-openclaw.sh` Step 2 to install `n` and upgrade Node
+at runtime. Once the base image (Agent Sandbox Operator's image and/or
+`ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest`) ships
+Node.js `>=22.22.3` natively, that Step 2 upgrade — and both `/usr/bin/node`
+/ `/usr/local/bin/node` entries here — become unnecessary and should be
+removed. Tracked in [ROADMAP.md](../ROADMAP.md)'s "Follow-up investigation
+(not scheduled)" list.
+
 **Scripts affected**: `policies/openclaw-sandbox.yaml`, `verify.sh` (Layer 5b Check 1)
 
 ## 3. Networking — Node.js fetch() and Proxy Credential Injection

@@ -57,8 +57,8 @@ if [[ -f "${SCRIPT_DIR}/lib/agent-run.sh" ]]; then
   _AGENT_RUN_STARTED="$(agent_run_now)"
 fi
 
-NAMESPACE="${NAMESPACE:-openshell}"
-SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw}"
+NAMESPACE="${NAMESPACE:-openshell2}"
+SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw2}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-full}"
 
 detect_environment

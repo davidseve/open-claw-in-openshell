@@ -344,3 +344,39 @@ ADR-0002 addendum.
 - [ADR-0009: External service routing](ADR-0009-external-service-routing.md) — the `{sandbox}--{service}` hostname pattern `SANDBOX_NAME` parametrizes
 - [ADR-0018: RHOAI MLflow sole backend](ADR-0018-rhoai-mlflow-sole-backend.md) — now implicitly a *shared*, multi-tenant sole backend when coexisting
 - `agentops-example`'s [ADR-0002 addendum](../../../agentops-example/docs/adr/0002-ocp-with-rhoai-as-platform.md) — the mirrored, minimal guards on that project's side
+
+## Addendum (2026-08-11): the "second instance" values are now the hardcoded defaults
+
+Everything above worked, but only as **opt-in overrides** — every session on
+this project had to remember to export `NAMESPACE=openshell2
+SANDBOX_NAME=openclaw-gw2 GATEWAY_NAME=openclaw2
+OPENSHELL_RELEASE_NAME=openshell2` before running anything. Forgetting even
+one of the four silently pointed a script at the wrong namespace/gateway/
+release — concretely, this bit again in a later session as `GATEWAY_NAME`
+pollution: a stray `GATEWAY_NAME=agentops` left exported in a shell from
+testing `agentops-example` silently misdirected this project's
+`ensure_oidc_token()`/gateway-select calls at the wrong
+`~/.config/openshell/gateways/<name>/` directory.
+
+`common.sh`'s four literals (`NAMESPACE`, `SANDBOX_NAME`, `GATEWAY_NAME`,
+`OPENSHELL_RELEASE_NAME`) are now hardcoded to `openshell2` /
+`openclaw-gw2` / `openclaw2` / `openshell2` — i.e. this project's *default*
+is now exactly the override value this ADR already validated live.
+`agentops-example` is unchanged and remains the fixed **base tenant**
+(`openshell` / `openclaw-gw` / `ocp` / `openshell`) per the project-lead's
+original direction to keep changes minimal on that side. `scripts/verify.sh`'s
+own redundant `NAMESPACE`/`SANDBOX_NAME` re-default was synced to match.
+`common.sh` also gained a diagnostic (non-fatal) warning when `GATEWAY_NAME`
+is inherited from the environment and doesn't match the new default, to make
+the exact pollution bug above loud instead of silent next time.
+
+Net effect: either project can now be deployed first on an empty cluster —
+or redeployed on an already-shared cluster — with **zero manual env
+exports**, and the two will never collide regardless of deploy order. This
+was re-validated live (2026-08-11) via a full app-layer teardown + redeploy
+of both projects in the *reverse* order from the original 2026-08-06
+validation above (`agentops-example` deployed first this time, onto its own
+unchanged `openshell` defaults; this project deployed second, picking up its
+new `openshell2` defaults with no env vars set at all) — see
+`scripts/cluster-lifecycle.sh verify` and `agentops-example`'s `make -C
+deploy test-e2e` results from that session for the outcome.

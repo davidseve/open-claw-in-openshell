@@ -40,12 +40,12 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "maas/gpt-oss-120b",
-        "fallbacks": ["maas/llama-scout-17b"]
+        "primary": "maas/llama-scout-17b",
+        "fallbacks": ["maas/gpt-oss-120b"]
       },
       "models": {
-        "maas/gpt-oss-120b": { "alias": "GPT-OSS" },
-        "maas/llama-scout-17b": { "alias": "Scout-fallback" },
+        "maas/gpt-oss-120b": { "alias": "GPT-OSS-fallback" },
+        "maas/llama-scout-17b": { "alias": "Scout" },
         "maas/claude-sonnet-4-6": { "alias": "Sonnet-backup" }
       },
       "workspace": "/sandbox/workspace"

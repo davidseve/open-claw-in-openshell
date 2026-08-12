@@ -11,7 +11,7 @@ Supports both AWS OCP clusters and local CRC (CodeReady Containers) for developm
 | OpenShell Helm chart | `0.0.83` | `oci://ghcr.io/nvidia/openshell/helm-chart` |
 | OpenShell gateway/supervisor | `0.0.83` | `ghcr.io/nvidia/openshell/gateway:0.0.83` |
 | OpenClaw sandbox image | `latest` | `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest` |
-| Agent Sandbox operator (OLM) | channel `preview-0.9`, CSV `agent-sandbox-operator.v0.9.0` | package `agent-sandbox-operator`, ns `agent-sandbox-system` (OSC 1.13 TP); CRC fallback: `manifests/agent-sandbox-v0.5.1.yaml` |
+| Agent Sandbox operator (OLM) | channel `preview-0.9`, CSV `agent-sandbox-operator.v0.9.0` | package `agent-sandbox-operator`, ns `agent-sandbox-system` (OSC 1.13 TP); own Helm chart `charts/agent-sandbox/`, not shared with `agentops-example`; CRC fallback: `manifests/agent-sandbox-v0.5.1.yaml` |
 | agent-harness-in-a-box (ref) | `76aca3b` | https://github.com/rcarrata/agent-harness-in-a-box/ |
 | oauth2-proxy | `v7.15.3` | `quay.io/oauth2-proxy/oauth2-proxy:v7.15.3` |
 | Keycloak | `24.0` | `quay.io/keycloak/keycloak:24.0` |
@@ -54,7 +54,7 @@ Run: `./scripts/bootstrap-ocp.sh`
 
 - [x] Verify OCP cluster access (`oc whoami`)
 - [x] Create `openshell` namespace
-- [x] Install Agent Sandbox operator (OLM `agent-sandbox-operator`, channel `preview-0.9` / CSV `v0.9.0` on OCP; CRC still uses raw `manifests/agent-sandbox-v0.5.1.yaml` fallback — see open item below)
+- [x] Install Agent Sandbox operator via its own Helm chart (`charts/agent-sandbox/`, OLM `agent-sandbox-operator`, channel `preview-0.9` / CSV `v0.9.0` on OCP; CRC still uses raw `manifests/agent-sandbox-v0.5.1.yaml` fallback — see open item below)
 - [x] Approve InstallPlan manually
 - [x] Grant `privileged` SCC to `openshell-sandbox` SA
 - [x] Generate Ed25519 JWT signing secret
@@ -292,6 +292,7 @@ The original plan for this section ("Map Keycloak roles to OpenClaw operator sco
 
 - [ ] **Blocked**: inject a static `x-openclaw-scopes: operator.write` header from the proxy to cap all proxied Control UI sessions. Investigated and found infeasible with the current stack: `registry.redhat.io/openshift4/ose-oauth-proxy` (see [manifests/oauth2-proxy/deployment.yaml.tpl](manifests/oauth2-proxy/deployment.yaml.tpl)) only forwards identity headers it already derives from the IdP (`x-forwarded-user`, `x-forwarded-email`, `x-forwarded-preferred-username` via `--pass-user-headers=true`); it has no flag to inject an arbitrary static header. Implementing this would require either patching/forking `oauth-proxy` or adding a header-rewriting sidecar between it and the OpenShell relay — disproportionate for this phase, and risky given ADR-0016 already documents this fork as fragile (the WebSocket/Host-header bug it had to work around). Revisit if/when the proxy is replaced (e.g. `kube-auth-proxy`, noted as a non-blocking follow-up in ADR-0016) with something that supports custom header injection.
 - [ ] **Follow-up investigation (not scheduled)**: re-verify the actual runtime behavior of `gateway.controlUi.dangerouslyDisableDeviceAuth: true` (set in [config/openclaw.json.tpl](config/openclaw.json.tpl), documented in [ADR-0012](docs/adrs/ADR-0012-trusted-proxy-auth.md)) against the currently deployed OpenClaw 2026.7.1 gateway. Current OpenClaw docs describe this key as a retired break-glass/migration setting rather than a persistently supported config, which may mean device-less trusted-proxy sessions today behave differently (e.g. scopes cleared to `[]` by default) than what ADR-0012 assumed. This is a deeper auth-architecture question, out of scope for "reduce UI surface."
+- [ ] **Follow-up investigation (not scheduled)**: periodically check whether the sandbox base image (Agent Sandbox Operator's image and/or `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest`) ships Node.js `>=22.22.3` natively. `launch-openclaw.sh`'s Step 2 (`npm install -g n && n 22.22.3`) exists solely to work around the current base image's older Node.js — and that step's own `npm install -g n` is itself unpinned (no `n@<version>`, resolves whatever is "latest" on the npm registry at exec time), the same unpinned-npm-install failure mode ADR-0006 (in the sibling `agentops-example` project) already hit once for the `openclaw` package itself. Once the base image ships a compatible Node.js out of the box, remove Step 2 entirely (and the binary-relocation workaround it required in [docs/constraints.md](docs/constraints.md) constraint #2), closing off this unpinned dependency.
 
 ## Phase 10 (future): Custom Sandbox Image
 
@@ -490,6 +491,8 @@ it doesn't cover every way the key text could be reshaped before being echoed).
       jailbreak/exfiltration prompts against a live session and asserts the real key
       never appears unmasked in `chat.history` / the `.jsonl` transcript
 
+**Architectural fix being tracked**: [Phase 16.1](#161-consume-platform-workload-identity-spiffespire) proposes replacing this static MaaS API key entirely with a SPIFFE/SPIRE-issued, auto-rotated credential once `rhoai-platform-ops` ships its workload-identity module — removing the class of problem (a durable secret that can be read off disk), not just mitigating it. Keep this item open until that lands; the mitigations above remain the near-term plan in the meantime.
+
 ### 13.5 Re-audit `OPENSHELL_GATEWAY_INSECURE` scoping when AWS OCP gets real certs
 
 **Context**: `scripts/common.sh`'s `detect_environment()` used to export
@@ -555,6 +558,21 @@ ADR-0016 "WebSocket login failure" for full analysis.
 - [ ] If fixed upstream: switch back to a friendly Route hostname (`openclaw-ui.<APPS_DOMAIN>`), remove `hostAliases`, set `--pass-host-header=false`
 - [ ] If not fixed upstream within a reasonable window: evaluate building a custom patched image (Option A) or nginx auth_request split (Option B)
 
+### 13.8 Privileged SCC — verdict and hardening path
+
+**Context**: [ADR-0006](docs/adrs/ADR-0006-scc-privileged-sandbox.md) documents the intentional paradox — OpenShell's supervisor needs `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and related capabilities to build the restrictive sandbox (nftables egress, Landlock, network namespaces) that constrains agent processes, while OpenShift's default `restricted-v2` SCC blocks those capabilities. The current fix grants the full `system:openshift:scc:privileged` SCC to the `openshell-sandbox` ServiceAccount only (gateway stays on `restricted-v2`), declared declaratively in `charts/openshell/templates/scc-rolebinding.yaml`.
+
+**Verdict**
+
+For an evaluation/workshop cluster on a private network (the context of this project and the sibling `agentops-example` / `rhoai-platform-ops` stack), this is a reasonable and honestly documented trade-off — consistent with what NVIDIA itself recommends for the OpenShift install path (experimental, privileged SCC required, evaluation only).
+
+For a truly hardened or multi-tenant environment, **do not leave it as-is**. The `privileged` SCC grants far more than the four capabilities OpenShell actually needs (`SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`) — it allows `allowedCapabilities: ["*"]`, privileged containers, host namespaces, and hostPath volumes. Improve in this order of effort:
+
+- [ ] **Custom SCC** — replace `system:openshift:scc:privileged` with a project-owned SCC that only allows `allowedCapabilities: [SYS_ADMIN, NET_ADMIN, SYS_PTRACE, SYSLOG]`, with `allowPrivilegedContainer: false` and no host namespaces/hostPath. Follows the standard OpenShift pattern: do not use `privileged` when you only need specific capabilities.
+- [ ] **Sidecar topology** — evaluate OpenShell's `supervisor.topology: sidecar` ([upstream docs](https://docs.nvidia.com/openshell/kubernetes/topology)): the agent container runs with `capabilities.drop: ["ALL"]`; only a short-lived network-init container needs setup capabilities (`NET_ADMIN`, `NET_RAW`, `CHOWN`, `FOWNER`). Easier to justify with a narrow custom SCC than the combined topology this project uses today.
+- [ ] **User namespaces** — enable `server.enableUserNamespaces: true` (or Helm equivalent) so elevated capabilities are namespaced and do not translate to host-level power. OpenShell documents this as defense-in-depth on Kubernetes 1.33+; not currently set in `charts/openshell/values-ocp.yaml.tpl`.
+- [ ] **RuntimeClass (Kata/microVM)** — since this project already depends on the Agent Sandbox Operator, evaluate a Kata (or similar) `RuntimeClass` so the privileged sandbox pod does not share the node kernel. Overlaps with [Phase 16.3](#163-ring-3--kata-containers--runtimeclass-for-the-sandbox-pod); track the SCC-hardening angle here, the blueprint Ring 3 angle there.
+
 ## Phase 14: Declarative Simplification + Shared-Cluster Coexistence
 
 **Status: COMPLETE** — Objective: port back the declarative patterns learned while building `agentops-example` from this project's stack, replacing imperative `oc`/script steps with Helm-native mechanisms, and enable both projects to coexist on one OCP cluster without losing or changing existing functionality (in particular, `trusted-proxy` auth stays untouched — no regression to a static gateway token).
@@ -569,6 +587,104 @@ ADR-0016 "WebSocket login failure" for full analysis.
 - [x] Confirmed **no functional regression**: `trusted-proxy` auth (ADR-0012) is unchanged — this project already had no static gateway token, unlike `agentops-example`, which had regressed to `auth.mode: "none"` for unrelated environment reasons and was explicitly left untouched by this work
 - [ ] Cluster validation: `helm lint`/`helm template` for `charts/openshell` and `charts/rhoai/openclaw-integration`, then a full solo `cluster-lifecycle.sh full --fresh` smoke test
 - [ ] Coexistence validation: deploy this project with an alternate `NAMESPACE`/`SANDBOX_NAME` on a cluster where `agentops-example` is already live; confirm both UIs, both CLIs, and both MLflow trace streams work simultaneously
+
+## Phase 15 (future): OpenShell Gateway Backend — PostgreSQL + Deployment
+
+**Context**: Found while comparing this project against a related OpenShell/OpenCode
+reference demo ([r3v5/agent-ops, `opencode-vertex-tracing`](https://github.com/r3v5/agent-ops/tree/opencode-in-openshell-with-mlflow-on-openshift-demo/demos/opencode-vertex-tracing) —
+same underlying `ghcr.io/nvidia/openshell` product). That demo runs the OpenShell gateway as
+a stateless `Deployment` backed by an external PostgreSQL 16 database
+(`server.externalDbSecret`), instead of the chart's default `StatefulSet` + per-pod SQLite PVC
+this project currently uses ([`charts/openshell/values.yaml`](charts/openshell/values.yaml) —
+`workload.kind: statefulset`, no `externalDbSecret`).
+
+This project already runs a shared PostgreSQL 16 instance for RHOAI-managed MLflow
+(`charts/rhoai/database/`, see Phase 12), so wiring the OpenShell gateway itself to the same
+(or a sibling) Postgres instance reuses infrastructure already validated on both CRC and AWS
+OCP, rather than adding a new stateful dependency.
+
+**Benefits**:
+- Stateless gateway: no per-pod PVC, easier to reason about across `helm upgrade` /
+  redeploy cycles (this ROADMAP already documents several StatefulSet/PVC-related
+  fragility findings — see ADR-0003-equivalent notes in `docs/constraints.md`)
+- Matches the "production-like" backend used by the reference demo above
+- Sets up future horizontal scaling of the gateway if ever needed (`replicaCount > 1`)
+
+**Tasks**:
+- [ ] Add an `openshell` database to `charts/rhoai/database/` (or provision a small dedicated
+      PostgreSQL release if keeping the gateway DB isolated from RHOAI's is preferred)
+- [ ] Create the connection-URI Secret that `server.externalDbSecret` expects
+- [ ] Set `openshell.workload.kind: deployment` and `openshell.server.externalDbSecret:
+      <secret-name>` in [`charts/openshell/values.yaml`](charts/openshell/values.yaml) (or the
+      `values-ocp*.yaml.tpl` overlays, if the DB secret name needs to be environment-specific)
+- [ ] Verify `scripts/deploy-rhoai-mlflow.sh` (or the new DB provisioning step) runs and is
+      waited on before `scripts/deploy-openshell.sh`, mirroring the existing RHOAI-before-OpenShell
+      ordering constraint this project already enforces
+- [ ] Re-run `scripts/verify.sh` (Layer 2: OpenShell Gateway) against a Deployment-backed
+      gateway on both CRC and AWS OCP — confirm sandbox create/exec, mTLS registration, and
+      `mlflow-openclaw` tracing are unaffected
+- [ ] Update `docs/constraints.md` and the relevant ADR (new or amended) with the decision and
+      drop now-inaccurate "SQLite" references from docs/skills
+
+## Phase 16 (future): Blueprint Alignment — Identity, Tool Governance, Ring 3
+
+Source: [Architect an open blueprint for cloud-native AI agents](https://developers.redhat.com/articles/2026/07/20/architect-open-blueprint-cloud-native-ai-agents) (Red Hat Developer, 2026-07-20). This project already implements a large share of the article's blueprint — Helm-declarative agent packaging (`charts/openshell/`, [ADR-0019](docs/adrs/ADR-0019-declarative-openshell-wrapper-chart.md)), OpenClaw as the harness (named directly in the article's component table), and two of the three nested isolation rings (Ring 1: Landlock/seccomp via the OpenShell supervisor; Ring 2: SCC + `NetworkPolicy`), plus a full OTel/Tempo/MLflow audit trail matching the article's observability requirements. This phase closes the remaining gaps, most of which depend on new shared infrastructure landing in `rhoai-platform-ops` first (see that project's Phase 8: Agentic Platform Foundations, `docs/ROADMAP.md`) — this project is the consumer, not the owner, of workload identity and MCP tool governance, per the decision to keep those as shared platform services.
+
+### 16.1 Consume platform Workload Identity (SPIFFE/SPIRE)
+
+- **Blocked on**: `rhoai-platform-ops` Phase 8.1 (SPIRE server/agent deployment)
+- Once available, migrate this project's outbound calls (sandbox → MaaS, and any future sandbox → skill backend) from the current static-key / trusted-proxy pattern to a SPIFFE SVID + token exchange (RFC 8693/7523)
+- This is the real fix for [item 13.4](#134-review-plaintext-maas-api-key-on-disk) (plaintext MaaS API key on disk) — a cryptographic, auto-rotated identity removes the need to ever write a durable secret to the sandbox filesystem
+- Note this is orthogonal to the existing human-facing OIDC work (Keycloak/OCP OAuth, ADR-0010/ADR-0016): that authenticates the *user* opening the Control UI; SPIFFE/SPIRE would authenticate the *agent pod itself* for its own outbound calls
+- Tasks (once unblocked):
+  - [ ] Register this project's sandbox ServiceAccount with the shared SPIRE server (workload registration entry, selector on namespace + SA)
+  - [ ] Add the SPIFFE authentication sidecar (or equivalent init pattern) to the sandbox pod spec
+  - [ ] Update `scripts/launch-openclaw.sh` to stop injecting the raw `MAAS_API_KEY` and instead configure the MaaS provider to use the exchanged short-lived token
+  - [ ] Remove or downgrade the interim mitigations from item 13.4 once this is validated end-to-end
+  - [ ] Add SPIFFE identity + token exchange checks to `verify.sh`
+
+### 16.2 Consume platform MCP Gateway for tool calls
+
+- **Blocked on**: `rhoai-platform-ops` Phase 8.2 (Kuadrant/mcp-gateway deployment)
+- Once available, any future OpenClaw MCP tool/skill configuration should point at the shared `MCP_URL` instead of (or in addition to) managing tool access purely via in-sandbox `tools.deny`/Landlock policy
+- Defense-in-depth framing from the article: the MCP Gateway checkpoint authorizes by token claims and never reads the prompt, so a prompt-injection attack that tries to force an unauthorized tool call fails at the infrastructure layer, independent of the in-sandbox policy that already exists as a second layer
+- Tasks (once unblocked):
+  - [ ] Configure OpenClaw's MCP client (if/when MCP tools are added) to use the shared `MCP_URL`
+  - [ ] Validate that the existing sandbox network policy (`policies/openclaw-sandbox.yaml`) allows egress to the gateway endpoint
+  - [ ] Add a verify.sh check that an unauthorized tool call is rejected by the gateway (claims-based), not just by in-sandbox policy
+
+### 16.3 Ring 3 — Kata Containers / RuntimeClass for the sandbox pod
+
+- The Agent Sandbox operator this project pins (Red Hat build of Agent Sandbox, OSC 1.13, [ADR-0004](docs/adrs/ADR-0004-agent-sandbox-redhat.md)) supports an optional Kata microVM boundary via `RuntimeClass` — not yet enabled here
+- Enabling it closes the last of the article's three nested isolation rings for this project: Ring 1 (process, done), Ring 2 (pod, done), Ring 3 (hardware/VM, not yet enabled)
+- Tasks:
+  - [ ] Confirm Kata `RuntimeClass` availability on target clusters (AWS OCP and CRC — CRC support for Kata/nested virtualization needs explicit validation, may not be feasible there)
+  - [ ] Evaluate performance/resource overhead of the microVM boundary per sandbox pod before enabling by default
+  - [ ] If validated: set `runtimeClassName` on the sandbox pod template, update ADR-0004 with the decision
+  - [ ] Add a `verify.sh` check confirming the sandbox pod actually runs under the Kata runtime when enabled
+
+### 16.4 Skill backend pattern (job placement)
+
+- The article's job-placement model (Table 3: in-pod / service-call / job-dispatch) assumes skills are thin definitions and clients, not compute hosted inside the agent pod — a habit it explicitly calls out as a common design mistake carried over from library-based development
+- This project has no formal "skill backend" yet; introduce one example as an out-of-pod MCP service (Pattern 2: service call, enforced by the MCP Gateway + egress policy from 16.2) to validate the location-agnostic model before any real skill is added
+- Tasks:
+  - [ ] Pick a low-risk example skill (e.g. a simple read-only lookup service) and deploy it as a separate pod/service, not sandbox-internal logic
+  - [ ] Wire it through the MCP Gateway (16.2) rather than a direct network-policy allow rule
+  - [ ] Document the pattern in `docs/` so future skills default to service-call placement instead of growing inside the sandbox
+
+### 16.5 Adversarial testing hookup
+
+- `rhoai-platform-ops`'s evaluation module already runs Garak-based adversarial scans (via EvalHub) but nothing today points them at this project's actual attack surface (OpenClaw's system prompts, tool configuration, jailbreak resistance)
+- Closes the article's "pre-production testing" cross-cutting control specifically for this project, complementing the live-session jailbreak probing already noted in item 13.4
+- Tasks:
+  - [ ] Evaluate running `make evalhub-security` (or an equivalent Garak invocation) against a disposable OpenClaw sandbox endpoint rather than only a raw model endpoint
+  - [ ] Add findings review to the PR checklist when `prompts/*.md` changes
+  - [ ] Consider a scheduled (not per-PR) adversarial run given Garak's CPU runtime cost, documented in `rhoai-platform-ops`
+
+### 16.6 Watch items (not scheduled)
+
+- **Agent-as-a-Service (OGX)**: RHOAI 3.5 EA ships a shared agentic-loop runtime as an alternative to this project's current in-pod harness loop. The article notes the two patterns compose (a sandboxed pod can delegate tool execution to a shared loop while keeping its own identity). Revisit once `rhoai-platform-ops` evaluates OGX in its own roadmap (Phase 6) — no action here until then.
+- **Multi-agent orchestration (A2A / signed AgentCards)**: only relevant if a second agent is ever added to this project. A2A reached 1.0 per the article, but interoperability in practice is still settling. Not applicable to a single-agent deployment today.
 
 ## References
 

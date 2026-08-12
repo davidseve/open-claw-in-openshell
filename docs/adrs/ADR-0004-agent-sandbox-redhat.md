@@ -1,7 +1,7 @@
 # ADR-0004: Red Hat Build of Agent Sandbox via OLM
 
 ## Status
-Accepted (updated 2026-08-06 — corrected package identity and install path against OpenShift sandboxed containers 1.13 docs)
+Accepted (updated 2026-08-12 — moved the OLM install from inline heredocs in `scripts/bootstrap-ocp.sh` to a dedicated Helm chart, `charts/agent-sandbox/`; updated 2026-08-06 — corrected package identity and install path against OpenShift sandboxed containers 1.13 docs)
 
 ## Context
 OpenShell requires Agent Sandbox CRDs (`Sandbox`, `SandboxTemplate`, `SandboxClaim`, `SandboxWarmPool`) to be installed on the cluster. Two sources were evaluated:
@@ -18,9 +18,11 @@ On OCP / RHPDS (non-CRC):
 - Package: `agent-sandbox-operator`
 - Namespace: `agent-sandbox-system`
 - Channel: `preview-0.9` / startingCSV `agent-sandbox-operator.v0.9.0` (Technology Preview with OpenShift sandboxed containers 1.13; confirmed on OCP 4.20.8 / `redhat-operators` catalog 2026-08-06)
-- `installPlanApproval: Manual` (auto-approved by `scripts/bootstrap-ocp.sh` after the channel is pinned in git)
+- `installPlanApproval: Manual` (auto-approved by `charts/agent-sandbox/Makefile`'s `wait-operators` target after the channel is pinned in git)
 - Do **not** apply the upstream raw manifest on this path — the Operator alone deploys the sandbox controller, sandbox router, and extension CRDs ([Install chapter, OSC 1.13](https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.13/html/deploying_red_hat_build_of_agent_sandbox/install-agent-sandbox-overview_agent-sandbox)).
 - Requires OpenShift Container Platform **4.19 or later**.
+
+**Implementation (2026-08-12):** the `OperatorGroup`/`Subscription` are no longer inline heredocs in `scripts/bootstrap-ocp.sh` — they live in a dedicated Helm chart, `charts/agent-sandbox/operators/` (namespace, channel, and CSV pinned in its `values.yaml`), installed and waited-on via `charts/agent-sandbox/Makefile`'s `wait-operators` target (`bootstrap-ocp.sh` just calls `make -C charts/agent-sandbox wait-operators` on the non-CRC branch). This mirrors the same Helm-chart-plus-Makefile pattern this project already uses for the RHOAI operator (`charts/rhoai/operators/` + `charts/rhoai/Makefile`). The chart is **deliberately not shared** with `agentops-example/deploy/helm/operators/` — that project maintains its own, separately-versioned copy of the equivalent Subscription; each project stays independently deployable and each Helm chart's lifecycle (install/upgrade/uninstall) is scoped to its own repo.
 
 On CRC / single-node local clusters where the `redhat-operators` catalog is unavailable:
 
@@ -41,4 +43,4 @@ Do **not** subscribe to `sandboxed-containers-operator` for Agent Sandbox CRDs. 
 - [Install chapter](https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.13/html/deploying_red_hat_build_of_agent_sandbox/install-agent-sandbox-overview_agent-sandbox)
 - [What's new in Red Hat OpenShift confidential computing and sandboxing (Aug 2026)](https://www.redhat.com/en/blog/whats-new-red-hat-openshift-confidential-computing-and-sandboxing)
 - [Agent Sandbox upstream](https://github.com/kubernetes-sigs/agent-sandbox)
-- Implementation: `scripts/bootstrap-ocp.sh`
+- Implementation: `charts/agent-sandbox/operators/` (Helm chart) + `charts/agent-sandbox/Makefile` (`wait-operators`), invoked from `scripts/bootstrap-ocp.sh`; CRC fallback (`manifests/agent-sandbox-v0.5.1.yaml`) still applied directly from that script

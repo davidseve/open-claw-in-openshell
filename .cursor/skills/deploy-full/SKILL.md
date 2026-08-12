@@ -115,7 +115,7 @@ See `docs/constraints.md` constraint #10 for why this order matters.
 ### Step 3: Verify result
 
 If the command exits 0 — done. Report the URLs:
-- Control UI: `https://openclaw-gw--openclaw-ui.<APPS_DOMAIN>/`
+- Control UI: `https://openclaw-gw2--openclaw-ui.<APPS_DOMAIN>/`
 - MLflow UI: RHOAI's Route (`oc get route mlflow -n redhat-ods-applications`)
 - Keycloak: `https://keycloak-openshell-keycloak.<APPS_DOMAIN>/` (CRC: `apps-crc.testing`)
 

@@ -170,6 +170,11 @@ fi
 # relocation is needed: policies/openclaw-sandbox.yaml already allows both
 # /usr/bin/node and /usr/local/bin/node in every network policy. (See
 # constraint #2)
+# TODO (see ROADMAP.md "Follow-up investigation (not scheduled)"): this
+# entire step — including the unpinned `npm install -g n` below — becomes
+# unnecessary once the sandbox base image ships Node.js >=22.22.3 natively.
+# Re-check on each base-image bump and remove this step + constraint #2's
+# binary-relocation entries if so.
 step "Upgrading Node.js and OpenClaw to 2026.7.1"
 CURRENT_VERSION=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- \
   openclaw --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "unknown")

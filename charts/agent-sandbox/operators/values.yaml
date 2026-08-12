@@ -1,0 +1,14 @@
+agentSandbox:
+  enabled: true
+  namespace: agent-sandbox-system
+  channel: preview-0.9
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  # Manual approval required: AGENTS.md security guideline —
+  # "Use installPlanApproval: Manual for OLM operators to prevent unreviewed
+  # upgrades." (agentops-example's own copy of this chart uses the same
+  # policy independently.)
+  installPlanApproval: Manual
+  # Pin CSV for reproducibility (confirmed on OCP 4.20.8 / redhat-operators
+  # catalog 2026-08-06). See docs/adrs/ADR-0004-agent-sandbox-redhat.md.
+  startingCSV: agent-sandbox-operator.v0.9.0
