@@ -12,15 +12,17 @@
 # #4b), the Python SDK supports both natively via MLFLOW_TRACKING_TOKEN and
 # MLFLOW_WORKSPACE env vars — no patching required here.
 #
-# Usage (from scripts/wire-rhoai-mlflow-tracing.sh, after wiring.env is written):
-#   set -a; source .rendered/rhoai-mlflow/wiring.env; set +a
-#   MLFLOW_URL="$RHOAI_MLFLOW_TRACKING_URI" \
-#   MLFLOW_TRACKING_TOKEN="$RHOAI_MLFLOW_SA_TOKEN" \
-#   MLFLOW_WORKSPACE="$RHOAI_MLFLOW_WORKSPACE" \
-#   MLFLOW_EXPERIMENT_ID="$RHOAI_MLFLOW_EXPERIMENT_ID" \
-#   MLFLOW_TRACKING_SERVER_CERT_PATH="$RHOAI_MLFLOW_CA_FILE" \
+# Usage:
+#   ./scripts/prompt-registry/seed-mlflow-prompts.sh
+#
+# Auth is auto-loaded from .rendered/rhoai-mlflow/wiring.env when present
+# (written by scripts/wire-rhoai-mlflow-tracing.sh). You can also pass vars
+# explicitly:
+#   MLFLOW_TRACKING_TOKEN=... MLFLOW_WORKSPACE=... MLFLOW_EXPERIMENT_ID=... \
 #     ./scripts/prompt-registry/seed-mlflow-prompts.sh
 #
+# MLFLOW_URL is always resolved from the external Route (not the in-cluster
+# Service URL in wiring.env) because this script runs on the host.
 # MLFLOW_EXPERIMENT_ID matters, not just cosmetically: registering a prompt
 # without an active experiment set tags it with `_mlflow_experiment_ids=,0,`
 # (the "Default" experiment). RHOAI's dashboard Prompts tab is nested per
@@ -38,6 +40,17 @@ PREFIX="openclaw-system"
 
 detect_environment
 
+WIRING_ENV="${RENDERED_DIR}/rhoai-mlflow/wiring.env"
+if [[ -f "$WIRING_ENV" ]]; then
+  # shellcheck source=/dev/null
+  source "$WIRING_ENV"
+  MLFLOW_TRACKING_TOKEN="${MLFLOW_TRACKING_TOKEN:-${RHOAI_MLFLOW_SA_TOKEN:-}}"
+  MLFLOW_WORKSPACE="${MLFLOW_WORKSPACE:-${RHOAI_MLFLOW_WORKSPACE:-}}"
+  MLFLOW_EXPERIMENT_ID="${MLFLOW_EXPERIMENT_ID:-${RHOAI_MLFLOW_EXPERIMENT_ID:-}}"
+  MLFLOW_TRACKING_SERVER_CERT_PATH="${MLFLOW_TRACKING_SERVER_CERT_PATH:-${RHOAI_MLFLOW_CA_FILE:-}}"
+  info "Loaded RHOAI MLflow auth from ${WIRING_ENV}"
+fi
+
 if [[ -z "${MLFLOW_URL:-}" ]]; then
   MLFLOW_ROUTE=$(oc get route mlflow -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || true)
   if [[ -n "$MLFLOW_ROUTE" ]]; then
@@ -54,7 +67,9 @@ MLFLOW_TRACKING_TOKEN="${MLFLOW_TRACKING_TOKEN:-}"
 MLFLOW_WORKSPACE="${MLFLOW_WORKSPACE:-}"
 MLFLOW_EXPERIMENT_ID="${MLFLOW_EXPERIMENT_ID:-}"
 if [[ -z "$MLFLOW_TRACKING_TOKEN" || -z "$MLFLOW_WORKSPACE" ]]; then
-  warn "MLFLOW_TRACKING_TOKEN / MLFLOW_WORKSPACE not set — requests will fail against RHOAI MLflow's workspace-enabled server unless the default workspace happens to match"
+  error "MLFLOW_TRACKING_TOKEN and MLFLOW_WORKSPACE are required for RHOAI MLflow."
+  error "Run ./scripts/wire-rhoai-mlflow-tracing.sh first (creates ${WIRING_ENV}), or export the vars manually."
+  exit 1
 fi
 if [[ -z "$MLFLOW_EXPERIMENT_ID" ]]; then
   warn "MLFLOW_EXPERIMENT_ID not set — prompts will be tagged to the 'Default' experiment and won't show up in the RHOAI dashboard's per-experiment Prompts tab"

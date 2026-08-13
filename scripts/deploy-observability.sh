@@ -55,34 +55,27 @@ step "Verifying trace pipeline (send test trace)"
 
 oc -n "$OBS_NAMESPACE" port-forward svc/otel-collector 34318:4318 &>/dev/null &
 PF_PID=$!
-sleep 2
-
-TRACE_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex)")
-NOW_NS=$(python3 -c "import time; print(int(time.time() * 1e9))")
-END_NS=$(python3 -c "import time; print(int((time.time()+1) * 1e9))")
-SPAN_ID=$(python3 -c "import os; print(os.urandom(8).hex())")
-
-RESP=$(curl -s -X POST http://localhost:34318/v1/traces \
-  -H "Content-Type: application/json" \
-  -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"deploy-test\"}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"test\"},\"spans\":[{\"traceId\":\"${TRACE_ID}\",\"spanId\":\"${SPAN_ID}\",\"name\":\"deploy-verify\",\"kind\":1,\"startTimeUnixNano\":\"${NOW_NS}\",\"endTimeUnixNano\":\"${END_NS}\",\"status\":{\"code\":1}}]}]}]}" 2>/dev/null || echo "error")
+if wait_for_local_port 34318 20 && TRACE_IDS=$(send_otel_test_trace 34318 deploy-verify); then
+  TRACE_ID="${TRACE_IDS%% *}"
+  pass "Test trace accepted by OTel Collector"
+else
+  fail "Could not send test trace to OTel Collector"
+  TRACE_ID=""
+fi
 
 kill $PF_PID 2>/dev/null || true
 
-if echo "$RESP" | grep -q "partialSuccess"; then
-  pass "Test trace accepted by OTel Collector"
-else
-  fail "Could not send test trace: ${RESP}"
-fi
+if [[ -n "$TRACE_ID" ]]; then
+  sleep 3
 
-sleep 3
+  VERIFY=$(oc -n "$OBS_NAMESPACE" exec deployment/tempo -- \
+    wget -qO- "http://localhost:3200/api/traces/${TRACE_ID}" 2>/dev/null || echo "{}")
 
-VERIFY=$(oc -n "$OBS_NAMESPACE" exec deployment/tempo -- \
-  wget -qO- "http://localhost:3200/api/traces/${TRACE_ID}" 2>/dev/null || echo "{}")
-
-if echo "$VERIFY" | grep -q "deploy-verify"; then
-  pass "Test trace stored and retrievable in Tempo"
-else
-  warn "Trace not yet visible (Tempo may need more ingestion time)"
+  if echo "$VERIFY" | grep -q "deploy-verify"; then
+    pass "Test trace stored and retrievable in Tempo"
+  else
+    warn "Trace not yet visible (Tempo may need more ingestion time)"
+  fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

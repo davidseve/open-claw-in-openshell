@@ -20,7 +20,7 @@ at launch time instead. Keep reading if you want to remove it.
 
 | File | Runs where | What it does |
 |------|-----------|---------------|
-| `seed-mlflow-prompts.sh` | On your machine, invoked by `wire-rhoai-mlflow-tracing.sh` | Registers `prompts/*.md` in the RHOAI MLflow Prompt Registry (`mlflow.genai.register_prompt()`), sets the active experiment first so the Dashboard's per-experiment Prompts tab can find them (`docs/constraints.md` #20), and points a `@production` alias at the latest version. |
+| `seed-mlflow-prompts.sh` | On your machine, invoked by `wire-rhoai-mlflow-tracing.sh` (or standalone after wire) | Registers `prompts/*.md` in the RHOAI MLflow Prompt Registry (`mlflow.genai.register_prompt()`), sets the active experiment first so the Dashboard's per-experiment Prompts tab can find them (`docs/constraints.md` #20), and points a `@production` alias at the latest version. Auto-loads auth from `.rendered/rhoai-mlflow/wiring.env`. |
 | `fetch-prompts-from-mlflow.sh` | Inside the sandbox, invoked by `launch-openclaw.sh` (`oc cp` + `oc exec`) | Downloads the `@production`-aliased prompts from MLflow into `/sandbox/workspace/*.md`, writes a `.prompt-versions.json` manifest recording which MLflow version of each prompt is in use. |
 | `prompt-trace-linker.js` | Inside the sandbox, as a long-running background process, invoked by `launch-openclaw.sh` | Polls the MLflow Traces API every 30s via `/usr/bin/curl` (Node `fetch()` is blocked by the sandbox proxy — see `docs/constraints.md` #14), finds traces missing prompt-version tags, and adds an `mlflow.linkedPrompts` tag + a `prompt_versions` custom tag using the manifest from `fetch-prompts-from-mlflow.sh`. |
 

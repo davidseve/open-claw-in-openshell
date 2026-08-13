@@ -161,16 +161,9 @@ info "Wiring facts written to ${OUT_DIR}/wiring.env"
 warn "wiring.env contains a live SA token — never commit (.rendered/ is gitignored)"
 
 step "Seeding system prompts into MLflow Prompt Registry"
-# Deliberately NOT passing MLFLOW_URL: this script runs on the host (not
-# inside the sandbox/cluster network), so it needs the external Route, not
-# the in-cluster Service URL (RHOAI_MLFLOW_SVC_URL) — seed-mlflow-prompts.sh
-# already auto-detects that Route when MLFLOW_URL is unset.
-MLFLOW_TRACKING_TOKEN="${SA_TOKEN}" \
-MLFLOW_WORKSPACE="${WORKSPACE}" \
-MLFLOW_EXPERIMENT_ID="${EXPERIMENT_ID}" \
-  "${SCRIPT_DIR}/prompt-registry/seed-mlflow-prompts.sh" \
+"${SCRIPT_DIR}/prompt-registry/seed-mlflow-prompts.sh" \
   && pass "System prompts seeded into RHOAI MLflow" \
-  || warn "Could not seed prompts (run scripts/prompt-registry/seed-mlflow-prompts.sh manually — see its usage comment for the required env vars)"
+  || warn "Could not seed prompts (run scripts/prompt-registry/seed-mlflow-prompts.sh manually after wire-rhoai-mlflow-tracing.sh)"
 
 step "wire-rhoai-mlflow-tracing.sh complete"
 info "Next: ./scripts/launch-openclaw.sh"
