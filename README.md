@@ -72,7 +72,7 @@ sequenceDiagram
 | **Control UI** | Browser → oauth-proxy (OpenShift-native OAuth) → Route → Gateway → sandbox `:18789` (trusted-proxy, `x-forwarded-email`) |
 | **CLI / gRPC** | CLI → Route `openshell-gw` → Gateway (OIDC JWT, issued by Keycloak) → sandbox lifecycle / SSH relay |
 | **Login** | Browser → oauth-proxy → OCP OAuth server → session cookie (see [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)) |
-| **Inference** | OpenClaw → L7 proxy → MaaS (`openshell:resolve:env:LITELLM_API_KEY` rewritten; never on disk) |
+| **Inference** | OpenClaw → MaaS (`apiKey` resolved from OpenClaw's own native `${LITELLM_API_KEY}` env SecretRef, in-process at gateway startup; never on disk — see [constraints.md #3](docs/constraints.md#3-networking--nodejs-fetch-and-proxy-credential-injection-resolved-via-openclaw-native-secretref)) |
 
 ### Security posture
 
@@ -279,7 +279,7 @@ OPENCLAW_BASE_URL="https://openclaw-gw2--openclaw-ui.<APPS_DOMAIN>" npx playwrig
 Tests are organized in four projects, run in dependency order:
 1. **auth-setup** (`auth.setup.ts`): Automated OCP OAuth login (HTPasswd form), saves browser session
 2. **ui-tests** (`openclaw-ui.spec.ts`): Control UI functionality (health, navigation, chat E2E via MaaS)
-3. **security-tests** (`sandbox-security.spec.ts`): Sandbox isolation (egress blocking, credential protection, privilege escalation, tool policy enforcement)
+3. **security-tests** (`sandbox-security.spec.ts`): Jailbreak/exfiltration resistance via chat — credential leak, gateway tool denial, config.patch social engineering, egress/sudo/IMDS/shadow (complements deterministic checks in `verify.sh` Layer 4)
 4. **mlflow-ui-tests** (`mlflow-ui.spec.ts`): RHOAI MLflow UI — GenAI Studio Prompts tab, Traces tab, and the "Prompt" column showing linked prompt versions (runs after the chat E2E test so a real trace exists to assert against)
 
 `scripts/verify.sh` runs a broader, non-browser check across 10 layers (infra → gateway → sandbox → security → OIDC → RHOAI MLflow → observability → UI → prompt/trace linkage) and is what `cluster-lifecycle.sh full` calls automatically at the end of a deploy.
@@ -294,7 +294,7 @@ This project accumulated a lot of hard-won, non-obvious findings while running a
 | OpenShift-native OAuth (`oauth-proxy` fork) for browser SSO instead of a separate IdP | One less moving part for human login; OCP is already the identity source of truth | [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md) |
 | Route hostname must equal the service-routing pattern (`{sandbox}--{service}`) | A WebSocket Host-header bug in the OAuth proxy fork silently breaks chat logins otherwise | [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md) "WebSocket login failure" |
 | Allowlist every binary path a version manager might install to (e.g. both `/usr/bin/node` and `/usr/local/bin/node`) | L7 proxies that resolve `/proc/<pid>/exe` silently deny traffic if a tool (like `n`) relocates the binary | [constraints.md #2](docs/constraints.md#2-networking--l7-binary-path-enforcement-resolved-via-policy) |
-| Bake secrets into rendered config at template time instead of relying on runtime placeholder-resolution proxies | Node's `fetch()`/`undici` creates ephemeral connections the proxy can't reliably attribute to a PID, breaking credential injection | [constraints.md #3](docs/constraints.md#3-networking--nodejs-fetch-and-proxy-credential-injection) |
+| Use the consuming app's OWN native env-backed SecretRef syntax instead of a sandbox-proxy credential-injection mechanism | Node's `fetch()`/`undici` creates ephemeral connections the proxy can't reliably attribute to a PID, breaking HTTP-layer credential injection; resolving in-process before the request is built sidesteps that class of problem entirely, and gets automatic exact-value redaction as a bonus | [constraints.md #3](docs/constraints.md#3-networking--nodejs-fetch-and-proxy-credential-injection-resolved-via-openclaw-native-secretref) |
 | Combine CA bundles, never overwrite a single-value trust env var (`NODE_EXTRA_CA_CERTS`) | Multiple independent TLS trust needs (proxy MITM CA + a real service CA) collide on the same env var | [constraints.md #4c](docs/constraints.md#4c-node_extra_ca_certs-is-single-value-must-be-extended-never-overwritten-resolved) |
 | Match `tls: skip` / per-host policy entries by the *exact* hostname string used in code | FQDN vs. short Kubernetes Service DNS form looks identical to a TLS failure but is actually a policy-matching miss | [constraints.md #4d](docs/constraints.md#4d-tls-skip-policy-endpoints-require-an-exact-hostname-string-match--fqdn-vs-short-service-name-silently-defeats-it) |
 | Source-patch a pinned dependency file directly when `npm overrides`/upgrades are blocked | Registry-level `policy_denied` on a specific package/version can block the "proper" fix; patching the already-installed file sidesteps it entirely | [constraints.md #4b](docs/constraints.md#4b-plugins--pinned-mlflowcore-misses-the-x-mlflow-workspace-fix-resolved-via-source-patch-backport) |

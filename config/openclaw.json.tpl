@@ -3,12 +3,21 @@
     "providers": {
       "maas": {
         "baseUrl": "https://maas-rhdp.apps.maas.redhatworkshops.io/v1",
-        "apiKey": "__MAAS_API_KEY__",
+        "apiKey": "${LITELLM_API_KEY}",
         "api": "openai-completions",
         "models": [
           {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 200000,
+            "maxTokens": 64000,
+            "compat": { "supportsStore": false }
+          },
+          {
             "id": "gpt-oss-120b",
-            "name": "GPT-OSS 120B",
+            "name": "GPT-OSS 120B (disabled)",
             "reasoning": true,
             "input": ["text"],
             "contextWindow": 32768,
@@ -17,20 +26,11 @@
           },
           {
             "id": "llama-scout-17b",
-            "name": "Llama Scout 17B",
+            "name": "Llama Scout 17B (disabled)",
             "reasoning": false,
             "input": ["text"],
             "contextWindow": 400000,
             "maxTokens": 8192,
-            "compat": { "supportsStore": false }
-          },
-          {
-            "id": "claude-sonnet-4-6",
-            "name": "Claude Sonnet 4.6 (backup)",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "contextWindow": 200000,
-            "maxTokens": 64000,
             "compat": { "supportsStore": false }
           }
         ]
@@ -40,13 +40,13 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "maas/llama-scout-17b",
-        "fallbacks": ["maas/gpt-oss-120b"]
+        "primary": "maas/claude-sonnet-4-6",
+        "fallbacks": []
       },
       "models": {
-        "maas/gpt-oss-120b": { "alias": "GPT-OSS-fallback" },
-        "maas/llama-scout-17b": { "alias": "Scout" },
-        "maas/claude-sonnet-4-6": { "alias": "Sonnet-backup" }
+        "maas/claude-sonnet-4-6": { "alias": "Sonnet" },
+        "maas/gpt-oss-120b": { "alias": "GPT-OSS-disabled" },
+        "maas/llama-scout-17b": { "alias": "Scout-disabled" }
       },
       "workspace": "/sandbox/workspace"
     }

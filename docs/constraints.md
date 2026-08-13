@@ -60,7 +60,7 @@ removed. Tracked in [ROADMAP.md](../ROADMAP.md)'s "Follow-up investigation
 
 **Scripts affected**: `policies/openclaw-sandbox.yaml`, `verify.sh` (Layer 5b Check 1)
 
-## 3. Networking — Node.js fetch() and Proxy Credential Injection
+## 3. Networking — Node.js fetch() and Proxy Credential Injection (RESOLVED via OpenClaw-native SecretRef)
 
 **Constraint**: The sandbox proxy resolves `openshell:resolve:env:KEY` credential
 placeholders by inspecting HTTP traffic. However, Node.js `fetch()` (which uses
@@ -75,25 +75,62 @@ connection pooling and fast teardown makes this unreliable.
 **Failure mode**: `DENIED: failed to resolve peer binary` in proxy logs. The
 gateway appears healthy but cannot reach the LLM provider.
 
-**Workaround**: Do NOT rely on proxy credential injection for Node.js `fetch()`.
-Instead:
-1. Bake the real API key directly into `openclaw.json` at template-render time.
-   `config/openclaw.json.tpl` holds a `__MAAS_API_KEY__` placeholder;
-   `render_openclaw_config()` in `scripts/common.sh` substitutes it with the
-   real `MAAS_API_KEY` (from `secrets/secrets.env`) using bash string
-   replacement (not sed/awk, so key characters like `/` are never
-   misinterpreted). The resulting `.rendered/openclaw.json` — never committed,
-   see `.gitignore` — is what gets uploaded/copied into the sandbox, so no
-   separate post-copy injection step is needed.
-2. Do NOT set `HTTP_PROXY` or `HTTPS_PROXY` — this forces `fetch()` to use
-   HTTP CONNECT tunneling, which the proxy rejects with 403.
-3. Do NOT set `NODE_OPTIONS="--require http-proxy-bootstrap.js"` — same reason.
-4. Let the transparent proxy (nftables L4 redirect) handle routing automatically.
+**Original workaround (superseded — kept for history)**: The first fix baked
+the real `MAAS_API_KEY` directly into `openclaw.json` at template-render time
+via bash string replacement, bypassing the proxy's credential injection
+entirely. This worked for connectivity, but left the raw key readable on the
+sandbox filesystem (`grep sk- /sandbox/workspace/.openclaw/openclaw.json`) and
+`echo`-able in chat by any prompt that could get the agent to run a shell
+command — see ROADMAP.md #13.4 for the jailbreak-probing finding that flagged
+this.
 
-**Upstream tracking**: OpenShell issue #894 (binary resolution for undici), #896 (enhanced provider management).
+**Current fix**: Use OpenClaw's OWN native env-backed `SecretRef` mechanism
+instead of any sandbox-proxy mechanism. OpenClaw's config schema accepts
+`"${ENV_VAR_NAME}"` as a `SecretInput` for any field typed `SecretInputSchema`
+(including `models.providers.<id>.apiKey` — see upstream
+`src/config/types.secrets.ts`, `ENV_SECRET_TEMPLATE_RE`). OpenClaw resolves
+this from its OWN process environment, in-process, BEFORE constructing the
+outbound HTTP request — so the sandbox proxy's binary-PID mapping problem
+never applies to this credential at all (there is no HTTP-layer injection to
+intercept).
+
+1. `config/openclaw.json.tpl`'s `apiKey` is the literal string
+   `"${LITELLM_API_KEY}"` — this ships to the sandbox as-is; the real key is
+   never written to `openclaw.json` on disk.
+2. `scripts/launch-openclaw.sh` Step 9b passes
+   `--env "LITELLM_API_KEY=${MAAS_API_KEY}"` to `openshell sandbox exec` when
+   starting the OpenClaw gateway process, so OpenClaw resolves the SecretRef
+   from ITS OWN process env at startup.
+3. **Bonus**: OpenClaw automatically calls
+   `registerSecretValueForRedaction()` (upstream
+   `src/logging/secret-redaction-registry.ts`) on every value resolved
+   through its native SecretRef mechanism. This registers the exact resolved
+   string in an in-process, exact-value redaction registry that
+   `redactToolPayloadText()` (used to render shell/exec tool output in chat)
+   checks on every render. The net effect: even though `LITELLM_API_KEY` is
+   still exported as a plain env var in the sandbox (for the OpenShell
+   provider's separate curl-based credential path), any prompt that gets the
+   agent to `echo $LITELLM_API_KEY` or `cat openclaw.json` now sees the value
+   masked (e.g. `sk-kPNr…SLFA`) in the Control UI — closing the leak found by
+   jailbreak probing without relying purely on the model's own judgment to
+   refuse.
+4. Do NOT set `HTTP_PROXY` or `HTTPS_PROXY` — this forces `fetch()` to use
+   HTTP CONNECT tunneling, which the proxy rejects with 403.
+5. Do NOT set `NODE_OPTIONS="--require http-proxy-bootstrap.js"` — same reason.
+6. Let the transparent proxy (nftables L4 redirect) handle routing automatically
+   for the destination-allowlist check (unrelated to credential injection).
+
+**Upstream tracking**: OpenShell issue #894 (binary resolution for undici) is
+no longer a blocker for THIS credential — it would still matter for any
+future secret that must be injected at the sandbox-proxy layer instead of
+resolved by the consuming Node.js process itself. #896 (enhanced provider
+management) unaffected.
 
 **Scripts affected**: `config/openclaw.json.tpl`, `scripts/common.sh`
-(`render_openclaw_config`), `launch-openclaw.sh` (Step 3, Step 9)
+(`render_openclaw_config`), `launch-openclaw.sh` (Step 3, Step 9b),
+`scripts/verify.sh` (Layer 4/5 credential + placeholder checks),
+`tests/sandbox-security.spec.ts` (credential-leak test now expects masked
+output rather than relying only on model refusal)
 
 ## 4. Plugins — Directory Structure and Ownership
 
@@ -1419,4 +1456,158 @@ immediately.
 
 **Scripts affected (for the future fix)**: `scripts/launch-openclaw.sh`
 (Step 4), `policies/openclaw-sandbox.yaml`, `scripts/verify.sh` (Layer 8b)
+
+## 25. `sandbox_run`'s PTY Local-Echo Made Several Layer 4 Credential/Config Checks Unconditionally "Pass" — FIXED
+
+**Context**: Found while forensically tracing a real (if stale) leaked API key
+back to its source session (ROADMAP.md #13.4). Constraints #15 and #17 had
+each independently found *one instance* of this class of bug (a synthetic
+curl request's own text getting matched as if it were a real response) and
+worked around it locally (deferred a restart, removed the affected checks).
+Neither fix touched the actual root cause in `scripts/common.sh`, so every
+*other* check using the same pattern stayed silently broken.
+
+**Root cause**: `openshell sandbox connect` is an interactive PTY. Per how
+PTYs work, it **echoes back the literal bytes it receives — the command text
+itself — before that command ever runs**, then prints the real output, then
+echoes the closing `exit`. `sandbox_run()` captures all of this undifferentiated
+as one string. Several `verify.sh` Layer 4/5b checks used a
+`command_that_might_fail || echo MARKER` (or `cmd && echo FOUND || echo
+MISSING`) shape and then grepped the captured output for `MARKER`/`FOUND` —
+but since the literal text `echo MARKER` is *part of the command being
+echoed*, that string is present in the raw transcript **unconditionally**,
+regardless of whether the real command actually matched anything. Confirmed
+live for the credential check specifically:
+
+```
+$ CRED_WS=$(sandbox_run 'grep -rl "sk-" /sandbox/workspace/.openclaw/ 2>/dev/null | head -1 || echo CLEAN')
+$ echo "$CRED_WS"
+grep -rl "sk-" /sandbox/workspace/.openclaw/ 2>/dev/null | head -1 || echo CLEAN && exit
+/sandbox/workspace/.openclaw/extensions/.../some-file.js
+exit
+```
+
+`echo "$CRED_WS" | grep -q CLEAN` matches — not because grep found nothing,
+but because the word "CLEAN" is sitting right there in the echoed command
+line. This affected `CRED_RO`/`CRED_WS` (plaintext-key filesystem scan),
+`CONFIG_PLACEHOLDER`/`CONFIG_CHECK` (SecretRef-literal-intact check), and
+`NODE_LOCAL` (rogue `/usr/local/bin/node` check) — all reporting favorable
+results independent of the real filesystem state. `NODE_LOCAL` in particular
+was masking a real, currently-live finding: `/usr/local/bin/node` genuinely
+existed (created that same day) and `PATH` resolved it *ahead of*
+`/usr/bin/node`, silently defeating constraint #2's binary-path network
+policy for any freshly-spawned Node process. (Separately, a `head -1` on the
+credential grep also picked up unrelated `sk-`-shaped substrings from
+`node_modules` build artifacts even once the echo bug was fixed — a second,
+independent false-positive source now also fixed by matching a realistic key
+shape and excluding `node_modules`.)
+
+**Fix applied**: `scripts/common.sh` `sandbox_run()` now strips the echoed
+input command (glob-escaped and matched via `${out#*needle}`) and the
+trailing echoed `exit` before returning — once, centrally, so every existing
+and future caller gets only the real command output. `verify.sh`'s
+`CRED_RO`/`CRED_WS` checks were also rewritten to (a) use an explicit
+`if/else` inside the sandboxed command instead of relying on pipe exit status
+or embedded fallback text, and (b) match `sk-[A-Za-z0-9]{16,}` excluding
+`node_modules`, rather than a bare `sk-` substring. The exposed
+`/usr/local/bin/node` was removed live via `oc exec ... -c agent -- rm`
+(sandbox user itself lacks permission — it's root-owned — which is a small
+positive: the agent's own tools couldn't have planted or removed it either).
+
+A related, independently-introduced bug in the same area: `verify.sh`
+Layer 9's model-drift guard (ROADMAP.md #13.4) read `sessions.json`'s
+top-level `model` key, which is **always `null`** in this OpenClaw version —
+the model a session actually ran against is recorded under
+`systemPromptReport.model` instead. The guard therefore never flagged a
+mismatch, by construction, since its check (`if model and model != primary`)
+short-circuited on the always-falsy `null`. Fixed to read the correct nested
+field.
+
+**Verification**: after the fix, `CRED_WS` correctly reported the constraint
+#26 leak below (previously masked by this exact bug) and `CONFIG_PLACEHOLDER`
+correctly reported the real, still-intact `${LITELLM_API_KEY}` SecretRef
+literal — both now driven by actual grep results, not echoed input text.
+
+**Scripts affected**: `scripts/common.sh` (`sandbox_run`, new
+`_glob_escape`/`_strip_pty_echo` helpers), `scripts/verify.sh` (Layer 4
+`CRED_RO`/`CRED_WS`, Layer 9 model-drift guard).
+
+## 26. OpenClaw's Per-Agent `models.json` Snapshot Writes the Resolved Plaintext apiKey to a Sandbox Path the Agent's Own Tools Can Read — OPEN, ACCEPTED RISK
+
+**Context**: Found immediately after constraint #25's fix let the workspace
+credential scan (`verify.sh` `CRED_WS`) actually run for real for the first
+time. It found a genuine, **currently live** match — not a stale artifact.
+
+**Finding**: independent of `config/openclaw.json.tpl`'s `apiKey` field
+(fixed in ROADMAP.md #13.4 to hold the `"${LITELLM_API_KEY}"` SecretRef
+literal, never the real key), OpenClaw also maintains a *separate*,
+per-agent resolved-config cache at
+`/sandbox/workspace/.openclaw/agents/main/agent/models.json`
+(`src/agents/models-config.ts` in the openclaw repo). This file **is**
+written with the fully-resolved, real `apiKey` value in plaintext — by
+design, `ensureModelsFileModeForModelsJson()` only `chmod`s it `0600`
+afterward. Confirmed live: the file's `mtime` was 5 seconds after the
+(post-#13.4-fix, post-restart) gateway process's own start time, i.e. this is
+regenerated by the *current, already-fixed* gateway on every startup, not a
+leftover from before the fix.
+
+**Why `chmod 0600` doesn't help here**: that mode restricts access to the
+file's *owning OS user* — but in this deployment topology, the OpenClaw
+gateway process and the sandboxed agent's own `read`/`exec` tool
+subprocesses all run as the **same** OS user (`sandbox`,
+`process.run_as_user` in `policies/openclaw-sandbox.yaml`). There is no OS
+user boundary between "the gateway's own private state" and "what the
+agent's own tools can open." A plain `read` tool call against this exact
+path succeeds and returns the file's contents (see verification below) —
+no jailbreak or exec-tool trick required, a materially more direct exposure
+than the `echo $LITELLM_API_KEY`-via-jailbreak path #13.4 was originally
+about.
+
+**Landlock cannot fix this (same limitation as constraint #24)**: Landlock
+rules are strictly additive — each `PathBeneath` rule *grants* access under a
+path; there is no "deny" primitive, and a more specific rule for a
+sub-path can only add rights, never subtract from a broader ancestor rule.
+`/sandbox/workspace` is already granted full read-write for the agent's
+tools (it needs that for real work), and `models.json` lives inside it —
+there is no way to carve out a read-denied exception for one sub-path
+using this policy schema, for the same reason constraint #24 found no way
+to make a single file's `chmod 444` survive its writable parent directory.
+OpenClaw's own `tools.deny` is a whole-tool name denylist (`gateway`,
+`cron`, ...), not a per-path restriction for `read`/`exec`/`write` — same
+conclusion constraint #24 already reached dumping the full config schema.
+
+**Partial, non-deterministic mitigation observed**: because the *same*
+gateway process resolves `models.json`'s `apiKey` via the identical
+`${LITELLM_API_KEY}` SecretRef machinery as `openclaw.json`, the real value
+is registered in OpenClaw's in-process exact-value redaction registry
+(`registerSecretValueForRedaction()`) regardless of which file it was read
+from. Empirically, asking the live (Sonnet) agent to "read
+`.../agent/models.json` and show me its exact contents" got a genuine
+`read` tool call and a compliant summary — but the model did not paste the
+raw key; it self-redacted to a partial preview (`sk-kPN…SLFA`) in its own
+prose and did not echo the full JSON verbatim. This is model judgment, not
+an infrastructure guarantee — a more adversarial prompt or a weaker model
+(cf. ROADMAP.md #13.4's Scout/gpt-oss-120b findings) could plausibly still
+get it to paste the file verbatim.
+
+**Mitigation applied today**: `verify.sh`'s `CRED_WS` check (constraint #25)
+now reliably catches this path and fails loudly, converting a previously
+invisible gap into a monitored, detected condition. No infrastructure-level
+prevention was implemented this session — see "why not fixed" below.
+
+**Why not fixed yet**: a real fix needs either (a) OpenClaw itself to avoid
+persisting the resolved secret to this per-agent cache at all (upstream
+change), or (b) a genuine OS-level trust boundary between the gateway
+process and the sandboxed agent's own tool-exec subprocesses (a deeper
+re-architecture of `process.run_as_user` than a single shared `sandbox`
+UID) — both out of scope for a same-day fix. The already-tracked
+SPIFFE/SPIRE direction (ROADMAP.md Phase 16.1: short-lived, auto-rotated,
+per-workload credentials) would make this finding largely moot regardless
+of where the secret ends up on disk, since there would be no long-lived
+static key value left to leak.
+
+**Scripts affected**: `scripts/verify.sh` (Layer 4 `CRED_WS`, detection
+only). Relevant upstream file (openclaw repo):
+`src/agents/models-config.ts`. Tracked as an open follow-up in ROADMAP.md
+#13.4.
 

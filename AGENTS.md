@@ -69,7 +69,7 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 
 **Responsibilities**:
 - Maintain `config/openclaw.json.tpl` with the MaaS provider definition and `__APPS_DOMAIN__` placeholders.
-- Validate model routing: `maas/gpt-oss-120b` is primary with fallback `maas/llama-scout-17b`; `maas/claude-sonnet-4-6` remains in the catalog as a disabled backup (not in `fallbacks`). To roll back to Sonnet, set `agents.defaults.model.primary` to `maas/claude-sonnet-4-6` and re-run `./scripts/launch-openclaw.sh`.
+- Validate model routing: `maas/claude-sonnet-4-6` is primary (no fallbacks); `maas/gpt-oss-120b` and `maas/llama-scout-17b` remain in the catalog as disabled backups (not in `fallbacks`). After changing `agents.defaults.model.primary`, re-run `./scripts/launch-openclaw.sh`.
 - Test Control UI chat functionality (WebSocket). Keep `gateway.http.endpoints.chatCompletions.enabled` false unless a deliberate HTTP API is required.
 - Run `openclaw doctor --lint` after configuration changes.
 - Verify `auth.mode: trusted-proxy` is correctly configured (no static tokens — see ADR-0012).

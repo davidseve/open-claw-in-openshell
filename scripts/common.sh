@@ -202,42 +202,27 @@ render_template() {
 }
 
 # render_openclaw_config renders config/openclaw.json.tpl like any other
-# template (__APPS_DOMAIN__ substitution), then additionally resolves the
-# __MAAS_API_KEY__ placeholder with the real secret. This is the only
-# template that needs a credential, so the substitution lives here instead
-# of in the generic render_template() to avoid requiring secrets.env for
-# scripts that render other templates (oauth2-proxy, mlflow, values-ocp).
-#
-# The proxy's openshell:resolve:env:KEY credential injection is NOT used for
-# this value because Node.js fetch()/undici connections are too ephemeral
-# for the proxy to map to a process binary (see constraint #3) — the real
-# key must be baked into the config before it reaches the sandbox.
-#
-# Uses bash's literal string replacement (not sed/awk) so that API key
-# characters (/, &, etc.) are never interpreted as pattern/replacement
-# metacharacters.
+# template (__APPS_DOMAIN__ substitution). Unlike the old constraint #3
+# workaround, it no longer bakes the real MAAS_API_KEY into the rendered
+# file: config/openclaw.json.tpl's apiKey field is the literal string
+# "${LITELLM_API_KEY}", OpenClaw's own native env-backed SecretRef syntax
+# (see src/config/types.secrets.ts upstream — ENV_SECRET_TEMPLATE_RE).
+# OpenClaw resolves that placeholder itself from ITS OWN process env at
+# gateway startup (launch-openclaw.sh Step 9b passes --env
+# "LITELLM_API_KEY=..." to `openshell sandbox exec`) — not via the sandbox
+# proxy's openshell:resolve:env:KEY injection, and not via bash string
+# substitution at render time. This means:
+#   1. The real key is never written to any file inside the sandbox.
+#   2. OpenClaw automatically registers the resolved value in its own
+#      exact-value redaction registry (secrets/runtime.ts ->
+#      registerSecretValueForRedaction), so it gets masked in chat
+#      transcripts and tool output (e.g. `echo $LITELLM_API_KEY`) even
+#      though that env var is still present in the sandbox for the
+#      OpenShell provider's curl-based credential injection path.
+# See docs/constraints.md #3 and ROADMAP.md #13.4 for the full history.
 render_openclaw_config() {
   local src="$1" dest="$2"
   render_template "$src" "$dest"
-
-  local secrets_file="${PROJECT_DIR}/secrets/secrets.env"
-  local maas_key="${MAAS_API_KEY:-}"
-  if [[ -z "$maas_key" && -f "$secrets_file" ]]; then
-    set -a
-    source "$secrets_file"
-    set +a
-    maas_key="${MAAS_API_KEY:-}"
-  fi
-
-  if [[ -z "$maas_key" ]]; then
-    warn "MAAS_API_KEY not found in secrets/secrets.env — apiKey in $(basename "$dest") left as __MAAS_API_KEY__ placeholder (LLM requests will fail until set)"
-    return 0
-  fi
-
-  local content
-  content=$(<"$dest")
-  content="${content//__MAAS_API_KEY__/$maas_key}"
-  printf '%s' "$content" > "$dest"
 }
 
 render_all_templates() {
@@ -255,6 +240,51 @@ render_all_templates() {
   # scripts/deploy-oauth2-proxy.sh passes APPS_DOMAIN via `helm --set`
   # instead of rendering a .tpl here.
   info "Templates rendered to ${RENDERED_DIR}/ (APPS_DOMAIN=${APPS_DOMAIN})"
+}
+
+# wait_for_local_port <port> [timeout_seconds] — poll until localhost:port accepts TCP.
+wait_for_local_port() {
+  local port="$1" timeout="${2:-15}" i=0
+  while [[ $i -lt $timeout ]]; do
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${port}/" 2>/dev/null \
+      || curl -s -o /dev/null --connect-timeout 1 -X POST "http://127.0.0.1:${port}/v1/traces" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# otel_http_export_accepted <http_code> <response_body>
+# OTLP/HTTP returns {} on full success; partialSuccess only when some spans were rejected.
+otel_http_export_accepted() {
+  local code="$1" body="$2"
+  [[ "$code" == "200" ]] || return 1
+  [[ -z "$body" || "$body" == "{}" || "$body" == *"partialSuccess"* ]] || return 1
+  return 0
+}
+
+# send_otel_test_trace <local_port> <span_name> — POST a minimal OTLP/HTTP trace.
+# Prints "traceId spanId" on stdout; returns non-zero if the export is rejected.
+send_otel_test_trace() {
+  local port="$1" span_name="$2"
+  local trace_id span_id now_ns end_ns http_code body
+  trace_id=$(python3 -c "import uuid; print(uuid.uuid4().hex)" 2>/dev/null || echo "abcdef1234567890abcdef1234567890")
+  span_id=$(python3 -c "import os; print(os.urandom(8).hex())" 2>/dev/null || echo "1234567890abcdef")
+  now_ns=$(python3 -c "import time; print(int(time.time() * 1e9))")
+  end_ns=$(python3 -c "import time; print(int((time.time()+1) * 1e9))")
+  body=$(curl -s -w '\n%{http_code}' -X POST "http://127.0.0.1:${port}/v1/traces" \
+    -H "Content-Type: application/json" \
+    -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"verify-test\"}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"test\"},\"spans\":[{\"traceId\":\"${trace_id}\",\"spanId\":\"${span_id}\",\"name\":\"${span_name}\",\"kind\":1,\"startTimeUnixNano\":\"${now_ns}\",\"endTimeUnixNano\":\"${end_ns}\",\"status\":{\"code\":1}}]}]}]}" 2>/dev/null || echo -e "\n000")
+  http_code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  if otel_http_export_accepted "$http_code" "$body"; then
+    echo "${trace_id} ${span_id}"
+    return 0
+  fi
+  echo "${body} (HTTP ${http_code})" >&2
+  return 1
 }
 
 check_prereqs() {
@@ -348,6 +378,48 @@ load_secrets() {
 }
 
 
+# Glob-escapes a literal string for safe use inside a `${var#*pattern}`
+# expansion (bash treats `#`/`##` patterns as globs, not literal text).
+_glob_escape() {
+  local s=$1 out="" i c
+  for (( i=0; i<${#s}; i++ )); do
+    c=${s:i:1}
+    case "$c" in
+      '\'|'*'|'?'|'[') out+="\\$c" ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# `openshell sandbox connect` is an interactive PTY: it echoes back the exact
+# bytes it was sent (our command + " && exit") BEFORE running anything, then
+# prints the real output, then echoes the second "exit" that ends the
+# session. Found live during a credential-leak investigation (ROADMAP.md
+# #13.4): several `verify.sh` Layer 4 checks used a
+# `cmd_that_might_fail || echo MARKER` pattern and then grepped the captured
+# output for MARKER — but since the literal text "echo MARKER" is PART OF
+# the command that gets echoed back verbatim, MARKER always appears in the
+# raw transcript regardless of whether the command actually failed. Those
+# checks were reporting PASS unconditionally. Strip the echoed input (and
+# ANSI/\r/closing-"exit" noise) here, once, so every caller gets only the
+# real command output.
+_strip_pty_echo() {
+  local cmd=$1 raw=$2
+  local needle
+  needle="$(_glob_escape "$cmd") && exit"
+  local stripped="${raw#*$needle}"
+  # Unexpected reformatting (e.g. a wrapped multi-line command) means the
+  # exact echoed prefix wasn't found verbatim — return the raw text rather
+  # than silently discarding real output a caller might depend on.
+  if [[ "$stripped" == "$raw" ]]; then
+    stripped=$raw
+  fi
+  stripped=$(printf '%s' "$stripped" | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r')
+  # Drop a trailing bare "exit" line (the echo of the session-ending exit).
+  printf '%s' "$stripped" | sed -E '${/^[[:space:]]*exit[[:space:]]*$/d}'
+}
+
 sandbox_run() {
   # The openshell CLI's "active gateway" is local machine state shared
   # across every project driving it from this same host. If another
@@ -367,7 +439,7 @@ sandbox_run() {
     out=$(printf '%s && exit\n' "$1" \
       | timeout 15 openshell sandbox connect "$SANDBOX_NAME" 2>&1 || true)
   fi
-  printf '%s\n' "$out"
+  printf '%s\n' "$(_strip_pty_echo "$1" "$out")"
 }
 
 # Lightweight OIDC password-grant refresh (no Helm upgrade). Writes

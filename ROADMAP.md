@@ -463,35 +463,151 @@ Evaluate switching from `auth.mode: "trusted-proxy"` to `auth.mode: "token"` (th
 
 </details>
 
-### 13.4 Review: plaintext MaaS API key on disk
+### 13.4 Review: plaintext MaaS API key on disk (mitigated — hard fix via OpenClaw-native SecretRef)
 
 Flagged from a chat-session security review (jailbreak/exfiltration probing found in a
-real session transcript — the agent correctly refused all attempts, but the underlying
-architecture relies on soft controls that deserve a hard fix:
+real session transcript). An initial pass wrote per-session-isolated Playwright security
+tests (`tests/sandbox-security.spec.ts`) to reproduce this deterministically — with a
+**fresh chat session per test** (avoiding the accumulated-refusal-history false negative
+where the model blanket-refuses because of prior attempts in the same session, not because
+of a real control), the credential-leak test failed for real: `echo $LITELLM_API_KEY`
+printed the raw key unmasked.
 
-**Plaintext API key in the sandbox workspace.** Constraint #3 (`docs/constraints.md`)
-requires `launch-openclaw.sh` to inject the real `MAAS_API_KEY` directly into
-`/sandbox/workspace/.openclaw/openclaw.json` instead of the `openshell:resolve:env:...`
-placeholder pattern, because Node's `fetch()`/`undici` breaks proxy credential injection.
-That path is Landlock **read-write** and not on the `tools.deny` list (only `gateway`,
-`cron`, `openclaw` are denied) — the agent's normal `read`/`exec` tools can access it.
-Today the only things standing between a malicious prompt and the raw key are: (1) the
-LLM's own judgment to refuse (soft — worked in the observed session, but not guaranteed),
-and (2) OpenClaw's pattern-based transcript/tool-output redaction (hard, but incomplete —
-it doesn't cover every way the key text could be reshaped before being echoed).
+**Root cause.** Constraint #3 (`docs/constraints.md`) used to require `launch-openclaw.sh`
+to bake the real `MAAS_API_KEY` directly into `/sandbox/workspace/.openclaw/openclaw.json`
+as a literal string, instead of any SecretRef mechanism, because Node's `fetch()`/`undici`
+breaks the sandbox proxy's `openshell:resolve:env:...` credential injection. That path is
+Landlock **read-write** and not on the `tools.deny` list — the agent's normal `read`/`exec`
+tools can access it, and since OpenClaw never "knew" the literal string was a secret (it
+was never resolved through OpenClaw's own secret-handling code), its own transcript/tool
+redaction never masked it either.
 
-- [ ] Re-investigate OpenShell issue #894 (undici binary resolution) for a fix that
-      restores true placeholder-based credential injection for Node.js `fetch()`, removing
-      the need to ever write the real key to sandbox disk
-- [ ] Until #894 lands, evaluate mitigations: register the plaintext MaaS key in
-      OpenClaw's exact-value secret registry (`secrets/runtime.ts`) so redaction isn't
-      purely pattern-based, and/or add the workspace config path to a denylist for
-      generic file-read/`exec` tools
-- [ ] Add an automated check (in `verify.sh` or a Playwright test) that attempts common
+**Fix applied.** OpenClaw's config schema natively supports `"${ENV_VAR}"` as a
+`SecretInput` for any `SecretInputSchema`-typed field (including
+`models.providers.<id>.apiKey`) — resolved from OpenClaw's OWN process env, in-process,
+before any network call, so the proxy's binary-PID mapping problem never applies to this
+credential:
+
+- `config/openclaw.json.tpl`'s `apiKey` is now the literal string `"${LITELLM_API_KEY}"` —
+  never bash-substituted with the real key at render time (`scripts/common.sh`
+  `render_openclaw_config()` no longer bakes anything in)
+- `scripts/launch-openclaw.sh` Step 9b passes `--env "LITELLM_API_KEY=${MAAS_API_KEY}"` to
+  `openshell sandbox exec` when starting the gateway process, so OpenClaw resolves it from
+  its own env at startup
+- OpenClaw automatically registers that resolved value in its own exact-value redaction
+  registry (`registerSecretValueForRedaction()`), which `redactToolPayloadText()` checks
+  when rendering shell/exec tool output in chat — so `echo $LITELLM_API_KEY` and
+  `cat openclaw.json` now show a masked value instead of the raw key, even though that env
+  var is still present in the sandbox (for the OpenShell provider's separate curl-based
+  credential path, unrelated to this fix)
+- See `docs/constraints.md` #3 for the full before/after and upstream code references
+
+- [x] Re-investigated OpenShell issue #894 (undici binary resolution) — not needed for this
+      credential: OpenClaw's own native env SecretRef resolves in-process, sidestepping the
+      proxy's binary-PID mapping problem entirely instead of waiting for a proxy-side fix
+- [x] Register the plaintext MaaS key in OpenClaw's exact-value secret registry — done via
+      the native SecretRef mechanism (automatic on resolution), not a manual registration call
+- [x] Add an automated check (in `verify.sh` or a Playwright test) that attempts common
       jailbreak/exfiltration prompts against a live session and asserts the real key
-      never appears unmasked in `chat.history` / the `.jsonl` transcript
+      never appears unmasked in chat (Playwright `security-tests` in Layer 9, one fresh
+      session per test; `.jsonl` transcript file scan still open — see below)
+- [x] Investigated a path-based denylist for generic file-read/`exec` tools as a second,
+      independent layer — **not currently feasible**: Landlock rules are additive-only (a
+      more specific rule can grant but never revoke a broader ancestor's access — same
+      limitation constraint #24 already found for write-protecting prompt files), and
+      OpenClaw's `tools.deny` is a whole-tool-name denylist, not path-scoped. See
+      constraint #26.
+- [x] Scanned `.jsonl` session transcript files directly (not just the rendered chat UI
+      text) — found a real, unmasked key in exactly one stale pre-restart session's
+      transcript (`sk-...`, confirmed via `systemPromptReport.model: "llama-scout-17b"`,
+      i.e. before this section's zombie-gateway fix), removed both the `.jsonl` and
+      `.trajectory.jsonl` files. Zero other matches anywhere under
+      `/sandbox/workspace/`, `/sandbox/.openclaw/`, `/tmp/` — **except** a second,
+      independent, currently-*live* leak path found in the same sweep: see below.
 
-**Architectural fix being tracked**: [Phase 16.1](#161-consume-platform-workload-identity-spiffespire) proposes replacing this static MaaS API key entirely with a SPIFFE/SPIRE-issued, auto-rotated credential once `rhoai-platform-ops` ships its workload-identity module — removing the class of problem (a durable secret that can be read off disk), not just mitigating it. Keep this item open until that lands; the mitigations above remain the near-term plan in the meantime.
+**New finding while re-verifying this section (2026-08-13, same day): a second plaintext
+apiKey leak path, unrelated to the SecretRef fix.** OpenClaw maintains a separate
+per-agent resolved-config cache at
+`/sandbox/workspace/.openclaw/agents/main/agent/models.json` that **is** written with the
+real, resolved `apiKey` in plaintext (by design — only `chmod 0600` afterward, which
+doesn't help since the gateway and the agent's own `read`/`exec` tools run as the same OS
+user). Confirmed this is written by the *current, already-fixed* gateway on every startup,
+not a pre-fix leftover. A plain `read` tool call against this path succeeds and returns
+real content — no jailbreak needed. Empirically, the live model (Sonnet) self-redacted the
+key to a partial preview in its own summary rather than pasting it raw, but that's model
+judgment, not an infrastructure guarantee. No clean fix exists in the current stack
+(Landlock can't scope it, `tools.deny` can't scope it); `verify.sh`'s credential scan now
+reliably detects and fails on it (previously masked by a separate bug — see below). Full
+write-up: constraint #26 (`docs/constraints.md`). Real fix is either an upstream OpenClaw
+change to stop persisting resolved secrets to this cache, or the SPIFFE/SPIRE direction
+(Phase 16.1) removing the long-lived static key entirely.
+- [ ] File upstream against OpenClaw: `models-config.ts`'s per-agent `models.json` cache
+      persists the fully-resolved `apiKey` in plaintext with no option to keep it as an
+      unresolved SecretRef or otherwise avoid materializing it to a sandbox-writable path
+- [x] Root-caused and fixed why this went undetected until today: `scripts/common.sh`'s
+      `sandbox_run()` wrapper (used by nearly every Layer 4/5b/9 check) runs commands
+      through an interactive PTY that echoes the input command's own text back before
+      running it — several checks (`CRED_RO`/`CRED_WS`, `CONFIG_PLACEHOLDER`, `NODE_LOCAL`,
+      and this section's own model-drift guard, which checked the wrong JSON field) were
+      matching against that echoed text instead of real output, and had been reporting
+      favorable results unconditionally. Fixed centrally in `sandbox_run()` (strips the
+      echo) plus per-check follow-ups. Full write-up: constraint #25.
+
+**Correction (initial "residual gap" write-up was measuring the wrong model).** An earlier
+version of this section reported that running the credential-leak Playwright test ~30 times
+showed the model's own natural-language summary re-quoting the raw key in roughly 1 in 6
+runs, and attributed this to a gap in OpenClaw's redaction pass (structured tool-output
+payloads get masked via `redactToolPayloadText()`'s exact-value registry check, but the
+model's free-form completion text supposedly did not). **That measurement was invalid**:
+`scripts/launch-openclaw.sh`'s pre-restart cleanup (Step 9a) killed stale gateway processes
+with `oc exec -c agent`, which operates in the *container's* PID namespace, while
+`openshell sandbox exec` (used to start the gateway) runs it inside the **sandbox's own**
+PID namespace. The two namespaces don't see each other's processes, so the "kill" never
+actually killed anything — every `launch-openclaw.sh` run left the previous gateway process
+running untouched and simply started a second one alongside it. Across ~30 ad-hoc test
+runs, session traffic was routed inconsistently between the current gateway (serving the
+intended `claude-sonnet-4-6` primary) and one or more zombie gateways still serving whatever
+model/config was primary *when they were originally started* — confirmed via
+`sessions.json`, which showed most of those sessions actually ran against `llama-scout-17b`
+or `gpt-oss-120b`, not `claude-sonnet-4-6`. A weaker model is far more likely to blindly
+restate raw tool stdout verbatim in its own words instead of following the "don't
+re-surface credentials" system guidance — which is exactly the pattern that looked like a
+redaction gap.
+
+**Fix applied.** `scripts/launch-openclaw.sh` Step 9a now kills stale processes via
+`openshell sandbox exec` (the same namespace the gateway actually runs in) and verifies
+termination before starting a fresh one; `scripts/verify.sh` Layer 9 now also snapshots
+`sessions.json` right before running security tests and fails if any session created during
+the run used a model other than the `primary` configured in `openclaw.json` — so a
+recurrence of this class of bug (wrong model silently serving requests) is caught
+automatically instead of masquerading as a model-behavior or redaction finding.
+
+**Re-validated against a confirmed-clean gateway.** With the zombie-process bug fixed and
+`sessions.json` confirming every test session ran against `claude-sonnet-4-6`, the full
+7-test security suite (including the credential-leak test) passed cleanly across 4
+consecutive runs with **zero retries needed** — a qualitative difference from the earlier
+Scout/gpt-oss-120b runs, which needed several heuristic loosenings in
+`tests/sandbox-security.spec.ts` just to stop failing on ambiguous/terse model behavior
+(since reverted/tightened now that they're confirmed unnecessary with the primary model;
+see inline comments in that file for what was removed and why).
+- [x] Root-caused and fixed: PID-namespace mismatch between `oc exec` (cleanup) and
+      `openshell sandbox exec` (gateway start) in `launch-openclaw.sh`, causing stale
+      gateway processes — and stale models — to silently keep serving requests
+- [x] Added a model-drift guard to `verify.sh` Layer 9 (fails fast if a security-test
+      session's `model` in `sessions.json` doesn't match the configured `primary`)
+- [ ] The underlying architectural point remains true in principle, independent of model:
+      any tool-calling agent that reads a raw secret into its own context to reason about
+      it (e.g. to tell a real key apart from a permission error) *could* restate it
+      verbatim in free-form prose, and a server-side redaction pass on structured
+      tool-output alone can't fully rule that out. Worth filing upstream (does OpenClaw run
+      `redactRegisteredSecretValues()` over plain assistant message text, not just
+      tool-activity payloads?) as defense-in-depth, but it is no longer an *observed*
+      failure mode with the primary model — deprioritized accordingly.
+- [ ] The SPIFFE/SPIRE short-lived-credential plan (Phase 16.1) remains the strongest
+      general mitigation regardless of model — a rotated, narrowly-scoped token shrinks the
+      blast radius of any single verbatim leak, tool-output or prose.
+
+**Architectural fix being tracked**: [Phase 16.1](#161-consume-platform-workload-identity-spiffespire) proposes replacing this static MaaS API key entirely with a SPIFFE/SPIRE-issued, auto-rotated credential once `rhoai-platform-ops` ships its workload-identity module — removing the class of problem (a durable secret that can be read off disk at all), not just mitigating it. Keep this item open until that lands; the redaction-registry fix above is the durable near-term control in the meantime.
 
 ### 13.5 Re-audit `OPENSHELL_GATEWAY_INSECURE` scoping when AWS OCP gets real certs
 

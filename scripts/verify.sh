@@ -40,8 +40,8 @@
 #   Layer 7b: External access (service route, oauth2-proxy OIDC)
 #   Layer 8:  Observability stack (Tempo, OTel Collector) + RHOAI MLflow infra
 #   Layer 8b: MLflow Prompt Registry (prompts, aliases, manifest, linker)
-#   Layer 9:  Control UI (Playwright — OpenClaw chat E2E only; sandbox
-#             enforcement is Layer 4 — LLM-mediated security specs were flaky)
+#   Layer 9:  Control UI (Playwright — OpenClaw chat E2E + jailbreak/exfiltration
+#             tests via security-tests; deterministic sandbox policy is Layer 4)
 #   Layer 10: MLflow traces + Prompt tags (API) and MLflow UI (Playwright)
 #             — runs AFTER Layer 9 so E2E chat traces exist first
 #
@@ -248,12 +248,13 @@ fi
 #   - DNS/connect to arbitrary hosts fails or is proxy-denied
 #   - /etc/shadow not readable as password hashes
 #   - MaaS reachability: the one allowed destination must work
-#   - Credential isolation: no plaintext API keys on sandbox filesystem
+#   - Credential isolation: no plaintext API keys on sandbox filesystem —
+#     apiKey is OpenClaw's native "${LITELLM_API_KEY}" env SecretRef,
+#     resolved in-process at gateway startup, never baked into the file
+#     (see constraint #3 in launch-openclaw.sh / ROADMAP.md #13.4)
 #   - Landlock enforcement: /sandbox/.openclaw must be read-only
-#   - Config placeholders: openshell:resolve:env markers must exist in the
-#     ORIGINAL config (at /sandbox/.openclaw/config.json). The WORKING config
-#     at /sandbox/workspace/.openclaw/openclaw.json has the real key injected
-#     by launch-openclaw.sh (see constraint #3 in launch-openclaw.sh).
+#   - Config placeholder: the ${LITELLM_API_KEY} marker must still be intact
+#     in the working config at /sandbox/workspace/.openclaw/openclaw.json
 # HOW TO FIX: These indicate fundamental sandbox security issues. Check
 #   policies/openclaw-sandbox.yaml and the SCC binding.
 step "Layer 4: Security Validation"
@@ -350,25 +351,39 @@ if command -v openshell &>/dev/null; then
   fi
 
   # Verify no plaintext credentials on sandbox filesystem.
-  # /sandbox/.openclaw/ is read-only (Landlock) and uses openshell:resolve:env placeholders.
-  # /sandbox/workspace/.openclaw/ has the working config where launch-openclaw.sh injects
-  # the real API key (constraint #3). This is a known workaround — warn, don't fail.
-  CRED_RO=$(sandbox_run 'grep -rl "sk-" /sandbox/.openclaw/ /tmp/ 2>/dev/null | head -1 || echo CLEAN' || true)
+  # /sandbox/.openclaw/ is read-only (Landlock). /sandbox/workspace/.openclaw/
+  # is the working config — since config/openclaw.json.tpl's apiKey is now
+  # OpenClaw's native "${LITELLM_API_KEY}" env SecretRef (resolved in-process
+  # at gateway startup, never baked into the file — see constraint #3 /
+  # ROADMAP.md #13.4), neither location should ever contain a raw "sk-" key.
+  # This is a hard fail now, not the former known-workaround warn.
+  # Match a plausible key SHAPE (sk-<16+ alnum>), not a bare "sk-" substring
+  # — the latter false-positives constantly on unrelated build artifacts
+  # under node_modules (minified bundles, source maps, etc.), which used to
+  # bury the real match under `head -1` noise. Also: `grep ... | head -N
+  # || echo MARKER` looks like it distinguishes "found" vs "clean" by exit
+  # status, but the exit status of a pipeline is the LAST command's (head),
+  # which succeeds whether or not grep matched anything — so `|| echo
+  # MARKER` never actually fires on "no match" either. Use an explicit
+  # if/else inside the sandboxed command instead of relying on pipe exit
+  # status or embedded fallback text (see `_strip_pty_echo` in common.sh for
+  # why embedded fallback text was doubly unreliable until that fix).
+  CRED_RO=$(sandbox_run 'M=$(grep -rlE "sk-[A-Za-z0-9]{16,}" /sandbox/.openclaw/ /tmp/ --exclude-dir=node_modules 2>/dev/null); if [ -n "$M" ]; then echo "$M"; else echo CLEAN; fi' || true)
   if ! _sandbox_run_ok "$CRED_RO"; then
     fail "SECURITY: cannot verify read-only credential zone (sandbox_run failed)"
-  elif echo "$CRED_RO" | grep -q "CLEAN"; then
+  elif echo "$CRED_RO" | grep -qx "CLEAN"; then
     pass "No plaintext API keys in read-only zone (/sandbox/.openclaw/, /tmp/)"
   else
-    fail "SECURITY: API key found in read-only filesystem zone"
+    fail "SECURITY: API key found in read-only filesystem zone: $(echo "$CRED_RO" | head -3 | tr '\n' ' ')"
   fi
 
-  CRED_WS=$(sandbox_run 'grep -rl "sk-" /sandbox/workspace/.openclaw/ 2>/dev/null | head -1 || echo CLEAN' || true)
+  CRED_WS=$(sandbox_run 'M=$(grep -rlE "sk-[A-Za-z0-9]{16,}" /sandbox/workspace/.openclaw/ --exclude-dir=node_modules 2>/dev/null); if [ -n "$M" ]; then echo "$M"; else echo CLEAN; fi' || true)
   if ! _sandbox_run_ok "$CRED_WS"; then
     warn "Workspace credential check skipped (sandbox_run failed)"
-  elif echo "$CRED_WS" | grep -q "CLEAN"; then
+  elif echo "$CRED_WS" | grep -qx "CLEAN"; then
     pass "No plaintext API keys in workspace config"
   else
-    warn "API key present in /sandbox/workspace/.openclaw/ (known workaround — constraint #3, OpenShell issue #894)"
+    fail "SECURITY: API key present in /sandbox/workspace/.openclaw/: $(echo "$CRED_WS" | head -3 | tr '\n' ' ') (apiKey should be the \${LITELLM_API_KEY} SecretRef literal, never a real key)"
   fi
 
   # Verify Landlock: /sandbox/.openclaw/ must be read-only
@@ -392,13 +407,16 @@ if command -v openshell &>/dev/null; then
     fail "/sandbox/workspace/ should be writable but write failed"
   fi
 
-  # Verify credential placeholder exists in ORIGINAL config (read-only zone).
-  # The WORKING config has the real key injected — that's by design (constraint #3).
-  CONFIG_PLACEHOLDER=$(sandbox_run 'grep -l "openshell:resolve:env" /sandbox/.openclaw/config.json /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
+  # Verify the working config still holds OpenClaw's native env SecretRef
+  # literal, not a real key. Since config/openclaw.json.tpl's apiKey field
+  # is never bash-substituted with the real secret anymore (constraint #3 /
+  # ROADMAP.md #13.4), this placeholder should be present at rest and only
+  # resolved in-process by OpenClaw at gateway startup.
+  CONFIG_PLACEHOLDER=$(sandbox_run 'grep -l "LITELLM_API_KEY" /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
   if ! _sandbox_run_ok "$CONFIG_PLACEHOLDER"; then
     fail "SECURITY: cannot verify config placeholder (sandbox_run failed)"
   elif echo "$CONFIG_PLACEHOLDER" | grep -q "FOUND"; then
-    pass "Config placeholder openshell:resolve:env still intact"
+    pass "Config placeholder \${LITELLM_API_KEY} still intact"
   else
     fail "SECURITY: config placeholder was modified or missing"
   fi
@@ -428,7 +446,7 @@ if command -v openshell &>/dev/null; then
     fail "OpenClaw health check failed"
   fi
 
-  CONFIG_CHECK=$(sandbox_run 'grep -l "openshell:resolve:env" /sandbox/.openclaw/config.json /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
+  CONFIG_CHECK=$(sandbox_run 'grep -l "LITELLM_API_KEY" /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
   if echo "$CONFIG_CHECK" | grep -q "FOUND"; then
     pass "Credential injection placeholder configured"
   else
@@ -781,33 +799,35 @@ elif oc get ns "$OBS_NAMESPACE" &>/dev/null; then
   # Send a test trace through the OTel pipeline to verify it's working
   oc -n "$OBS_NAMESPACE" port-forward svc/otel-collector 24318:4318 &>/dev/null &
   TRACE_PF_PID=$!
-  sleep 2
-
-  TEST_TRACE_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex)" 2>/dev/null || echo "abcdef1234567890abcdef1234567890")
-  TEST_SPAN_ID=$(python3 -c "import os; print(os.urandom(8).hex())" 2>/dev/null || echo "1234567890abcdef")
-  NOW_NS=$(python3 -c "import time; print(int(time.time() * 1e9))")
-  END_NS=$(python3 -c "import time; print(int((time.time()+1) * 1e9))")
-
-  TRACE_RESP=$(curl -s -X POST http://localhost:24318/v1/traces \
-    -H "Content-Type: application/json" \
-    -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"verify-test\"}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"test\"},\"spans\":[{\"traceId\":\"${TEST_TRACE_ID}\",\"spanId\":\"${TEST_SPAN_ID}\",\"name\":\"verify-trace\",\"kind\":1,\"startTimeUnixNano\":\"${NOW_NS}\",\"endTimeUnixNano\":\"${END_NS}\",\"status\":{\"code\":1}}]}]}]}" 2>/dev/null || echo "error")
+  if wait_for_local_port 24318 20; then
+    if TRACE_IDS=$(send_otel_test_trace 24318 verify-trace); then
+      TEST_TRACE_ID="${TRACE_IDS%% *}"
+      pass "Trace pipeline: OTel Collector accepts OTLP traces"
+    else
+      fail "Trace pipeline: could not send trace to collector"
+      TEST_TRACE_ID=""
+    fi
+  else
+    fail "Trace pipeline: port-forward to otel-collector:4318 not ready"
+    TEST_TRACE_ID=""
+  fi
 
   kill $TRACE_PF_PID 2>/dev/null || true
 
-  if echo "$TRACE_RESP" | grep -q "partialSuccess"; then
-    pass "Trace pipeline: OTel Collector accepts OTLP traces"
-  else
-    fail "Trace pipeline: could not send trace to collector"
+  if [[ -z "$TEST_TRACE_ID" ]]; then
+    : # already failed above
   fi
 
-  sleep 5
+  if [[ -n "$TEST_TRACE_ID" ]]; then
+    sleep 5
 
-  TRACE_VERIFY=$(oc -n "$OBS_NAMESPACE" exec deployment/tempo -- \
-    wget -qO- "http://localhost:3200/api/traces/${TEST_TRACE_ID}" 2>/dev/null || echo "{}")
-  if echo "$TRACE_VERIFY" | grep -q "verify-trace"; then
-    pass "Trace pipeline: trace stored in Tempo and retrievable"
-  else
-    warn "Trace pipeline: trace not yet visible in Tempo (may need more time)"
+    TRACE_VERIFY=$(oc -n "$OBS_NAMESPACE" exec deployment/tempo -- \
+      wget -qO- "http://localhost:3200/api/traces/${TEST_TRACE_ID}" 2>/dev/null || echo "{}")
+    if echo "$TRACE_VERIFY" | grep -q "verify-trace"; then
+      pass "Trace pipeline: trace stored in Tempo and retrievable"
+    else
+      warn "Trace pipeline: trace not yet visible in Tempo (may need more time)"
+    fi
   fi
 
 else
@@ -987,13 +1007,79 @@ else
     (cd "$TEST_DIR" && npx playwright install chromium) 2>&1 | tail -5
 
     export OPENCLAW_BASE_URL
-    # Security enforcement is Layer 4 (sandbox_run). Do not run
-    # security-tests: those asked the LLM via chat and pattern-matched
-    # refusals — flaky and not a measure of sandbox policy.
+    load_secrets
+    export MAAS_API_KEY
     if (cd "$TEST_DIR" && npx playwright test --project=ui-tests) 2>&1; then
       pass "Playwright Control UI tests passed (OIDC flow)"
     else
-      fail "Playwright tests failed"
+      fail "Playwright Control UI tests failed"
+    fi
+
+    # PROBE_START_MS marks "now" so the model-drift guard below only looks at
+    # sessions the run about to happen actually creates (session keys embed
+    # Date.now(), see tests/helpers.ts uniqueSessionKey()).
+    PROBE_START_MS=$(python3 -c "import time; print(int(time.time()*1000))")
+    SECURITY_TESTS_STATUS=0
+    (cd "$TEST_DIR" && npx playwright test --project=security-tests) 2>&1 || SECURITY_TESTS_STATUS=$?
+
+    # Guard against stale-model drift: gateway.reload.mode is "off" (openclaw.json),
+    # so a gateway process that was already running when agents.defaults.model.primary
+    # changed on disk keeps handing NEW sessions the model that was loaded into memory
+    # at its OWN last startup — silently testing a different model than configured,
+    # with no error anywhere. Found live 2026-08-13: 121/141 security-test sessions ran
+    # on llama-scout-17b while primary said claude-sonnet-4-6 (gateway hadn't been
+    # restarted since before the primary was fixed). See ROADMAP.md #13.4. Verify here
+    # against the REAL sessions this run just created — sessions.json is ground truth,
+    # not the config file or the UI.
+    PRIMARY_MODEL_FULL=$(python3 -c "import json; print(json.load(open('${RENDERED_DIR}/openclaw.json'))['agents']['defaults']['model']['primary'])" 2>/dev/null || echo "")
+    PRIMARY_MODEL="${PRIMARY_MODEL_FULL#*/}"
+    if [[ -n "$PRIMARY_MODEL" ]]; then
+      MODEL_CHECK=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- python3 -c "
+import json
+data = json.load(open('/sandbox/workspace/.openclaw/agents/main/sessions/sessions.json'))
+start = ${PROBE_START_MS}
+primary = '${PRIMARY_MODEL}'
+bad = []
+seen = 0
+for k, v in data.items():
+    if ':security-' not in k or not isinstance(v, dict):
+        continue
+    tail = k.split(':security-', 1)[1]
+    epoch_str = tail.split('-', 1)[0]
+    if not epoch_str.isdigit() or int(epoch_str) < start:
+        continue
+    seen += 1
+    # The top-level 'model' key is always null in practice — the model a
+    # session actually ran against is recorded under systemPromptReport.model
+    # (confirmed live 2026-08-13 while forensically tracing a leaked-key chat
+    # transcript back to a specific stale-gateway session; the original
+    # version of this guard checked the always-null field and therefore never
+    # actually caught anything, silently). See ROADMAP.md #13.4.
+    model = (v.get('systemPromptReport') or {}).get('model')
+    if model and model != primary:
+        bad.append((k, model))
+if seen == 0:
+    print('NO_SESSIONS_FOUND')
+elif bad:
+    print('MISMATCH:' + repr(bad[:5]))
+else:
+    print('OK:' + str(seen))
+" 2>&1) || true
+      if echo "$MODEL_CHECK" | grep -q "^OK:"; then
+        pass "Security tests ran against the configured primary model (${PRIMARY_MODEL})"
+      elif echo "$MODEL_CHECK" | grep -q "^MISMATCH"; then
+        fail "SECURITY TESTS RAN AGAINST THE WRONG MODEL (expected ${PRIMARY_MODEL}): ${MODEL_CHECK#MISMATCH:}. The gateway process didn't pick up the current primary (gateway.reload.mode=off never hot-reloads it). Fix: ./scripts/launch-openclaw.sh (restarts the gateway), then re-run this layer."
+      else
+        warn "Could not verify which model the security tests ran against (${MODEL_CHECK:-no output}); results above may be invalid"
+      fi
+    else
+      warn "Could not read agents.defaults.model.primary from ${RENDERED_DIR}/openclaw.json — skipping model-drift guard"
+    fi
+
+    if [[ "$SECURITY_TESTS_STATUS" -eq 0 ]]; then
+      pass "Playwright security exfiltration tests passed"
+    else
+      fail "Playwright security exfiltration tests failed"
     fi
   else
     warn "Playwright not installed, skipping UI tests"

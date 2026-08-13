@@ -30,9 +30,15 @@
 #      map to a process binary via /proc/net/tcp. This causes DENIED with
 #      "failed to resolve peer binary".
 #      => Do NOT rely on proxy credential injection for Node.js fetch().
-#      => Bake the real API key into openclaw.json at template-render time
-#         instead (see render_openclaw_config() in common.sh, which resolves
-#         the __MAAS_API_KEY__ placeholder from openclaw.json.tpl).
+#      => Instead, config/openclaw.json.tpl's apiKey is the literal string
+#         "${LITELLM_API_KEY}" — OpenClaw's OWN native env-backed SecretRef
+#         syntax (resolved in-process, before any fetch() call is made, so
+#         the proxy's binary-resolution problem never applies to this
+#         credential). Step 9b below passes --env "LITELLM_API_KEY=..." to
+#         `openshell sandbox exec` so OpenClaw's gateway process resolves it
+#         at startup. The real key is never written to openclaw.json on disk,
+#         and OpenClaw auto-registers the resolved value in its own
+#         exact-value redaction registry, masking it in chat/tool output.
 #      => Do NOT set HTTP_PROXY or HTTPS_PROXY — this forces fetch() to use
 #         HTTP CONNECT tunneling, which the proxy rejects with 403.
 #      => Do NOT set NODE_OPTIONS="--require http-proxy-bootstrap.js" — same
@@ -70,11 +76,18 @@
 #
 #   6. PROCESS MANAGEMENT: The gateway binary is called openclaw-gateway
 #      but resolves to /usr/bin/node via /proc/<pid>/exe. When killing,
-#      use `pgrep -f "openclaw\|node"` not just `pkill node`, because
-#      the process name in `ps` is "openclaw-gatewa" (truncated).
+#      use `pgrep -f "openclaw-gateway\|prompt-trace-linker"`.
 #      Stale lock files at .openclaw/state/*.lock prevent restart.
 #      => Always clean locks before starting.
 #      => Always kill ALL node processes before restart (gateway + linker).
+#      => MUST kill via `openshell sandbox exec` (same namespace as constraint
+#         #11), NOT `oc exec -c agent` — `oc exec` reaches a different
+#         namespace where `pgrep -f` finds nothing, so the kill silently
+#         no-ops while the real process keeps running. Found live 2026-08-13:
+#         a gateway survived 5 hours and 6+ "restarts" this way, serving
+#         every test against a stale pre-fix in-memory config the whole time
+#         (ROADMAP.md #13.4). Verify the process list is actually empty
+#         after killing — don't trust exit code 0 alone.
 #
 #   7. OTEL EXPORTERS: Setting OTEL_LOGS_EXPORTER=otlp or OTEL_METRICS_EXPORTER=otlp
 #      can cause the gateway to attempt network connections that the proxy may
@@ -98,6 +111,7 @@ source "$(dirname "$0")/common.sh"
 # disk — no live hot-patch of a running sandbox afterwards.
 check_openshell_cli
 detect_environment
+load_secrets
 render_all_templates
 
 step "Loading RHOAI MLflow wiring facts"
@@ -195,13 +209,14 @@ fi
 # /sandbox/ is read-only (Landlock). OpenClaw needs to write state, logs, and
 # locks. We set HOME=/sandbox/workspace so .openclaw/ is writable. (See constraint #1)
 #
-# The real MaaS API key is already baked into ${RENDERED_DIR}/openclaw.json by
-# render_openclaw_config() (see common.sh), which resolves the __MAAS_API_KEY__
-# placeholder from config/openclaw.json.tpl at render time. No separate
-# post-copy injection step is needed. (See constraint #3 — the sandbox proxy's
-# openshell:resolve:env:KEY injection is not used here because Node.js
-# fetch()/undici connections are too ephemeral for the proxy to map to a
-# process binary.)
+# ${RENDERED_DIR}/openclaw.json's apiKey field is the literal string
+# "${LITELLM_API_KEY}" — OpenClaw's own native env SecretRef syntax, resolved
+# by OpenClaw itself from its process env at gateway startup (Step 9b), not
+# baked in at template-render time. The real key is never written to this
+# file. (See constraint #3 — the sandbox proxy's openshell:resolve:env:KEY
+# injection is still not used here, since Node.js fetch()/undici connections
+# are too ephemeral for the proxy to map to a process binary; OpenClaw's own
+# in-process SecretRef resolution sidesteps that problem entirely.)
 step "Copying config to writable workspace"
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/state
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/agents
@@ -213,6 +228,46 @@ SANDBOX_UID=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- id -u sandbox 
 SANDBOX_GID=$(oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- id -g sandbox 2>/dev/null || echo "1000")
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- chown -R "${SANDBOX_UID}:${SANDBOX_GID}" /sandbox/workspace
 info "Config at /sandbox/workspace/.openclaw/openclaw.json"
+
+# OpenClaw persists per-session model overrides in sessions.json (server-side).
+# Refreshing the Control UI does NOT clear them — only config.primary changes
+# in openclaw.json. After we change agents.defaults.model.primary (e.g. back
+# to Sonnet), stale overrides like llama-scout-17b keep the old model active
+# and the UI model picker may appear broken (known OpenClaw 2026.7.1 quirk).
+# On every launch: drop session-level model overrides so sessions inherit the
+# freshly rendered config primary, and remove the cached models catalog so
+# the gateway rebuilds aliases from openclaw.json on restart.
+step "Resetting stale session model overrides to config primary"
+PRIMARY_MODEL=$(python3 -c "import json; print(json.load(open('${RENDERED_DIR}/openclaw.json'))['agents']['defaults']['model']['primary'])")
+oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- python3 -c "
+import json
+from pathlib import Path
+
+primary = '${PRIMARY_MODEL}'
+sessions_path = Path('/sandbox/workspace/.openclaw/agents/main/sessions/sessions.json')
+if sessions_path.exists():
+    data = json.loads(sessions_path.read_text())
+    changed = 0
+    for entry in data.values():
+        if not isinstance(entry, dict):
+            continue
+        if 'model' in entry or 'modelProvider' in entry:
+            entry.pop('model', None)
+            entry.pop('modelProvider', None)
+            changed += 1
+    if changed:
+        sessions_path.write_text(json.dumps(data, indent=2) + '\n')
+        print(f'Cleared model override on {changed} session(s); will inherit primary={primary}')
+    else:
+        print('No session model overrides to clear')
+else:
+    print('No sessions.json yet')
+
+models_cache = Path('/sandbox/workspace/.openclaw/agents/main/agent/models.json')
+if models_cache.exists():
+    models_cache.unlink()
+    print('Removed stale models.json cache')
+" 2>&1 | while IFS= read -r line; do info "  $line"; done || warn "Could not reset session model overrides (non-fatal)"
 
 # RHOAI MLflow mode: stage the openshift-service-ca.crt bundle inside the
 # sandbox workspace so the mlflow-openclaw plugin's Node process (not the
@@ -377,7 +432,11 @@ echo "$BASELINE_OUTPUT" | tail -3 | while IFS= read -r line; do info "  $line"; 
 #    namespace. If the gateway binds to 127.0.0.1 in the container root
 #    namespace, the relay gets "Connection refused" and the web UI shows
 #    "Service endpoint is not reachable".
-#    - Use `oc exec` ONLY for cleanup (kill, chown) — runs as root in container ns
+#    - Use `oc exec` ONLY for file ownership/lock cleanup — runs as root in
+#      container ns. Do NOT use it to kill gateway/linker processes — they
+#      live in the sandbox namespace, not the container ns, so `oc exec --
+#      pgrep -f ...` finds nothing there (found live 2026-08-13, see
+#      constraint #6). Killing must go through `openshell sandbox exec` too.
 #    - Use `openshell sandbox exec --no-tty` for starting processes — runs in
 #      the sandbox namespace via the gRPC exec endpoint, same as `sandbox
 #      connect` but without a PTY (no ANSI escape codes to filter) and with
@@ -402,13 +461,54 @@ echo "$BASELINE_OUTPUT" | tail -3 | while IFS= read -r line; do info "  $line"; 
 
 step "Starting OpenClaw gateway and trace linker"
 
-# Step 9a: Cleanup (oc exec = root, container namespace)
-# Fix ownership of ALL files the gateway needs to write. Previous steps
-# (plugin install, prompt seed, config injection) run as root and leave
-# files owned by root. The gateway runs as sandbox user.
+# Step 9a-i: Kill stale processes — MUST run via `openshell sandbox exec`,
+# NOT `oc exec -c agent`. `oc exec -c agent` reaches the container's OUTER
+# namespace, while the gateway/linker actually run inside the ISOLATED
+# sandbox namespace reached by `openshell sandbox exec`/`sandbox connect`
+# (same distinction as constraint 6/11 above, which we'd previously only
+# applied to STARTING processes, not killing them). `oc exec -c agent --
+# pgrep -f "openclaw|node"` finds NOTHING there even while a real gateway is
+# alive and serving traffic in the sandbox namespace — so this kill was
+# always a silent no-op. Found live 2026-08-13: a gateway process survived
+# FIVE HOURS and at least six prior "restarts" completely undetected,
+# quietly serving every chat/security-test turn against a stale, pre-fix
+# in-memory model config (agents.defaults.model.primary changes on disk
+# never reached it) — see ROADMAP.md #13.4 and docs/constraints.md #6.
+# Verify empty afterward instead of trusting a silent no-op; retry once,
+# then hard-fail rather than silently starting a second gateway that will
+# fail to bind the port and leave the stale one as the sole survivor.
+kill_stale_openclaw_processes() {
+  openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 15 -- bash -c '
+    for p in $(pgrep -f "openclaw-gateway|prompt-trace-linker" 2>/dev/null); do
+      kill -9 "$p" 2>/dev/null
+    done
+    sleep 2
+    pgrep -af "openclaw-gateway|prompt-trace-linker" 2>/dev/null
+    true
+  ' 2>&1
+  return 0
+}
+STALE_CHECK="$(kill_stale_openclaw_processes)"
+if echo "$STALE_CHECK" | grep -qE "openclaw-gateway|prompt-trace-linker"; then
+  warn "Stale gateway/linker process(es) survived first kill attempt — retrying:"
+  echo "$STALE_CHECK" | while IFS= read -r line; do info "  $line"; done
+  STALE_CHECK="$(kill_stale_openclaw_processes)"
+fi
+if echo "$STALE_CHECK" | grep -qE "openclaw-gateway|prompt-trace-linker"; then
+  error "Could not kill stale OpenClaw process(es) after 2 attempts — refusing to start a second gateway on top of a live one:"
+  echo "$STALE_CHECK" | while IFS= read -r line; do error "  $line"; done
+  error "Fix: openshell sandbox connect ${SANDBOX_NAME}, then manually 'kill -9 <pid>' for each, then re-run this script."
+  exit 1
+fi
+info "Confirmed no stale gateway/linker processes remain"
+
+# Step 9a-ii: Fix ownership of ALL files the gateway needs to write (oc exec
+# = root, container namespace — file ownership/locks are on the shared
+# workspace volume, so this part IS reachable from either namespace, unlike
+# the process kill above). Previous steps (plugin install, prompt seed,
+# config injection) run as root and leave files owned by root. The gateway
+# runs as sandbox user.
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c '
-for p in $(pgrep -f "openclaw\|node" 2>/dev/null); do kill -9 $p 2>/dev/null; done
-sleep 2
 rm -f /sandbox/workspace/.openclaw/state/*.lock /sandbox/workspace/.openclaw/*.lock /tmp/openclaw/*.lock /tmp/openclaw-*/*.lock 2>/dev/null
 chown -R sandbox:sandbox /sandbox/workspace/.openclaw/state/ 2>/dev/null
 chown -R sandbox:sandbox /sandbox/workspace/.openclaw/agents/ 2>/dev/null
@@ -433,11 +533,19 @@ echo "CLEANUP_DONE"
 # passed too for the exporters that DO read it (none currently in
 # @mlflow/core@0.2.0 — kept for forward compat and parity with the linker's
 # env below, harmless no-op either way).
+#
+# LITELLM_API_KEY: resolves config/openclaw.json.tpl's apiKey placeholder
+# ("${LITELLM_API_KEY}", OpenClaw's own native env SecretRef syntax) from
+# THIS process's env at gateway startup. OpenClaw auto-registers the
+# resolved value in its exact-value redaction registry (see constraint #3
+# above and docs/constraints.md #3 / ROADMAP.md #13.4) — the real key is
+# never written to openclaw.json on disk.
 RHOAI_MLFLOW_GW_ENV=(
   --env "MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}"
   --env "MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}"
   --env "NODE_EXTRA_CA_CERTS=${RHOAI_MLFLOW_COMBINED_CA}"
   --env "MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}"
+  --env "LITELLM_API_KEY=${MAAS_API_KEY}"
 )
 # The prompt-trace-linker sidecar reaches RHOAI MLflow via /usr/bin/curl
 # (constraint #8), not Node fetch — curl's --cacert has no effect on the

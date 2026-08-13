@@ -8,8 +8,12 @@ test.describe('OpenClaw Control UI', () => {
     await page.goto('/');
     await expect(page).toHaveTitle('OpenClaw Control');
     await expect(page.getByPlaceholder(/Message/)).toBeVisible();
-    // Model badge can be in DOM but CSS-hidden briefly during hydration.
-    await expect(page.getByText(/gpt-oss|GPT-OSS/).first()).toBeAttached({ timeout: 10000 });
+    await expect(page.getByText('Ready to chat')).toBeVisible();
+    // Model selector: "<model-id> · maas · <reasoning>" — id varies by config
+    // and per-session UI overrides, so only assert the stable MaaS provider bit.
+    await expect(
+      page.getByRole('group').filter({ hasText: /\bmaas\b/ }).first(),
+    ).toBeAttached({ timeout: 10000 });
   });
 
   test('sidebar navigation is present', async ({ page }) => {
@@ -53,7 +57,7 @@ test.describe('OpenClaw Control UI', () => {
   test('chat completions HTTP API is disabled', async ({ request }) => {
     const resp = await request.post('/v1/chat/completions', {
       data: {
-        model: 'gpt-oss-120b',
+        model: 'claude-sonnet-4-6',
         messages: [{ role: 'user', content: 'ping' }],
       },
     });

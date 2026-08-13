@@ -30,7 +30,6 @@ export default defineConfig({
       },
     },
     {
-      // No-op placeholder — real security checks live in verify.sh Layer 4.
       name: 'security-tests',
       testMatch: /sandbox-security\.spec\.ts/,
       dependencies: ['auth-setup'],
