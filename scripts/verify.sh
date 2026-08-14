@@ -201,6 +201,13 @@ if command -v openshell &>/dev/null; then
     && pass "MaaS provider registered" \
     || fail "MaaS provider not found"
 
+  INFERENCE_ROUTE=$(openshell inference get 2>/dev/null || true)
+  if echo "$INFERENCE_ROUTE" | grep -q "Provider:"; then
+    pass "Inference route configured ($(echo "$INFERENCE_ROUTE" | grep -oP 'Model:\s*\K\S+' | head -1))"
+  else
+    fail "Inference route not configured (run: openshell inference set --provider $PROVIDER_NAME --model $INFERENCE_MODEL)"
+  fi
+
   if oc get ns "$KC_NAMESPACE" &>/dev/null 2>&1; then
     OIDC_CFG=$(oc -n "$NAMESPACE" get configmap openshell-config -o jsonpath='{.data}' 2>/dev/null || true)
     if echo "$OIDC_CFG" | grep -q "oidc"; then
@@ -340,23 +347,25 @@ if command -v openshell &>/dev/null; then
     pass "/etc/shadow content not exposed as hashes"
   fi
 
-  # Verify MaaS IS reachable (it's in the allow list)
-  MAAS_RESULT=$(sandbox_run 'curl -sI --max-time 5 https://maas-rhdp.apps.maas.redhatworkshops.io/health 2>&1 | head -1' || true)
-  if ! _sandbox_run_ok "$MAAS_RESULT"; then
-    warn "MaaS reachability check skipped (sandbox_run failed)"
-  elif echo "$MAAS_RESULT" | grep -qE "200|401|403"; then
-    pass "MaaS endpoint reachable through proxy"
+  # Verify inference.local is reachable (OpenShell inference router).
+  # Direct MaaS egress is no longer in the allow list — all LLM traffic
+  # goes through inference.local, which the privacy router handles internally.
+  INFERENCE_RESULT=$(sandbox_run 'curl -sk --max-time 10 https://inference.local/v1/models 2>&1 | head -1' || true)
+  if ! _sandbox_run_ok "$INFERENCE_RESULT"; then
+    warn "inference.local reachability check skipped (sandbox_run failed)"
+  elif echo "$INFERENCE_RESULT" | grep -qE "200|data|model|object"; then
+    pass "inference.local reachable through OpenShell privacy router"
+  elif echo "$INFERENCE_RESULT" | grep -qiE "403|denied|refused|not configured"; then
+    warn "inference.local returned denial — check: openshell inference get"
   else
-    warn "MaaS endpoint response unexpected: $MAAS_RESULT"
+    warn "inference.local response unexpected: ${INFERENCE_RESULT:0:120}"
   fi
 
   # Verify no plaintext credentials on sandbox filesystem.
   # /sandbox/.openclaw/ is read-only (Landlock). /sandbox/workspace/.openclaw/
-  # is the working config — since config/openclaw.json.tpl's apiKey is now
-  # OpenClaw's native "${LITELLM_API_KEY}" env SecretRef (resolved in-process
-  # at gateway startup, never baked into the file — see constraint #3 /
-  # ROADMAP.md #13.4), neither location should ever contain a raw "sk-" key.
-  # This is a hard fail now, not the former known-workaround warn.
+  # is the working config — apiKey is "unused" (inference router handles
+  # credentials at the gateway layer), so neither location should ever
+  # contain a raw "sk-" key.
   # Match a plausible key SHAPE (sk-<16+ alnum>), not a bare "sk-" substring
   # — the latter false-positives constantly on unrelated build artifacts
   # under node_modules (minified bundles, source maps, etc.), which used to
@@ -383,7 +392,7 @@ if command -v openshell &>/dev/null; then
   elif echo "$CRED_WS" | grep -qx "CLEAN"; then
     pass "No plaintext API keys in workspace config"
   else
-    fail "SECURITY: API key present in /sandbox/workspace/.openclaw/: $(echo "$CRED_WS" | head -3 | tr '\n' ' ') (apiKey should be the \${LITELLM_API_KEY} SecretRef literal, never a real key)"
+    fail "SECURITY: API key present in /sandbox/workspace/.openclaw/: $(echo "$CRED_WS" | head -3 | tr '\n' ' ') (apiKey should be 'unused', never a real key)"
   fi
 
   # Verify Landlock: /sandbox/.openclaw/ must be read-only
@@ -407,18 +416,17 @@ if command -v openshell &>/dev/null; then
     fail "/sandbox/workspace/ should be writable but write failed"
   fi
 
-  # Verify the working config still holds OpenClaw's native env SecretRef
-  # literal, not a real key. Since config/openclaw.json.tpl's apiKey field
-  # is never bash-substituted with the real secret anymore (constraint #3 /
-  # ROADMAP.md #13.4), this placeholder should be present at rest and only
-  # resolved in-process by OpenClaw at gateway startup.
-  CONFIG_PLACEHOLDER=$(sandbox_run 'grep -l "LITELLM_API_KEY" /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
-  if ! _sandbox_run_ok "$CONFIG_PLACEHOLDER"; then
-    fail "SECURITY: cannot verify config placeholder (sandbox_run failed)"
-  elif echo "$CONFIG_PLACEHOLDER" | grep -q "FOUND"; then
-    pass "Config placeholder \${LITELLM_API_KEY} still intact"
+  # Verify the working config uses apiKey: "unused" (inference router handles
+  # credentials) and does not contain a real API key.
+  CONFIG_APIKEY=$(sandbox_run 'python3 -c "import json;d=json.load(open(\"/sandbox/workspace/.openclaw/openclaw.json\"));p=d.get(\"models\",{}).get(\"providers\",{});keys=[v.get(\"apiKey\",\"\") for v in p.values()];print(\"APIKEYS:\"+\",\".join(keys))"' || true)
+  if ! _sandbox_run_ok "$CONFIG_APIKEY"; then
+    fail "SECURITY: cannot verify config apiKey (sandbox_run failed)"
+  elif echo "$CONFIG_APIKEY" | grep -q "APIKEYS:unused"; then
+    pass "Config apiKey is 'unused' (inference router handles credentials)"
+  elif echo "$CONFIG_APIKEY" | grep -qE "APIKEYS:.*sk-"; then
+    fail "SECURITY: config apiKey contains a real key — should be 'unused'"
   else
-    fail "SECURITY: config placeholder was modified or missing"
+    warn "Config apiKey unexpected: ${CONFIG_APIKEY:0:80}"
   fi
   fi  # end: sandbox_run usable
   fi  # end: ensure_oidc_token succeeded
@@ -446,11 +454,11 @@ if command -v openshell &>/dev/null; then
     fail "OpenClaw health check failed"
   fi
 
-  CONFIG_CHECK=$(sandbox_run 'grep -l "LITELLM_API_KEY" /sandbox/workspace/.openclaw/openclaw.json 2>/dev/null && echo FOUND || echo MISSING' || true)
-  if echo "$CONFIG_CHECK" | grep -q "FOUND"; then
-    pass "Credential injection placeholder configured"
+  CONFIG_PROVIDER=$(sandbox_run 'python3 -c "import json;d=json.load(open(\"/sandbox/workspace/.openclaw/openclaw.json\"));p=list(d.get(\"models\",{}).get(\"providers\",{}).keys());print(\"PROVIDERS:\"+\",\".join(p))"' || true)
+  if echo "$CONFIG_PROVIDER" | grep -q "PROVIDERS:inference"; then
+    pass "Inference router provider configured (inference.local)"
   else
-    warn "Credential injection placeholder not found in config"
+    warn "Expected inference provider, got: ${CONFIG_PROVIDER:0:80}"
   fi
 
   # chatCompletions HTTP API must be disabled (security: only WebSocket via Control UI)
@@ -479,48 +487,30 @@ else
 fi
 
 # =============================================================================
-# Layer 5b: LLM Connectivity (end-to-end through sandbox proxy)
+# Layer 5b: LLM Connectivity (inference.local through OpenShell privacy router)
 # =============================================================================
 # WHY: This layer catches the MOST COMMON failure mode: the OpenClaw gateway
 #   can start and appear healthy but CANNOT actually reach the LLM provider.
+#   LLM traffic flows through inference.local (OpenShell's inference router),
+#   not direct egress to an external MaaS endpoint.
 #
-# ROOT CAUSE HISTORY (do not remove — prevents regression):
-#   1. Node.js binary path: `n` (version manager) installs Node.js at
-#      /usr/local/bin/node. The sandbox proxy L7 policy only allows
-#      /usr/bin/node. If both exist, Node.js processes use /usr/local/bin/node
-#      (PATH priority), and the proxy DENIES all their traffic.
-#      => Check 1 verifies /usr/local/bin/node does NOT exist.
+# CHECKS:
+#   1. Node.js binary path: /usr/local/bin/node must NOT exist (proxy L7
+#      policy allows /usr/bin/node only).
+#   2. Node.js fetch() reaches inference.local through the privacy router.
+#   3. No DENIED proxy entries for inference-related traffic.
 #
-#   2. Node.js fetch() connectivity: Even with correct binary path, fetch()
-#      (undici) creates ephemeral connections. The proxy CAN handle these
-#      through the transparent nftables redirect, but setting HTTP_PROXY or
-#      NODE_OPTIONS breaks this by forcing HTTP CONNECT tunneling.
-#      => Check 2 verifies Node.js fetch() works through the proxy.
-#
-#   3. Proxy denial logs: Even if curl works, Node.js may be denied.
-#      The proxy logs DENIED entries with the reason.
-#      => Check 3 looks for DENIED entries mentioning "maas".
-#
-# A real end-to-end chat request + MLflow trace check used to live here as
-# Checks 4-5, but were removed (docs/constraints.md #17): Check 4 toggled
-# `gateway.http.endpoints.chatCompletions.enabled` at runtime, which is a
-# no-op on the running gateway (`gateway.reload.mode=off`) — its "PASS" came
-# from a PTY echoing the curl command's own text, not a real model response,
-# while Check 5 (trace recency) then correctly but confusingly FAILed against
-# a request that never actually happened. Layer 9's Playwright test already
-# exercises a real chat turn over the WebSocket path (unaffected by this
-# bug) end-to-end, so that removal costs no real coverage.
+# Layer 9's Playwright test exercises a real chat turn over the WebSocket
+# path end-to-end (unaffected by this check's scope).
 #
 # HOW TO FIX:
 #   Check 1 fail: oc exec $SANDBOX -c agent -- bash -c 'cp /usr/local/bin/node /usr/bin/node && rm -f /usr/local/bin/node'
-#   Check 2 fail: Verify no HTTP_PROXY/NODE_OPTIONS set. Check launch-openclaw.sh constraint #3.
-#   Check 3 fail: Review policies/openclaw-sandbox.yaml. Check `openshell logs openclaw-gw | grep DENIED`.
+#   Check 2 fail: Verify inference route: openshell inference get. Check launch-openclaw.sh constraint #3.
+#   Check 3 fail: Check `openshell logs $SANDBOX_NAME | grep DENIED`.
 step "Layer 5b: LLM Connectivity"
 
 if command -v openshell &>/dev/null; then
   # Check 1: Node.js binary path — /usr/local/bin/node must NOT exist.
-  # If it exists, the proxy will deny all Node.js network traffic because
-  # the L7 policy only allows /usr/bin/node. (See root cause #1 above)
   NODE_LOCAL=$(sandbox_run 'test -f /usr/local/bin/node && echo EXISTS || echo ABSENT' || true)
   if echo "$NODE_LOCAL" | grep -q "ABSENT"; then
     pass "No /usr/local/bin/node (only /usr/bin/node allowed by policy)"
@@ -528,12 +518,13 @@ if command -v openshell &>/dev/null; then
     fail "SECURITY: /usr/local/bin/node exists — proxy will deny Node.js network access. Fix: rm /usr/local/bin/node"
   fi
 
-  # Check 2: Node.js fetch() reaches MaaS through the transparent proxy.
-  # This is the SAME mechanism the OpenClaw gateway uses to call the LLM.
-  # If this fails, the gateway will fail too. (See root cause #2 above)
+  # Check 2: Node.js fetch() reaches inference.local through the privacy router.
+  # inference.local is the managed inference endpoint — the privacy router
+  # strips sandbox credentials, injects real provider credentials, and
+  # forwards to the configured backend.
   NODE_FETCH=$(sandbox_run 'cat > /tmp/verify-fetch.mjs << '"'"'HEREDOC'"'"'
 try {
-  const r = await fetch("https://maas-rhdp.apps.maas.redhatworkshops.io/health");
+  const r = await fetch("https://inference.local/v1/models");
   console.log("NODE_FETCH_STATUS:" + r.status);
 } catch(e) {
   const cause = e.cause?.cause?.message || e.cause?.message || e.message;
@@ -543,30 +534,59 @@ HEREDOC
 /usr/bin/node /tmp/verify-fetch.mjs 2>&1' || true)
   if echo "$NODE_FETCH" | grep -q "NODE_FETCH_STATUS:"; then
     FETCH_CODE=$(echo "$NODE_FETCH" | tr -d '\r' | sed -n 's/.*NODE_FETCH_STATUS://p' | head -1)
-    pass "Node.js fetch() reaches MaaS through proxy (HTTP $FETCH_CODE)"
+    pass "Node.js fetch() reaches inference.local (HTTP $FETCH_CODE)"
   elif echo "$NODE_FETCH" | grep -q "NODE_FETCH_ERROR:"; then
     FETCH_ERR=$(echo "$NODE_FETCH" | tr -d '\r' | sed -n 's/.*NODE_FETCH_ERROR://p' | head -1)
-    fail "Node.js fetch() to MaaS fails: $FETCH_ERR"
+    fail "Node.js fetch() to inference.local fails: $FETCH_ERR"
   else
-    fail "Node.js fetch() to MaaS: unexpected result"
+    fail "Node.js fetch() to inference.local: unexpected result"
   fi
 
-  # Check 3: No DENIED entries for MaaS in sandbox proxy logs.
-  # The proxy logs every denied connection with the reason.
-  # Even a single DENIED entry means the gateway is failing silently.
-  # (See root cause #3 above)
-  DENY_LOGS=$(openshell logs "$SANDBOX_NAME" 2>&1 | grep "DENIED.*maas" | tail -5 || true)
+  # Check 3: No DENIED entries for inference in sandbox proxy logs.
+  DENY_LOGS=$(openshell logs "$SANDBOX_NAME" 2>&1 | grep -iE "DENIED.*(inference|maas)" | tail -5 || true)
   DENY_COUNT=$(echo "$DENY_LOGS" | grep -c "DENIED" || true)
   if [[ "$DENY_COUNT" -eq 0 ]]; then
-    pass "No DENIED proxy entries for MaaS"
+    pass "No DENIED proxy entries for inference traffic"
   else
     LATEST_DENY=$(echo "$DENY_LOGS" | tail -1 | grep -oP "reason:.*" | head -1 || echo "unknown")
-    fail "Sandbox proxy denied MaaS access ($DENY_COUNT entries). Latest: ${LATEST_DENY:0:120}"
+    fail "Sandbox proxy denied inference access ($DENY_COUNT entries). Latest: ${LATEST_DENY:0:120}"
   fi
 
 else
   warn "openshell CLI not available, skipping LLM connectivity checks"
 fi
+
+# =============================================================================
+# Layer 5c: Inference Router Smoke Test (full profile only)
+# =============================================================================
+# WHY: Validates the full inference routing stack independently of OpenClaw:
+#   providers_v2 enabled -> provider registered -> inference route configured
+#   -> router resolves to real model -> response returned. Uses a disposable
+#   sandbox with the OpenAI SDK. Skipped in smoke profile (takes ~30s).
+# HOW TO FIX: openshell inference get; openshell provider list
+if [[ "$VERIFY_PROFILE" != "smoke" ]]; then
+step "Layer 5c: Inference Router Smoke Test"
+
+if command -v openshell &>/dev/null; then
+  SMOKE_RESULT=$(openshell sandbox create --no-keep -- \
+    bash -c 'pip install -q openai 2>/dev/null && python3 -c "
+from openai import OpenAI
+c = OpenAI(base_url=\"https://inference.local/v1\", api_key=\"unused\")
+r = c.chat.completions.create(model=\"router\", messages=[{\"role\":\"user\",\"content\":\"Say PONG\"}], max_tokens=5)
+print(\"INFERENCE_ROUTER_OK:\" + r.choices[0].message.content.strip())
+print(\"RESOLVED_MODEL:\" + (r.model or \"unknown\"))
+"' 2>&1 || true)
+  if echo "$SMOKE_RESULT" | grep -q "INFERENCE_ROUTER_OK:"; then
+    RESOLVED=$(echo "$SMOKE_RESULT" | grep -oP 'RESOLVED_MODEL:\K.*' | head -1 || echo "unknown")
+    pass "Inference router smoke test passed (resolved model: ${RESOLVED})"
+  else
+    SMOKE_ERR=$(echo "$SMOKE_RESULT" | tail -3 | tr '\n' ' ')
+    fail "Inference router smoke test failed: ${SMOKE_ERR:0:200}"
+  fi
+else
+  warn "openshell CLI not available, skipping inference router smoke test"
+fi
+fi  # end: full profile only
 
 # =============================================================================
 # Layer 7a: Unauthenticated Direct-Access Route Is Retired
@@ -1144,6 +1164,42 @@ print(rich)
       pass "MLflow trace content: ${RICH_CONTENT} trace(s) with full input/output (mlflow.traceInputs)"
     elif [[ -n "$RICH_CONTENT" ]]; then
       warn "MLflow trace content: no traces with mlflow.traceInputs found yet"
+    fi
+
+    # Check model name resolution: traces should show the real model name
+    # (e.g. claude-sonnet-4-6), not "router". The patch in patch-mlflow-plugin.py
+    # makes service.ts prefer lastAssistant.responseModel. See ADR-0021.
+    TRACE_MODEL=$(echo "$MLFLOW_TRACES" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+traces = data.get('traces',[])
+for t in traces:
+    for m in t.get('request_metadata',[]):
+        if m.get('key') == 'mlflow.llm.model':
+            print(m.get('value','unknown'))
+            break
+    else:
+        continue
+    break
+else:
+    # Try tags as fallback
+    for t in traces:
+        for tag in t.get('tags',[]):
+            if tag.get('key') == 'mlflow.llm.model':
+                print(tag.get('value','unknown'))
+                break
+        else:
+            continue
+        break
+    else:
+        print('not_found')
+" 2>/dev/null || echo "unknown")
+    if [[ "$TRACE_MODEL" == "router" ]]; then
+      warn "MLflow trace model is 'router' — patch-mlflow-plugin.py model resolution may not have applied"
+    elif [[ "$TRACE_MODEL" == "not_found" || "$TRACE_MODEL" == "unknown" ]]; then
+      info "MLflow trace model name: not found in recent traces (will verify on next deployment)"
+    else
+      pass "MLflow trace model resolved to real name: ${TRACE_MODEL}"
     fi
 
     TAGGED_CHECK="$MLFLOW_TRACES"

@@ -41,7 +41,8 @@ and ALL Node.js network traffic is silently DENIED.
 
 **Resolution**: `policies/openclaw-sandbox.yaml` now lists both
 `/usr/bin/node` and `/usr/local/bin/node` in the `binaries` section of every
-network policy (`maas_inference`, `observability`, `mlflow_direct`). This
+network policy (`observability`, `mlflow_direct`). The former `maas_inference`
+policy was removed when inference moved to `inference.local` (ADR-0021). This
 makes the `cp`/`rm` binary-relocation dance in `launch-openclaw.sh` after a
 `n` upgrade unnecessary — the proxy accepts connections from either path.
 If the base image or install method ever changes the Node.js binary path
@@ -60,77 +61,57 @@ removed. Tracked in [ROADMAP.md](../ROADMAP.md)'s "Follow-up investigation
 
 **Scripts affected**: `policies/openclaw-sandbox.yaml`, `verify.sh` (Layer 5b Check 1)
 
-## 3. Networking — Node.js fetch() and Proxy Credential Injection (RESOLVED via OpenClaw-native SecretRef)
+## 3. Networking — LLM Credential Injection (RESOLVED via inference router)
 
-**Constraint**: The sandbox proxy resolves `openshell:resolve:env:KEY` credential
-placeholders by inspecting HTTP traffic. However, Node.js `fetch()` (which uses
-`undici` internally) creates ephemeral TCP connections. The proxy cannot reliably
-map these ephemeral connections to a process binary via `/proc/net/tcp` lookups
-because the connection may close before the lookup completes.
+**Constraint**: LLM credentials must reach the upstream provider without being
+exposed to the sandbox process or written to the sandbox filesystem.
 
-**Why**: The proxy uses `/proc/net/tcp` to find the owning PID of a TCP
-connection, then reads `/proc/<pid>/exe` to identify the binary. Undici's
-connection pooling and fast teardown makes this unreliable.
+**Why**: Exposing real API keys inside the sandbox (via env vars or config files)
+creates a credential-leak attack surface. Jailbreak prompts could get the agent
+to `echo $LITELLM_API_KEY` or `cat openclaw.json` and expose the key in chat.
 
-**Failure mode**: `DENIED: failed to resolve peer binary` in proxy logs. The
-gateway appears healthy but cannot reach the LLM provider.
+**Historical approaches (superseded)**:
 
-**Original workaround (superseded — kept for history)**: The first fix baked
-the real `MAAS_API_KEY` directly into `openclaw.json` at template-render time
-via bash string replacement, bypassing the proxy's credential injection
-entirely. This worked for connectivity, but left the raw key readable on the
-sandbox filesystem (`grep sk- /sandbox/workspace/.openclaw/openclaw.json`) and
-`echo`-able in chat by any prompt that could get the agent to run a shell
-command — see ROADMAP.md #13.4 for the jailbreak-probing finding that flagged
-this.
+1. **Baked key in config** (v1, superseded): Real `MAAS_API_KEY` baked into
+   `openclaw.json` via bash string replacement. Worked for connectivity but
+   left the raw key readable on disk and echo-able in chat.
+2. **OpenClaw native SecretRef** (v2, superseded): `apiKey: "${LITELLM_API_KEY}"`
+   resolved in-process by OpenClaw at startup. Better than v1 (OpenClaw's
+   redaction registry masked the value in chat output), but still required
+   injecting the real key as an env var into the sandbox process.
 
-**Current fix**: Use OpenClaw's OWN native env-backed `SecretRef` mechanism
-instead of any sandbox-proxy mechanism. OpenClaw's config schema accepts
-`"${ENV_VAR_NAME}"` as a `SecretInput` for any field typed `SecretInputSchema`
-(including `models.providers.<id>.apiKey` — see upstream
-`src/config/types.secrets.ts`, `ENV_SECRET_TEMPLATE_RE`). OpenClaw resolves
-this from its OWN process environment, in-process, BEFORE constructing the
-outbound HTTP request — so the sandbox proxy's binary-PID mapping problem
-never applies to this credential at all (there is no HTTP-layer injection to
-intercept).
+**Current fix**: Use OpenShell's **inference router** (`inference.local`).
+The real API key lives exclusively in the gateway's provider record, registered
+via `openshell provider create --credential "LITELLM_API_KEY=${MAAS_API_KEY}"`.
+The sandbox process calls `https://inference.local/v1` with `model: "router"`
+and `apiKey: "unused"`. The privacy router intercepts the request, strips
+sandbox credentials, injects the real provider credential from the gateway's
+record, and forwards upstream. The sandbox process never sees the real key.
 
-1. `config/openclaw.json.tpl`'s `apiKey` is the literal string
-   `"${LITELLM_API_KEY}"` — this ships to the sandbox as-is; the real key is
-   never written to `openclaw.json` on disk.
-2. `scripts/launch-openclaw.sh` Step 9b passes
-   `--env "LITELLM_API_KEY=${MAAS_API_KEY}"` to `openshell sandbox exec` when
-   starting the OpenClaw gateway process, so OpenClaw resolves the SecretRef
-   from ITS OWN process env at startup.
-3. **Bonus**: OpenClaw automatically calls
-   `registerSecretValueForRedaction()` (upstream
-   `src/logging/secret-redaction-registry.ts`) on every value resolved
-   through its native SecretRef mechanism. This registers the exact resolved
-   string in an in-process, exact-value redaction registry that
-   `redactToolPayloadText()` (used to render shell/exec tool output in chat)
-   checks on every render. The net effect: even though `LITELLM_API_KEY` is
-   still exported as a plain env var in the sandbox (for the OpenShell
-   provider's separate curl-based credential path), any prompt that gets the
-   agent to `echo $LITELLM_API_KEY` or `cat openclaw.json` now sees the value
-   masked (e.g. `sk-kPNr…SLFA`) in the Control UI — closing the leak found by
-   jailbreak probing without relying purely on the model's own judgment to
-   refuse.
+1. `config/openclaw.json.tpl`'s `apiKey` is the literal string `"unused"`.
+2. `scripts/launch-openclaw.sh` does NOT inject `LITELLM_API_KEY` into the
+   sandbox environment. The key is only used at deploy time by
+   `create_provider()` in `scripts/deploy-openshell.sh`.
+3. `providers_v2_enabled` must be `true` on the gateway (set by
+   `enable_providers_v2()` in `scripts/common.sh`).
 4. Do NOT set `HTTP_PROXY` or `HTTPS_PROXY` — this forces `fetch()` to use
    HTTP CONNECT tunneling, which the proxy rejects with 403.
 5. Do NOT set `NODE_OPTIONS="--require http-proxy-bootstrap.js"` — same reason.
-6. Let the transparent proxy (nftables L4 redirect) handle routing automatically
-   for the destination-allowlist check (unrelated to credential injection).
 
-**Upstream tracking**: OpenShell issue #894 (binary resolution for undici) is
-no longer a blocker for THIS credential — it would still matter for any
-future secret that must be injected at the sandbox-proxy layer instead of
-resolved by the consuming Node.js process itself. #896 (enhanced provider
-management) unaffected.
+**Upstream tracking**:
+- [NVIDIA/OpenShell#1886](https://github.com/NVIDIA/OpenShell/issues/1886) —
+  Declarative provider config via Helm values (not yet available).
+- [NVIDIA/OpenShell#896](https://github.com/NVIDIA/OpenShell/issues/896) —
+  Multi-provider inference routing (future).
 
 **Scripts affected**: `config/openclaw.json.tpl`, `scripts/common.sh`
-(`render_openclaw_config`), `launch-openclaw.sh` (Step 3, Step 9b),
-`scripts/verify.sh` (Layer 4/5 credential + placeholder checks),
-`tests/sandbox-security.spec.ts` (credential-leak test now expects masked
-output rather than relying only on model refusal)
+(`create_provider`, `enable_providers_v2`, `configure_inference_route`),
+`scripts/deploy-openshell.sh`, `launch-openclaw.sh` (Step 3, Step 9b),
+`scripts/verify.sh` (Layer 2/4/5/5b/5c credential + inference route checks),
+`policies/openclaw-sandbox.yaml` (maas_inference block removed),
+`tests/sandbox-security.spec.ts`
+
+See [ADR-0021](adrs/ADR-0021-inference-router-migration.md).
 
 ## 4. Plugins — Directory Structure and Ownership
 
@@ -1610,4 +1591,69 @@ static key value left to leak.
 only). Relevant upstream file (openclaw repo):
 `src/agents/models-config.ts`. Tracked as an open follow-up in ROADMAP.md
 #13.4.
+
+## 27. MLflow Traces Show `inference/router` Instead of the Real Model Name — UPSTREAM GAP
+
+**Constraint**: When using OpenShell's inference router (`inference.local`),
+OpenClaw's `llm_output` plugin hook event always sets `evt.model` to the
+*config* model ID (e.g. `"router"`) instead of the real upstream model name
+(e.g. `"claude-sonnet-4-6"`) that the API response returned.
+
+**Why**: OpenClaw's CLI runner (`cli-runner-*.js`) constructs the
+`llm_output` event from `context.modelId` — the static ID from
+`openclaw.json` config — not from the API response's `model` field.
+The streaming transport layer *does* capture the real model name
+(`responseModel` in `openai-transport-stream-*.js`, line ~1047), and even
+detects when it differs from the configured ID (`isDifferentModel` check,
+line ~1328), but this information is never propagated to the plugin hook
+event or to `buildCliHookAssistantMessage`.
+
+**Failure mode**: MLflow traces all show `model: inference/router` (or
+`model: router`) in the root span's `mlflow.llm.model` attribute. This
+makes it impossible to tell which real model served a request when using
+the inference router.
+
+**What we investigated** (2026-08-14):
+- `lastAssistant.responseModel`: does not exist — `buildCliHookAssistantMessage`
+  builds `lastAssistant` from `context.modelId`, same static value.
+- `evt.model` in both `llm_input` and `llm_output`: always `context.modelId`.
+- `output.model`: the output object from `executePreparedCliRun` does not
+  expose the API response's model field to the hook layer.
+- Env var workaround (`INFERENCE_MODEL`): we prototyped and verified a
+  working patch that reads `process.env.INFERENCE_MODEL` in the mlflow
+  plugin's `llm_output` handler to override `trace.model` when it equals
+  `"router"`. This worked (confirmed: root span showed `claude-sonnet-4-6`)
+  but was deliberately removed — it's a fragile workaround that silently
+  breaks when the patch script is removed or the plugin is updated.
+
+**Upstream fix needed**: OpenClaw's `runAgentHarnessLlmOutputHook` in
+`lifecycle-hook-helpers-*.js` should include the response model from the
+streaming transport (the `responseModel` that `openai-transport-stream`
+already tracks) in the hook event payload. Something like:
+
+```javascript
+// In cli-runner (where llm_output event is constructed):
+event: {
+  ...existing fields,
+  responseModel: output.responseModel,  // from streaming transport
+}
+```
+
+This would let any plugin (not just our MLflow one) access the actual
+model that served the request, which is especially important for inference
+routers and model load balancers.
+
+**How to verify the upstream fix has landed**: After an OpenClaw update,
+check the `llm_output` event in the plugin hook — if `evt.responseModel`
+or similar field contains the real model name from the API response,
+the fix is in. Test: configure `model: router` via `inference.local`,
+send a message, check MLflow trace — `mlflow.llm.model` should show
+`claude-sonnet-4-6` (or whatever the router resolves to) without any
+patching.
+
+**Current impact**: Cosmetic only — traces work, token counts are correct,
+prompts are captured. Only the model name in the trace summary is wrong.
+
+**Scripts affected**: None (workaround was removed). This is documentation
+of the upstream gap only.
 

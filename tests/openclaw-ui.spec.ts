@@ -9,10 +9,8 @@ test.describe('OpenClaw Control UI', () => {
     await expect(page).toHaveTitle('OpenClaw Control');
     await expect(page.getByPlaceholder(/Message/)).toBeVisible();
     await expect(page.getByText('Ready to chat')).toBeVisible();
-    // Model selector: "<model-id> · maas · <reasoning>" — id varies by config
-    // and per-session UI overrides, so only assert the stable MaaS provider bit.
     await expect(
-      page.getByRole('group').filter({ hasText: /\bmaas\b/ }).first(),
+      page.getByRole('group').filter({ hasText: /\binference\b/ }).first(),
     ).toBeAttached({ timeout: 10000 });
   });
 
@@ -32,7 +30,7 @@ test.describe('OpenClaw Control UI', () => {
     await expect(sendButton).toBeVisible();
   });
 
-  test('E2E chat: model responds via MaaS', async ({ page }) => {
+  test('E2E chat: model responds via inference router', async ({ page }) => {
     await page.goto('/');
 
     const messageInput = page.getByPlaceholder(/Message/);
@@ -57,7 +55,7 @@ test.describe('OpenClaw Control UI', () => {
   test('chat completions HTTP API is disabled', async ({ request }) => {
     const resp = await request.post('/v1/chat/completions', {
       data: {
-        model: 'claude-sonnet-4-6',
+        model: 'router',
         messages: [{ role: 'user', content: 'ping' }],
       },
     });

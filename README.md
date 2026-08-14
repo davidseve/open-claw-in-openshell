@@ -1,6 +1,6 @@
 # OpenClaw in OpenShell
 
-OpenClaw runs **inside** an OpenShell sandbox on OpenShift (Pattern A, [ADR-0007](docs/adrs/ADR-0007-openclaw-inside-sandbox.md)), with inference via Red Hat MaaS (LiteLLM) and browser login through OpenShift's own native OAuth server ([ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md); no Keycloak in this path). Keycloak remains deployed only as the OIDC issuer for the CLI/gRPC gateway auth path.
+OpenClaw runs **inside** an OpenShell sandbox on OpenShift (Pattern A, [ADR-0007](docs/adrs/ADR-0007-openclaw-inside-sandbox.md)), with inference routed through OpenShell's `inference.local` privacy router ([ADR-0021](docs/adrs/ADR-0021-inference-router-migration.md)) to Red Hat MaaS (LiteLLM), and browser login through OpenShift's own native OAuth server ([ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md); no Keycloak in this path). Keycloak remains deployed only as the OIDC issuer for the CLI/gRPC gateway auth path.
 
 Supports both AWS OCP clusters and local CRC (CodeReady Containers / OpenShift Local) for development.
 
@@ -30,7 +30,8 @@ flowchart LR
     OC --> Proxy
   end
 
-  MaaS["Red Hat MaaS<br/>GPT-OSS 120B"]
+  IR["inference.local<br/>Privacy Router"]
+  MaaS["Red Hat MaaS<br/>LiteLLM"]
 
   Browser -->|"Route openclaw-ui-auth"| OAuthProxy
   OAuthProxy -->|"x-forwarded-email/user"| Router
@@ -38,7 +39,8 @@ flowchart LR
   Router --> GW
   GW -->|"relay → loopback :18789"| OC
   OAuthProxy -.->|"OAuth login (SA-based client)"| OCPOAuth["OCP OAuth server"]
-  Proxy -->|"allow + credential rewrite"| MaaS
+  OC -->|"model=router"| IR
+  IR -->|"credential injection"| MaaS
 ```
 
 ### Identity (OAuth)
@@ -72,7 +74,7 @@ sequenceDiagram
 | **Control UI** | Browser → oauth-proxy (OpenShift-native OAuth) → Route → Gateway → sandbox `:18789` (trusted-proxy, `x-forwarded-email`) |
 | **CLI / gRPC** | CLI → Route `openshell-gw` → Gateway (OIDC JWT, issued by Keycloak) → sandbox lifecycle / SSH relay |
 | **Login** | Browser → oauth-proxy → OCP OAuth server → session cookie (see [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md)) |
-| **Inference** | OpenClaw → MaaS (`apiKey` resolved from OpenClaw's own native `${LITELLM_API_KEY}` env SecretRef, in-process at gateway startup; never on disk — see [constraints.md #3](docs/constraints.md#3-networking--nodejs-fetch-and-proxy-credential-injection-resolved-via-openclaw-native-secretref)) |
+| **Inference** | OpenClaw → `inference.local` (privacy router) → MaaS (credential injection at gateway layer; `apiKey: "unused"` in sandbox config — see [ADR-0021](docs/adrs/ADR-0021-inference-router-migration.md)) |
 
 ### Security posture
 

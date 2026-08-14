@@ -7,7 +7,7 @@ This document defines the roles, skills, and responsibilities for the OpenClaw-i
 Cybersecurity is a first-class concern in this project, not an afterthought. Every role carries explicit security responsibilities. The baseline security posture is defined by OpenShell's sandbox model:
 
 - **Sandbox isolation**: all agent workloads run inside OpenShell sandboxes with nftables, Landlock LSM, and network namespace enforcement.
-- **Credential injection without filesystem exposure**: API keys are injected as environment variables by the OpenShell provider system. Child processes see opaque placeholders; real secrets are resolved by the proxy at request time. Credentials never touch the sandbox filesystem.
+- **Credential injection without filesystem exposure**: LLM credentials are managed by the OpenShell inference router (`inference.local`). The real API key lives in the gateway's provider record; the sandbox process uses `apiKey: "unused"` and never sees or needs the real credential. See [ADR-0021](docs/adrs/ADR-0021-inference-router-migration.md).
 - **Default-deny networking**: all outbound traffic from sandboxes is blocked unless explicitly allowed by a network policy with L7 inspection.
 - **OIDC authentication**: browser access to the Control UI goes through oauth-proxy → OpenShift's native OAuth server (ADR-0016; no Keycloak in this path). Keycloak remains the OIDC issuer for the separate CLI/gRPC gateway auth path only. The OpenClaw gateway uses `auth.mode: trusted-proxy` — no static tokens (ADR-0012).
 - **Supply chain awareness**: all images, charts, and operators are version-pinned. No `latest` tags in production configurations.
@@ -68,8 +68,8 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 **Tools**: `openclaw`, `curl`, `jq`, browser (Control UI).
 
 **Responsibilities**:
-- Maintain `config/openclaw.json.tpl` with the MaaS provider definition and `__APPS_DOMAIN__` placeholders.
-- Validate model routing: `maas/claude-sonnet-4-6` is primary (no fallbacks); `maas/gpt-oss-120b` and `maas/llama-scout-17b` remain in the catalog as disabled backups (not in `fallbacks`). After changing `agents.defaults.model.primary`, re-run `./scripts/launch-openclaw.sh`.
+- Maintain `config/openclaw.json.tpl` with the inference router provider definition (`inference.local`) and `__APPS_DOMAIN__` placeholders.
+- Validate model routing: `inference/router` is primary (resolved to the real model by the OpenShell inference router). After changing the inference route (`openshell inference set`), re-run `./scripts/launch-openclaw.sh`.
 - Test Control UI chat functionality (WebSocket). Keep `gateway.http.endpoints.chatCompletions.enabled` false unless a deliberate HTTP API is required.
 - Run `openclaw doctor --lint` after configuration changes.
 - Verify `auth.mode: trusted-proxy` is correctly configured (no static tokens — see ADR-0012).
@@ -84,9 +84,10 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 
 **Responsibilities**:
 - Deploy and maintain the OpenShell gateway on OCP via Helm.
-- Create and manage credential providers (`generic` type for MaaS API key).
+- Create and manage credential providers (`openai` type for MaaS via inference router).
+- Configure inference routing (`openshell inference set`) and manage `providers_v2_enabled`.
 - Author and refine sandbox network policies (`policies/openclaw-sandbox.yaml`).
 - Expose sandbox services and manage service URL routing through the gateway.
 - Monitor sandbox deny logs for policy violations and adjust rules accordingly.
-- Ensure the sandbox proxy performs L7 credential injection correctly (no plaintext secrets in sandbox).
+- Verify the inference router injects credentials correctly (no plaintext secrets in sandbox).
 - Coordinate with OCP Security Specialist on SCC and namespace prerequisites.

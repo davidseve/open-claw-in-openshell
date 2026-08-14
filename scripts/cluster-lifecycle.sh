@@ -185,7 +185,8 @@ cmd_deploy() {
     OPENSHELL_HEADLESS=1 KC_USER="${KC_USER:-admin}" KC_PASS="${KC_PASS:-admin}" \
       "${SCRIPT_DIR}/configure-oidc.sh"
 
-    step "Phase 7b: Create MaaS provider (needs OIDC token)"
+    step "Phase 7b: Enable providers_v2, create MaaS provider, configure inference route (needs OIDC token)"
+    enable_providers_v2 2>/dev/null || true
     # Gateway may still be stabilizing after helm upgrade; retry up to 30s
     retries=0
     while ! create_provider 2>/dev/null; do
@@ -197,6 +198,9 @@ cmd_deploy() {
       info "Waiting for gateway to accept requests (attempt $retries/6)..."
       sleep 5
     done
+    configure_inference_route 2>/dev/null \
+      && info "Inference route ready" \
+      || warn "Inference route configuration failed — run manually: openshell inference set --provider $PROVIDER_NAME --model $INFERENCE_MODEL --no-verify"
 
     step "Phase 8: Deploy oauth-proxy (OpenShift-native OAuth UI auth, ADR-0016)"
     "${SCRIPT_DIR}/deploy-oauth2-proxy.sh"

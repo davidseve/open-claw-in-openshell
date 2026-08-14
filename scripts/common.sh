@@ -7,6 +7,8 @@ NAMESPACE="${NAMESPACE:-openshell2}"
 OPENSHELL_CHART_VERSION="${OPENSHELL_CHART_VERSION:-0.0.83}"
 SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw2}"
 PROVIDER_NAME="${PROVIDER_NAME:-maas-litellm}"
+INFERENCE_MODEL="${INFERENCE_MODEL:-claude-sonnet-4-6}"
+MAAS_BASE_URL="${MAAS_BASE_URL:-https://maas-rhdp.apps.maas.redhatworkshops.io/v1}"
 # CLI-local (per-machine) gateway alias name — deliberately separate from
 # NAMESPACE/SANDBOX_NAME. `openshell gateway add/remove/select` and the mTLS
 # cert cache under ~/.config/openshell/gateways/<name>/ are keyed by this
@@ -536,8 +538,18 @@ ensure_oidc_token() {
   return 1
 }
 
-# Create the MaaS provider. Idempotent — skips if already exists.
-# Requires a valid OIDC token when gateway has auth enabled.
+# Enable providers_v2 on the gateway. Idempotent — safe to call multiple times.
+# Unlocks provider profile policy composition and per-provider policy layers
+# that auto-contribute to sandbox effective policy.
+enable_providers_v2() {
+  openshell settings set --global --key providers_v2_enabled --value true --yes 2>/dev/null
+  info "providers_v2_enabled = true"
+}
+
+# Create the MaaS provider (v2-compatible, --type openai). Idempotent — skips
+# if already exists. Requires a valid OIDC token when gateway has auth enabled.
+# The credential is stored in the gateway's provider record and injected by
+# the inference router (inference.local) — never exposed to sandbox processes.
 create_provider() {
   if [[ -z "${MAAS_API_KEY:-}" ]]; then load_secrets; fi
   if openshell provider list 2>/dev/null | grep -q "$PROVIDER_NAME"; then
@@ -546,9 +558,17 @@ create_provider() {
   fi
   openshell provider create \
     --name "$PROVIDER_NAME" \
-    --type generic \
-    --credential "LITELLM_API_KEY=${MAAS_API_KEY}"
-  info "Provider '$PROVIDER_NAME' created"
+    --type openai \
+    --credential "OPENAI_API_KEY=${MAAS_API_KEY}" \
+    --config "OPENAI_BASE_URL=${MAAS_BASE_URL}"
+  info "Provider '$PROVIDER_NAME' created (type=openai, base=${MAAS_BASE_URL})"
+}
+
+# Configure the inference route: inference.local -> provider/model.
+# All sandboxes on this gateway will use this route. Idempotent.
+configure_inference_route() {
+  openshell inference set --provider "$PROVIDER_NAME" --model "$INFERENCE_MODEL" --no-verify 2>/dev/null
+  info "Inference route: $PROVIDER_NAME / $INFERENCE_MODEL"
 }
 
 get_apps_domain() {

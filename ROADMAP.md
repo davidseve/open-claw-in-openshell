@@ -308,27 +308,29 @@ The original plan for this section ("Map Keycloak roles to OpenClaw operator sco
 - [ ] Add npm/PyPI endpoints if OpenClaw tools need them
 - [ ] Switch to `enforcement: enforce` after validation
 - [ ] Implement credential rotation procedure
-- [ ] Migrate inference routing to `inference.local` + `model='router'` alias (see below)
+- [x] ~~Migrate inference routing to `inference.local` + `model='router'` alias~~ (see 11.1 below)
 
-### 11.1 Migrate to OpenShell Inference Router (`inference.local`)
+### 11.1 Migrate to OpenShell Inference Router (`inference.local`) — COMPLETE
 
-**Context**: The current deployment routes LLM traffic directly from the sandbox to the external MaaS endpoint (`maas-rhdp.apps.maas.redhatworkshops.io:443`) with `request_body_credential_rewrite: true` in the network policy. The upstream [opendatahub-io/agent-ops](https://github.com/opendatahub-io/agent-ops) project uses OpenShell's built-in inference router instead: sandbox code calls `inference.local` via the OpenAI SDK with `model='router'`, and the gateway transparently injects provider credentials and forwards to the configured backend. This makes the agent code fully provider-agnostic.
+**Status: COMPLETE** — See [ADR-0021](docs/adrs/ADR-0021-inference-router-migration.md).
 
-**Benefits**:
-- Swap providers (MaaS, vLLM, Bedrock, RHOAI-served model) without touching sandbox policy, `openclaw.json`, or the agent code
-- Eliminates the `request_body_credential_rewrite` dependency (credential injection moves to the gateway's inference layer, not the L7 proxy's body rewrite)
-- Enables `providers_v2_enabled` features: provider profile policy composition, per-provider policy layers auto-contributed to sandbox effective policy
-- Agent code becomes a single `base_url: https://inference.local/v1`, `model: router` config — no hardcoded endpoint or model name
+All LLM traffic now routes through OpenShell's inference router (`inference.local`). The agent code is provider-agnostic: `baseUrl: https://inference.local/v1`, `model: router`. The real API key lives in the gateway's provider record; the sandbox process uses `apiKey: "unused"`.
 
-**Prerequisites**:
-- [ ] Enable `providers_v2_enabled` on the gateway: `openshell settings set --global --key providers_v2_enabled --value true --yes`
-- [ ] Re-register the MaaS provider with a v2-compatible type (evaluate `--type openai` since MaaS/LiteLLM serves the OpenAI chat completions API)
-- [ ] Configure inference route: `openshell inference set --provider <name> --model <model>`
-- [ ] Update `config/openclaw.json.tpl` provider config: point `baseUrl` at `https://inference.local/v1`, set model to `router`
-- [ ] Update `policies/openclaw-sandbox.yaml`: remove (or keep as fallback) the `maas_inference` network policy block — `inference.local` traffic is handled by the OpenShell proxy automatically, no explicit endpoint entry needed
-- [ ] Validate that `@mlflow/mlflow-openclaw` plugin traces still capture model name correctly (the router resolves `router` to the real model name in the response)
-- [ ] Add `providers_v2_enabled` enablement to `scripts/deploy-openshell.sh` or `scripts/common.sh`
-- [ ] Add inference routing smoke test: `openshell sandbox create --no-keep -- uv run --with openai python3 -c "..."` (disposable sandbox, validates the full routing stack)
+**Completed**:
+- [x] Enable `providers_v2_enabled` on the gateway
+- [x] Re-register MaaS provider with `--type openai` (v2-compatible)
+- [x] Configure inference route: `openshell inference set --provider maas-litellm --model claude-sonnet-4-6`
+- [x] Update `config/openclaw.json.tpl` to `inference.local/v1`, `model: router`
+- [x] Remove `maas_inference` network policy block from `openclaw-sandbox.yaml`
+- [x] Remove `LITELLM_API_KEY` env injection from `launch-openclaw.sh`
+- [x] Update `verify.sh` layers 2, 4, 5, 5b for inference router checks
+- [x] Add inference router smoke test (Layer 5c, disposable sandbox + OpenAI SDK)
+- [x] Update Playwright tests (`openclaw-ui.spec.ts`, `sandbox-security.spec.ts`)
+- [x] Create `docs/AGENT-SANDBOX-AND-OPENSHELL.md` with inference routing section
+
+**Future work**:
+- Declarative provider configuration via Helm values — not yet available upstream. Tracked at [NVIDIA/OpenShell#1886](https://github.com/NVIDIA/OpenShell/issues/1886). When available, `create_provider()` and `configure_inference_route()` in `scripts/common.sh` can be replaced with Helm values in `charts/openshell/values.yaml`.
+- Multi-provider inference routing (path-based: `inference.local/openai/...` vs `inference.local/anthropic/...`) — tracked at [NVIDIA/OpenShell#896](https://github.com/NVIDIA/OpenShell/issues/896). Would allow per-sandbox model selection.
 
 ### 11.2 OCSF Audit Event Assertions in `verify.sh`
 
@@ -482,25 +484,15 @@ tools can access it, and since OpenClaw never "knew" the literal string was a se
 was never resolved through OpenClaw's own secret-handling code), its own transcript/tool
 redaction never masked it either.
 
-**Fix applied.** OpenClaw's config schema natively supports `"${ENV_VAR}"` as a
-`SecretInput` for any `SecretInputSchema`-typed field (including
-`models.providers.<id>.apiKey`) — resolved from OpenClaw's OWN process env, in-process,
-before any network call, so the proxy's binary-PID mapping problem never applies to this
-credential:
+**Fix applied (v2, then superseded by inference router).** The intermediate
+fix used OpenClaw's native `"${LITELLM_API_KEY}"` SecretRef syntax, resolved
+in-process at gateway startup.
 
-- `config/openclaw.json.tpl`'s `apiKey` is now the literal string `"${LITELLM_API_KEY}"` —
-  never bash-substituted with the real key at render time (`scripts/common.sh`
-  `render_openclaw_config()` no longer bakes anything in)
-- `scripts/launch-openclaw.sh` Step 9b passes `--env "LITELLM_API_KEY=${MAAS_API_KEY}"` to
-  `openshell sandbox exec` when starting the gateway process, so OpenClaw resolves it from
-  its own env at startup
-- OpenClaw automatically registers that resolved value in its own exact-value redaction
-  registry (`registerSecretValueForRedaction()`), which `redactToolPayloadText()` checks
-  when rendering shell/exec tool output in chat — so `echo $LITELLM_API_KEY` and
-  `cat openclaw.json` now show a masked value instead of the raw key, even though that env
-  var is still present in the sandbox (for the OpenShell provider's separate curl-based
-  credential path, unrelated to this fix)
-- See `docs/constraints.md` #3 for the full before/after and upstream code references
+**Superseded by inference router (ADR-0021):** `apiKey` is now the literal
+string `"unused"`, and `LITELLM_API_KEY` is no longer injected into the sandbox
+environment at all. The real credential lives exclusively in the gateway's
+provider record and is injected by the inference router at the gateway layer.
+See `docs/constraints.md` #3 and section 11.1 above.
 
 - [x] Re-investigated OpenShell issue #894 (undici binary resolution) — not needed for this
       credential: OpenClaw's own native env SecretRef resolves in-process, sidestepping the

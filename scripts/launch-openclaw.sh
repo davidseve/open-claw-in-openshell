@@ -24,21 +24,14 @@
 #      => Nothing to do here — just keep both paths in the policy's
 #         `binaries` list whenever the base image or Node install path changes.
 #
-#   3. CREDENTIAL INJECTION: The proxy resolves openshell:resolve:env:KEY
-#      placeholders by inspecting HTTP traffic. However, Node.js fetch()
-#      (undici) creates ephemeral connections that the proxy cannot reliably
-#      map to a process binary via /proc/net/tcp. This causes DENIED with
-#      "failed to resolve peer binary".
-#      => Do NOT rely on proxy credential injection for Node.js fetch().
-#      => Instead, config/openclaw.json.tpl's apiKey is the literal string
-#         "${LITELLM_API_KEY}" — OpenClaw's OWN native env-backed SecretRef
-#         syntax (resolved in-process, before any fetch() call is made, so
-#         the proxy's binary-resolution problem never applies to this
-#         credential). Step 9b below passes --env "LITELLM_API_KEY=..." to
-#         `openshell sandbox exec` so OpenClaw's gateway process resolves it
-#         at startup. The real key is never written to openclaw.json on disk,
-#         and OpenClaw auto-registers the resolved value in its own
-#         exact-value redaction registry, masking it in chat/tool output.
+#   3. CREDENTIAL INJECTION: LLM inference uses OpenShell's inference router
+#      (inference.local). The privacy router injects provider credentials at
+#      the gateway layer — the sandbox process never sees or needs the API key.
+#      config/openclaw.json.tpl uses apiKey: "unused" and baseUrl:
+#      https://inference.local/v1 with model: router. The provider credential
+#      is registered via `openshell provider create` in deploy-openshell.sh
+#      and stored in the gateway's provider record. See
+#      docs/adrs/ADR-0021-inference-router-migration.md.
 #      => Do NOT set HTTP_PROXY or HTTPS_PROXY — this forces fetch() to use
 #         HTTP CONNECT tunneling, which the proxy rejects with 403.
 #      => Do NOT set NODE_OPTIONS="--require http-proxy-bootstrap.js" — same
@@ -209,14 +202,11 @@ fi
 # /sandbox/ is read-only (Landlock). OpenClaw needs to write state, logs, and
 # locks. We set HOME=/sandbox/workspace so .openclaw/ is writable. (See constraint #1)
 #
-# ${RENDERED_DIR}/openclaw.json's apiKey field is the literal string
-# "${LITELLM_API_KEY}" — OpenClaw's own native env SecretRef syntax, resolved
-# by OpenClaw itself from its process env at gateway startup (Step 9b), not
-# baked in at template-render time. The real key is never written to this
-# file. (See constraint #3 — the sandbox proxy's openshell:resolve:env:KEY
-# injection is still not used here, since Node.js fetch()/undici connections
-# are too ephemeral for the proxy to map to a process binary; OpenClaw's own
-# in-process SecretRef resolution sidesteps that problem entirely.)
+# ${RENDERED_DIR}/openclaw.json's apiKey field is the literal string "unused" —
+# the inference router (inference.local) handles credential injection at the
+# gateway layer, so no real API key is ever written to this file or injected
+# into the sandbox environment. See constraint #3 and
+# docs/adrs/ADR-0021-inference-router-migration.md.
 step "Copying config to writable workspace"
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/state
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- mkdir -p /sandbox/workspace/.openclaw/agents
@@ -534,18 +524,15 @@ echo "CLEANUP_DONE"
 # @mlflow/core@0.2.0 — kept for forward compat and parity with the linker's
 # env below, harmless no-op either way).
 #
-# LITELLM_API_KEY: resolves config/openclaw.json.tpl's apiKey placeholder
-# ("${LITELLM_API_KEY}", OpenClaw's own native env SecretRef syntax) from
-# THIS process's env at gateway startup. OpenClaw auto-registers the
-# resolved value in its exact-value redaction registry (see constraint #3
-# above and docs/constraints.md #3 / ROADMAP.md #13.4) — the real key is
-# never written to openclaw.json on disk.
+# No LITELLM_API_KEY injection: inference uses the inference router
+# (inference.local), which injects credentials from the gateway's provider
+# record. The sandbox process never sees the real API key. See constraint #3
+# and docs/adrs/ADR-0021-inference-router-migration.md.
 RHOAI_MLFLOW_GW_ENV=(
   --env "MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}"
   --env "MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}"
   --env "NODE_EXTRA_CA_CERTS=${RHOAI_MLFLOW_COMBINED_CA}"
   --env "MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}"
-  --env "LITELLM_API_KEY=${MAAS_API_KEY}"
 )
 # The prompt-trace-linker sidecar reaches RHOAI MLflow via /usr/bin/curl
 # (constraint #8), not Node fetch — curl's --cacert has no effect on the
