@@ -204,23 +204,9 @@ render_template() {
 }
 
 # render_openclaw_config renders config/openclaw.json.tpl like any other
-# template (__APPS_DOMAIN__ substitution). Unlike the old constraint #3
-# workaround, it no longer bakes the real MAAS_API_KEY into the rendered
-# file: config/openclaw.json.tpl's apiKey field is the literal string
-# "${LITELLM_API_KEY}", OpenClaw's own native env-backed SecretRef syntax
-# (see src/config/types.secrets.ts upstream — ENV_SECRET_TEMPLATE_RE).
-# OpenClaw resolves that placeholder itself from ITS OWN process env at
-# gateway startup (launch-openclaw.sh Step 9b passes --env
-# "LITELLM_API_KEY=..." to `openshell sandbox exec`) — not via the sandbox
-# proxy's openshell:resolve:env:KEY injection, and not via bash string
-# substitution at render time. This means:
-#   1. The real key is never written to any file inside the sandbox.
-#   2. OpenClaw automatically registers the resolved value in its own
-#      exact-value redaction registry (secrets/runtime.ts ->
-#      registerSecretValueForRedaction), so it gets masked in chat
-#      transcripts and tool output (e.g. `echo $LITELLM_API_KEY`) even
-#      though that env var is still present in the sandbox for the
-#      OpenShell provider's curl-based credential injection path.
+# template (__APPS_DOMAIN__ substitution). The rendered file uses
+# apiKey: "unused" — the inference router (inference.local) injects the real
+# credential at the gateway layer. The sandbox process never sees the real key.
 # See docs/constraints.md #3 and ROADMAP.md #13.4 for the full history.
 render_openclaw_config() {
   local src="$1" dest="$2"

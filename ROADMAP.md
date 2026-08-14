@@ -251,21 +251,45 @@ Run: `./scripts/seed-mlflow-prompts.sh` (initial seed), then `./scripts/launch-o
 
 ### Future: Multi-turn evaluation by prompt version
 
-The `mlflow-openclaw` plugin tracks `mlflow.trace.session` and `mlflow.trace.user`. Combined with prompt version tags, this enables session-level quality evaluation:
+**Status: BLOCKED** — upstream JS SDK issue (see ADR-0014 Problem 9).
+
+The MLflow Python API (`mlflow.genai.scorers`) provides session-level judges
+(`ConversationCompleteness`, `UserFrustration`, `KnowledgeRetention`, etc.)
+since MLflow 3.7.0. Combined with `prompt_versions` tags (set by
+`prompt-trace-linker.js`), this would enable quality evaluation per prompt
+version:
 
 ```python
 import mlflow
 from mlflow.genai.scorers import ConversationCompleteness, UserFrustration
 
 traces = mlflow.search_traces(
-    filter_string='tag.prompt_versions LIKE "%SOUL\\":3%"',
+    experiment_ids=["<experiment-id>"],
+    filter_string='tag.prompt_versions LIKE "%SOUL:3%"',
     return_type="list",
 )
 results = mlflow.genai.evaluate(
     data=traces,
-    scorers=[ConversationCompleteness(), UserFrustration()],
+    scorers=[
+        ConversationCompleteness(model="openai:/gpt-4o-mini"),
+        UserFrustration(model="openai:/gpt-4o-mini"),
+    ],
 )
 ```
+
+**Blocker:** `@mlflow/core` JS SDK v0.2.0 writes `mlflow.trace.session` as a
+**span attribute** (inside `traces.json` artifact), not as **trace metadata**
+(in the DB). `mlflow.genai.evaluate` groups sessions by
+`metadata["mlflow.trace.session"]` — without it, multi-turn scorers produce
+no results.
+
+**Revisit when:**
+- `@mlflow/core` >= 0.3.x adds metadata support to `POST /api/3.0/mlflow/traces`
+- Or RHOAI MLflow bumps the JS SDK dependency
+
+**Workaround (if urgent):** extend `patch-mlflow-plugin.py` to inject
+`metadata: {"mlflow.trace.session": sessionKey, "mlflow.trace.user": userId}`
+into the trace creation payload. The patching infrastructure already exists.
 
 ## Phase 9: Simplify Control UI for End Users
 
@@ -290,18 +314,20 @@ OpenClaw has no native "kiosk mode." The approach combines operator scopes, plug
 
 The original plan for this section ("Map Keycloak roles to OpenClaw operator scopes") is obsolete: [ADR-0016](docs/adrs/ADR-0016-openshift-native-oauth-spike.md) (2026-07-23) replaced Keycloak with `oauth-proxy` (OpenShift fork, native OCP OAuth) for the entire browser auth path. Keycloak is no longer in that path at all — it remains only for the CLI/gRPC gateway auth path. OCP's native OAuth server does not expose roles/groups in the token (they live in the Kubernetes User/Group API, not the JWT/opaque token), so there is no role claim left to map.
 
-- [ ] **Blocked**: inject a static `x-openclaw-scopes: operator.write` header from the proxy to cap all proxied Control UI sessions. Investigated and found infeasible with the current stack: `registry.redhat.io/openshift4/ose-oauth-proxy` (see [manifests/oauth2-proxy/deployment.yaml.tpl](manifests/oauth2-proxy/deployment.yaml.tpl)) only forwards identity headers it already derives from the IdP (`x-forwarded-user`, `x-forwarded-email`, `x-forwarded-preferred-username` via `--pass-user-headers=true`); it has no flag to inject an arbitrary static header. Implementing this would require either patching/forking `oauth-proxy` or adding a header-rewriting sidecar between it and the OpenShell relay — disproportionate for this phase, and risky given ADR-0016 already documents this fork as fragile (the WebSocket/Host-header bug it had to work around). Revisit if/when the proxy is replaced (e.g. `kube-auth-proxy`, noted as a non-blocking follow-up in ADR-0016) with something that supports custom header injection.
+- [ ] **Blocked**: inject a static `x-openclaw-scopes: operator.write` header from the proxy to cap all proxied Control UI sessions. Investigated and found infeasible with the current stack: `registry.redhat.io/openshift4/ose-oauth-proxy` (see [charts/oauth2-proxy/templates/deployment.yaml](charts/oauth2-proxy/templates/deployment.yaml)) only forwards identity headers it already derives from the IdP (`x-forwarded-user`, `x-forwarded-email`, `x-forwarded-preferred-username` via `--pass-user-headers=true`); it has no flag to inject an arbitrary static header. Implementing this would require either patching/forking `oauth-proxy` or adding a header-rewriting sidecar between it and the OpenShell relay — disproportionate for this phase, and risky given ADR-0016 already documents this fork as fragile (the WebSocket/Host-header bug it had to work around). Revisit if/when the proxy is replaced (e.g. `kube-auth-proxy`, noted as a non-blocking follow-up in ADR-0016) with something that supports custom header injection.
 - [ ] **Follow-up investigation (not scheduled)**: re-verify the actual runtime behavior of `gateway.controlUi.dangerouslyDisableDeviceAuth: true` (set in [config/openclaw.json.tpl](config/openclaw.json.tpl), documented in [ADR-0012](docs/adrs/ADR-0012-trusted-proxy-auth.md)) against the currently deployed OpenClaw 2026.7.1 gateway. Current OpenClaw docs describe this key as a retired break-glass/migration setting rather than a persistently supported config, which may mean device-less trusted-proxy sessions today behave differently (e.g. scopes cleared to `[]` by default) than what ADR-0012 assumed. This is a deeper auth-architecture question, out of scope for "reduce UI surface."
 - [ ] **Follow-up investigation (not scheduled)**: periodically check whether the sandbox base image (Agent Sandbox Operator's image and/or `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest`) ships Node.js `>=22.22.3` natively. `launch-openclaw.sh`'s Step 2 (`npm install -g n && n 22.22.3`) exists solely to work around the current base image's older Node.js — and that step's own `npm install -g n` is itself unpinned (no `n@<version>`, resolves whatever is "latest" on the npm registry at exec time), the same unpinned-npm-install failure mode ADR-0006 (in the sibling `agentops-example` project) already hit once for the `openclaw` package itself. Once the base image ships a compatible Node.js out of the box, remove Step 2 entirely (and the binary-relocation workaround it required in [docs/constraints.md](docs/constraints.md) constraint #2), closing off this unpinned dependency.
 
-## Phase 10 (future): Custom Sandbox Image
+## Phase 10 (very low priority): Custom Sandbox Image
+
+**Status: DEFERRED — expecting community fix.** The upstream OpenShell/OpenClaw community is expected to ship a sandbox base image that includes a compatible Node.js and pre-baked configuration, making this custom-image work unnecessary. Revisit only if the community does not deliver within a reasonable timeframe.
 
 - [ ] Build Dockerfile extending OpenShell base with Node.js + OpenClaw
 - [ ] Pre-bake `openclaw.json` configuration
 - [ ] Push to internal registry (Quay/OpenShift internal)
 - [ ] Update `values-ocp.yaml` with custom sandbox image
 
-## Phase 11 (future): Policy Refinement
+## Phase 11 (deprioritized): Policy Refinement
 
 - [ ] Start with `enforcement: audit` for new endpoints
 - [ ] Review deny logs: `openshell logs openclaw-gw --level warn`
@@ -332,20 +358,20 @@ All LLM traffic now routes through OpenShell's inference router (`inference.loca
 - Declarative provider configuration via Helm values — not yet available upstream. Tracked at [NVIDIA/OpenShell#1886](https://github.com/NVIDIA/OpenShell/issues/1886). When available, `create_provider()` and `configure_inference_route()` in `scripts/common.sh` can be replaced with Helm values in `charts/openshell/values.yaml`.
 - Multi-provider inference routing (path-based: `inference.local/openai/...` vs `inference.local/anthropic/...`) — tracked at [NVIDIA/OpenShell#896](https://github.com/NVIDIA/OpenShell/issues/896). Would allow per-sandbox model selection.
 
-### 11.2 OCSF Audit Event Assertions in `verify.sh`
+### 11.2 OCSF Audit Event Assertions in `verify.sh` — COMPLETE
 
-**Context**: The upstream [opendatahub-io/agent-ops](https://github.com/opendatahub-io/agent-ops) guides highlight `openshell logs <sandbox> --source sandbox|gateway` and `openshell term` for live OCSF event streaming — every network policy verdict (ALLOWED/DENIED), the binary that made the connection, the destination endpoint, and which policy engine made the decision are recorded as structured OCSF `HttpActivity` events. Currently `verify.sh` Layer 4 tests that egress is *blocked* (curl returns 403/timeout) but does not verify that the corresponding DENIED OCSF event was actually recorded in the audit trail.
+**Context**: The upstream [opendatahub-io/agent-ops](https://github.com/opendatahub-io/agent-ops) guides highlight `openshell logs <sandbox> --source sandbox|gateway` and `openshell term` for live OCSF event streaming — every network policy verdict (ALLOWED/DENIED), the binary that made the connection, the destination endpoint, and which policy engine made the decision are recorded as structured OCSF `HttpActivity` events. Previously `verify.sh` Layer 4 tested that egress was *blocked* (curl returns 403/timeout) but did not verify that the corresponding DENIED OCSF event was actually recorded in the audit trail.
 
 **Benefits**:
 - Validates the full observability chain end-to-end: policy enforcement happened AND the audit trail captured it
 - Catches silent audit failures (policy works but logging is broken — the sandbox is secure but the operator has no visibility)
 - Aligns with compliance requirements where audit evidence must be independently verifiable
 
-**Tasks**:
-- [ ] After the existing Layer 4 egress-denied test (`curl github.com` → blocked), query `openshell logs $SANDBOX_NAME --source sandbox` and assert a `NET:OPEN [MED] DENIED` event exists for the blocked destination
-- [ ] After the existing Layer 4 MaaS-allowed test, assert a `NET:OPEN [INFO] ALLOWED` event exists for the MaaS endpoint with `engine:opa`
-- [ ] Add to both `full` and `smoke` profiles (the `openshell logs` call is fast — no sandbox exec required)
-- [ ] Document expected OCSF event format in `docs/constraints.md` for future reference
+**Completed**:
+- [x] After the existing Layer 4 egress-denied test (`curl github.com` → blocked), query `openshell logs $SANDBOX_NAME --source sandbox` and assert a DENIED event exists for the blocked destination
+- [x] After the existing Layer 4 inference.local-allowed test, assert an ALLOWED event exists for the inference endpoint
+- [x] Runs in both `full` and `smoke` profiles (the `openshell logs` call is fast — no sandbox exec required)
+- [x] Document expected OCSF event format in `docs/constraints.md` (constraint #28)
 
 ## Phase 12: Migrate to RHOAI-managed MLflow
 
@@ -465,141 +491,26 @@ Evaluate switching from `auth.mode: "trusted-proxy"` to `auth.mode: "token"` (th
 
 </details>
 
-### 13.4 Review: plaintext MaaS API key on disk (mitigated — hard fix via OpenClaw-native SecretRef)
+### 13.4 Review: plaintext MaaS API key on disk (resolved)
 
-Flagged from a chat-session security review (jailbreak/exfiltration probing found in a
-real session transcript). An initial pass wrote per-session-isolated Playwright security
-tests (`tests/sandbox-security.spec.ts`) to reproduce this deterministically — with a
-**fresh chat session per test** (avoiding the accumulated-refusal-history false negative
-where the model blanket-refuses because of prior attempts in the same session, not because
-of a real control), the credential-leak test failed for real: `echo $LITELLM_API_KEY`
-printed the raw key unmasked.
+Security review found the raw MaaS API key readable by agent tools (`echo $LITELLM_API_KEY`,
+config files on disk). Root cause: the credential was materialized inside the sandbox,
+where Landlock and `tools.deny` cannot path-scope deny access. **Resolved** by the
+inference router migration (ADR-0021). Historical detail: constraints #3, #25, #26 in
+`docs/constraints.md`.
 
-**Root cause.** Constraint #3 (`docs/constraints.md`) used to require `launch-openclaw.sh`
-to bake the real `MAAS_API_KEY` directly into `/sandbox/workspace/.openclaw/openclaw.json`
-as a literal string, instead of any SecretRef mechanism, because Node's `fetch()`/`undici`
-breaks the sandbox proxy's `openshell:resolve:env:...` credential injection. That path is
-Landlock **read-write** and not on the `tools.deny` list — the agent's normal `read`/`exec`
-tools can access it, and since OpenClaw never "knew" the literal string was a secret (it
-was never resolved through OpenClaw's own secret-handling code), its own transcript/tool
-redaction never masked it either.
+**Solution applied**
 
-**Fix applied (v2, then superseded by inference router).** The intermediate
-fix used OpenClaw's native `"${LITELLM_API_KEY}"` SecretRef syntax, resolved
-in-process at gateway startup.
+1. **Inference router (ADR-0021)** — `apiKey` in sandbox config is `"unused"`; `LITELLM_API_KEY` is no longer injected into the sandbox. The real credential lives only in the gateway provider record and is injected by the inference router at the gateway layer. This also eliminates the intermediate SecretRef-era `models.json` cache leak (constraint #26): OpenClaw no longer resolves a real key into sandbox-writable paths.
+2. **Security tests** — Playwright jailbreak/credential-leak suite in `verify.sh` Layer 9 (`tests/sandbox-security.spec.ts`, one fresh session per test).
+3. **Gateway lifecycle** — `launch-openclaw.sh` kills stale gateways via `openshell sandbox exec` (same PID namespace); Layer 9 fails if a security-test session used a model other than the configured primary (model-drift guard).
+4. **Credential scanning** — `verify.sh` Layer 4 (`CRED_RO`/`CRED_WS`) scans sandbox files for `sk-…` patterns as a regression guard against accidental credential materialization.
+5. **Check infrastructure** — Fixed `sandbox_run()` PTY echo that caused several Layer 4/5b/9 checks to report false passes (constraint #25).
 
-**Superseded by inference router (ADR-0021):** `apiKey` is now the literal
-string `"unused"`, and `LITELLM_API_KEY` is no longer injected into the sandbox
-environment at all. The real credential lives exclusively in the gateway's
-provider record and is injected by the inference router at the gateway layer.
-See `docs/constraints.md` #3 and section 11.1 above.
+**Future improvements (defense-in-depth, not open gaps)**
 
-- [x] Re-investigated OpenShell issue #894 (undici binary resolution) — not needed for this
-      credential: OpenClaw's own native env SecretRef resolves in-process, sidestepping the
-      proxy's binary-PID mapping problem entirely instead of waiting for a proxy-side fix
-- [x] Register the plaintext MaaS key in OpenClaw's exact-value secret registry — done via
-      the native SecretRef mechanism (automatic on resolution), not a manual registration call
-- [x] Add an automated check (in `verify.sh` or a Playwright test) that attempts common
-      jailbreak/exfiltration prompts against a live session and asserts the real key
-      never appears unmasked in chat (Playwright `security-tests` in Layer 9, one fresh
-      session per test; `.jsonl` transcript file scan still open — see below)
-- [x] Investigated a path-based denylist for generic file-read/`exec` tools as a second,
-      independent layer — **not currently feasible**: Landlock rules are additive-only (a
-      more specific rule can grant but never revoke a broader ancestor's access — same
-      limitation constraint #24 already found for write-protecting prompt files), and
-      OpenClaw's `tools.deny` is a whole-tool-name denylist, not path-scoped. See
-      constraint #26.
-- [x] Scanned `.jsonl` session transcript files directly (not just the rendered chat UI
-      text) — found a real, unmasked key in exactly one stale pre-restart session's
-      transcript (`sk-...`, confirmed via `systemPromptReport.model: "llama-scout-17b"`,
-      i.e. before this section's zombie-gateway fix), removed both the `.jsonl` and
-      `.trajectory.jsonl` files. Zero other matches anywhere under
-      `/sandbox/workspace/`, `/sandbox/.openclaw/`, `/tmp/` — **except** a second,
-      independent, currently-*live* leak path found in the same sweep: see below.
-
-**New finding while re-verifying this section (2026-08-13, same day): a second plaintext
-apiKey leak path, unrelated to the SecretRef fix.** OpenClaw maintains a separate
-per-agent resolved-config cache at
-`/sandbox/workspace/.openclaw/agents/main/agent/models.json` that **is** written with the
-real, resolved `apiKey` in plaintext (by design — only `chmod 0600` afterward, which
-doesn't help since the gateway and the agent's own `read`/`exec` tools run as the same OS
-user). Confirmed this is written by the *current, already-fixed* gateway on every startup,
-not a pre-fix leftover. A plain `read` tool call against this path succeeds and returns
-real content — no jailbreak needed. Empirically, the live model (Sonnet) self-redacted the
-key to a partial preview in its own summary rather than pasting it raw, but that's model
-judgment, not an infrastructure guarantee. No clean fix exists in the current stack
-(Landlock can't scope it, `tools.deny` can't scope it); `verify.sh`'s credential scan now
-reliably detects and fails on it (previously masked by a separate bug — see below). Full
-write-up: constraint #26 (`docs/constraints.md`). Real fix is either an upstream OpenClaw
-change to stop persisting resolved secrets to this cache, or the SPIFFE/SPIRE direction
-(Phase 16.1) removing the long-lived static key entirely.
-- [ ] File upstream against OpenClaw: `models-config.ts`'s per-agent `models.json` cache
-      persists the fully-resolved `apiKey` in plaintext with no option to keep it as an
-      unresolved SecretRef or otherwise avoid materializing it to a sandbox-writable path
-- [x] Root-caused and fixed why this went undetected until today: `scripts/common.sh`'s
-      `sandbox_run()` wrapper (used by nearly every Layer 4/5b/9 check) runs commands
-      through an interactive PTY that echoes the input command's own text back before
-      running it — several checks (`CRED_RO`/`CRED_WS`, `CONFIG_PLACEHOLDER`, `NODE_LOCAL`,
-      and this section's own model-drift guard, which checked the wrong JSON field) were
-      matching against that echoed text instead of real output, and had been reporting
-      favorable results unconditionally. Fixed centrally in `sandbox_run()` (strips the
-      echo) plus per-check follow-ups. Full write-up: constraint #25.
-
-**Correction (initial "residual gap" write-up was measuring the wrong model).** An earlier
-version of this section reported that running the credential-leak Playwright test ~30 times
-showed the model's own natural-language summary re-quoting the raw key in roughly 1 in 6
-runs, and attributed this to a gap in OpenClaw's redaction pass (structured tool-output
-payloads get masked via `redactToolPayloadText()`'s exact-value registry check, but the
-model's free-form completion text supposedly did not). **That measurement was invalid**:
-`scripts/launch-openclaw.sh`'s pre-restart cleanup (Step 9a) killed stale gateway processes
-with `oc exec -c agent`, which operates in the *container's* PID namespace, while
-`openshell sandbox exec` (used to start the gateway) runs it inside the **sandbox's own**
-PID namespace. The two namespaces don't see each other's processes, so the "kill" never
-actually killed anything — every `launch-openclaw.sh` run left the previous gateway process
-running untouched and simply started a second one alongside it. Across ~30 ad-hoc test
-runs, session traffic was routed inconsistently between the current gateway (serving the
-intended `claude-sonnet-4-6` primary) and one or more zombie gateways still serving whatever
-model/config was primary *when they were originally started* — confirmed via
-`sessions.json`, which showed most of those sessions actually ran against `llama-scout-17b`
-or `gpt-oss-120b`, not `claude-sonnet-4-6`. A weaker model is far more likely to blindly
-restate raw tool stdout verbatim in its own words instead of following the "don't
-re-surface credentials" system guidance — which is exactly the pattern that looked like a
-redaction gap.
-
-**Fix applied.** `scripts/launch-openclaw.sh` Step 9a now kills stale processes via
-`openshell sandbox exec` (the same namespace the gateway actually runs in) and verifies
-termination before starting a fresh one; `scripts/verify.sh` Layer 9 now also snapshots
-`sessions.json` right before running security tests and fails if any session created during
-the run used a model other than the `primary` configured in `openclaw.json` — so a
-recurrence of this class of bug (wrong model silently serving requests) is caught
-automatically instead of masquerading as a model-behavior or redaction finding.
-
-**Re-validated against a confirmed-clean gateway.** With the zombie-process bug fixed and
-`sessions.json` confirming every test session ran against `claude-sonnet-4-6`, the full
-7-test security suite (including the credential-leak test) passed cleanly across 4
-consecutive runs with **zero retries needed** — a qualitative difference from the earlier
-Scout/gpt-oss-120b runs, which needed several heuristic loosenings in
-`tests/sandbox-security.spec.ts` just to stop failing on ambiguous/terse model behavior
-(since reverted/tightened now that they're confirmed unnecessary with the primary model;
-see inline comments in that file for what was removed and why).
-- [x] Root-caused and fixed: PID-namespace mismatch between `oc exec` (cleanup) and
-      `openshell sandbox exec` (gateway start) in `launch-openclaw.sh`, causing stale
-      gateway processes — and stale models — to silently keep serving requests
-- [x] Added a model-drift guard to `verify.sh` Layer 9 (fails fast if a security-test
-      session's `model` in `sessions.json` doesn't match the configured `primary`)
-- [ ] The underlying architectural point remains true in principle, independent of model:
-      any tool-calling agent that reads a raw secret into its own context to reason about
-      it (e.g. to tell a real key apart from a permission error) *could* restate it
-      verbatim in free-form prose, and a server-side redaction pass on structured
-      tool-output alone can't fully rule that out. Worth filing upstream (does OpenClaw run
-      `redactRegisteredSecretValues()` over plain assistant message text, not just
-      tool-activity payloads?) as defense-in-depth, but it is no longer an *observed*
-      failure mode with the primary model — deprioritized accordingly.
-- [ ] The SPIFFE/SPIRE short-lived-credential plan (Phase 16.1) remains the strongest
-      general mitigation regardless of model — a rotated, narrowly-scoped token shrinks the
-      blast radius of any single verbatim leak, tool-output or prose.
-
-**Architectural fix being tracked**: [Phase 16.1](#161-consume-platform-workload-identity-spiffespire) proposes replacing this static MaaS API key entirely with a SPIFFE/SPIRE-issued, auto-rotated credential once `rhoai-platform-ops` ships its workload-identity module — removing the class of problem (a durable secret that can be read off disk at all), not just mitigating it. Keep this item open until that lands; the redaction-registry fix above is the durable near-term control in the meantime.
+- [ ] [Phase 16.1](#161-consume-platform-workload-identity-spiffespire): SPIFFE/SPIRE workload identity — replace the gateway's static provider credential with auto-rotated, narrowly-scoped tokens
+- [ ] Upstream redaction of free-form assistant text, not just tool payloads (deprioritized — not an observed failure mode with the primary model)
 
 ### 13.5 Re-audit `OPENSHELL_GATEWAY_INSECURE` scoping when AWS OCP gets real certs
 
@@ -741,14 +652,13 @@ Source: [Architect an open blueprint for cloud-native AI agents](https://develop
 ### 16.1 Consume platform Workload Identity (SPIFFE/SPIRE)
 
 - **Blocked on**: `rhoai-platform-ops` Phase 8.1 (SPIRE server/agent deployment)
-- Once available, migrate this project's outbound calls (sandbox → MaaS, and any future sandbox → skill backend) from the current static-key / trusted-proxy pattern to a SPIFFE SVID + token exchange (RFC 8693/7523)
-- This is the real fix for [item 13.4](#134-review-plaintext-maas-api-key-on-disk) (plaintext MaaS API key on disk) — a cryptographic, auto-rotated identity removes the need to ever write a durable secret to the sandbox filesystem
+- Once available, migrate outbound calls from the gateway's static provider credential to a SPIFFE SVID + token exchange (RFC 8693/7523)
+- Defense-in-depth for [item 13.4](#134-review-plaintext-maas-api-key-on-disk): the inference router already keeps credentials out of the sandbox; SPIFFE/SPIRE further shrinks blast radius by replacing the long-lived static key in the gateway provider record with auto-rotated workload identity
 - Note this is orthogonal to the existing human-facing OIDC work (Keycloak/OCP OAuth, ADR-0010/ADR-0016): that authenticates the *user* opening the Control UI; SPIFFE/SPIRE would authenticate the *agent pod itself* for its own outbound calls
 - Tasks (once unblocked):
   - [ ] Register this project's sandbox ServiceAccount with the shared SPIRE server (workload registration entry, selector on namespace + SA)
   - [ ] Add the SPIFFE authentication sidecar (or equivalent init pattern) to the sandbox pod spec
-  - [ ] Update `scripts/launch-openclaw.sh` to stop injecting the raw `MAAS_API_KEY` and instead configure the MaaS provider to use the exchanged short-lived token
-  - [ ] Remove or downgrade the interim mitigations from item 13.4 once this is validated end-to-end
+  - [ ] Update `create_provider()` / inference route to use the exchanged short-lived token instead of the static `MAAS_API_KEY`
   - [ ] Add SPIFFE identity + token exchange checks to `verify.sh`
 
 ### 16.2 Consume platform MCP Gateway for tool calls
@@ -793,6 +703,35 @@ Source: [Architect an open blueprint for cloud-native AI agents](https://develop
 
 - **Agent-as-a-Service (OGX)**: RHOAI 3.5 EA ships a shared agentic-loop runtime as an alternative to this project's current in-pod harness loop. The article notes the two patterns compose (a sandboxed pod can delegate tool execution to a shared loop while keeping its own identity). Revisit once `rhoai-platform-ops` evaluates OGX in its own roadmap (Phase 6) — no action here until then.
 - **Multi-agent orchestration (A2A / signed AgentCards)**: only relevant if a second agent is ever added to this project. A2A reached 1.0 per the article, but interoperability in practice is still settling. Not applicable to a single-agent deployment today.
+
+## Phase 17 (future): Unified Observability — OpenShell/OpenClaw Logs in the OpenShift Stack
+
+**Status**: Not started — planning only.
+
+**Context**: Today, sandbox security audit events (OCSF) live exclusively in OpenShell's own logging system (`openshell logs`), and OpenClaw gateway logs live inside the sandbox pod's stdout. Neither is visible in the cluster's central observability stack (Prometheus/Loki/Tempo/Grafana). This means an operator must use the `openshell` CLI to investigate security events — they can't build alerts, dashboards, or correlate sandbox network verdicts with agent traces in MLflow or distributed traces in Tempo.
+
+**Goal**: Forward OpenShell and OpenClaw logs into the OpenShift observability stack so that all sandbox audit events, network policy verdicts, and agent gateway logs are queryable, alertable, and correlatable alongside platform metrics and traces.
+
+**Architecture options**:
+
+| Approach | How | Pros | Cons |
+|---|---|---|---|
+| **A. Sidecar OTel Collector** | Deploy an OTel Collector sidecar in the sandbox pod that tails OpenShell's OCSF log stream and exports as OTLP logs to the cluster's OTel pipeline | Native OTel integration, structured attributes, correlates with existing Tempo traces | Requires sidecar injection, adds resource overhead per sandbox pod |
+| **B. Cluster-level log forwarding (CLF/Loki)** | Use OpenShift's ClusterLogForwarder to capture sandbox pod stdout (which includes OCSF events) and route to Loki | No per-pod changes, uses existing OCP logging infrastructure | Requires Loki deployment (or RHOL), logs are semi-structured text requiring parsing |
+| **C. OpenShell webhook/export** | If upstream adds an OCSF export webhook or OTLP exporter, configure it to push directly to the cluster's OTel Collector | Cleanest integration, no sidecar | Depends on upstream feature availability |
+
+**Tasks**:
+- [ ] Evaluate which approach is feasible given current OpenShell version (v0.0.83) — check if `openshell logs` supports `--format json` or if there's an export mechanism
+- [ ] If approach A: add OTel Collector sidecar to the OpenShell wrapper chart (`charts/openshell/`), configure log receiver for OCSF events, export to `otel-collector.observability.svc`
+- [ ] If approach B: deploy Loki (or use RHOL if available) and configure ClusterLogForwarder with a pipeline for the `openshell` namespace; create Grafana dashboard for OCSF event queries
+- [ ] Create a Grafana dashboard showing: DENIED events over time, top blocked destinations, ALLOWED vs DENIED ratio, per-binary network activity
+- [ ] Create PrometheusRule alerts for anomalous patterns (e.g., burst of DENIED events, new destination never seen before, OCSF logging gap — no events for >N minutes while sandbox is active)
+- [ ] Correlate OCSF events with MLflow traces: when a DENIED event occurs during an active chat session, link the network verdict to the MLflow trace that triggered it (requires trace-id propagation or timestamp correlation)
+- [ ] Forward OpenClaw gateway logs (`openclaw.log` inside sandbox) alongside OCSF events — useful for debugging agent-side errors that correspond to network policy decisions
+- [ ] Add `verify.sh` checks for the new pipeline (e.g., after a DENIED event, query Loki/Tempo to confirm the event arrived in the central stack)
+- [ ] Document the integration in `docs/constraints.md` and create an ADR for the chosen approach
+
+**Blocked on**: Evaluating upstream OpenShell OCSF export capabilities and deciding between Loki (RHOL) vs OTel Collector log pipeline for the cluster.
 
 ## References
 

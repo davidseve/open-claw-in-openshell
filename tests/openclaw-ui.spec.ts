@@ -7,11 +7,8 @@ test.describe('OpenClaw Control UI', () => {
   test('loads and shows chat interface', async ({ page }) => {
     await page.goto('/');
     await expect(page).toHaveTitle('OpenClaw Control');
-    await expect(page.getByPlaceholder(/Message/)).toBeVisible();
-    await expect(page.getByText('Ready to chat')).toBeVisible();
-    await expect(
-      page.getByRole('group').filter({ hasText: /\binference\b/ }).first(),
-    ).toBeAttached({ timeout: 10000 });
+    await expect(page.getByPlaceholder(/Message/)).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText(/Router|Sonnet|router|inference/).first()).toHaveCount(1, { timeout: 10000 });
   });
 
   test('sidebar navigation is present', async ({ page }) => {

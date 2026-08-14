@@ -197,6 +197,10 @@ else
     echo "NODE=$(node --version) OPENCLAW=$(openclaw --version 2>&1 | grep -oP "\d+\.\d+\.\d+") NPM=$(npm --version 2>/dev/null || echo BROKEN)"
   ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 fi
+# verify.sh Layer 5b: proxy L7 allowlist uses /usr/bin/node — relocate if `n` left a copy at /usr/local/bin/node
+oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c \
+  'test -f /usr/local/bin/node && cp -f /usr/local/bin/node /usr/bin/node && rm -f /usr/local/bin/node' \
+  2>/dev/null || true
 
 # ─── Step 3: Copy config to writable workspace ──────────────────────────────
 # /sandbox/ is read-only (Landlock). OpenClaw needs to write state, logs, and
@@ -226,7 +230,8 @@ info "Config at /sandbox/workspace/.openclaw/openclaw.json"
 # and the UI model picker may appear broken (known OpenClaw 2026.7.1 quirk).
 # On every launch: drop session-level model overrides so sessions inherit the
 # freshly rendered config primary, and remove the cached models catalog so
-# the gateway rebuilds aliases from openclaw.json on restart.
+# the gateway rebuilds from openclaw.json on restart (also clears any stale
+# SecretRef-era models.json that may still contain a resolved apiKey).
 step "Resetting stale session model overrides to config primary"
 PRIMARY_MODEL=$(python3 -c "import json; print(json.load(open('${RENDERED_DIR}/openclaw.json'))['agents']['defaults']['model']['primary'])")
 oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- python3 -c "

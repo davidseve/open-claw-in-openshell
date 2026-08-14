@@ -256,12 +256,12 @@ fi
 #   - /etc/shadow not readable as password hashes
 #   - MaaS reachability: the one allowed destination must work
 #   - Credential isolation: no plaintext API keys on sandbox filesystem —
-#     apiKey is OpenClaw's native "${LITELLM_API_KEY}" env SecretRef,
-#     resolved in-process at gateway startup, never baked into the file
-#     (see constraint #3 in launch-openclaw.sh / ROADMAP.md #13.4)
-#   - Landlock enforcement: /sandbox/.openclaw must be read-only
-#   - Config placeholder: the ${LITELLM_API_KEY} marker must still be intact
-#     in the working config at /sandbox/workspace/.openclaw/openclaw.json
+#     apiKey is "unused" (inference router handles credentials at the gateway
+#     layer); neither env nor config files should contain a real sk- key
+#     (see constraint #3 / ROADMAP.md #13.4)
+#   - OCSF audit trail: verify DENIED/ALLOWED events were recorded by the
+#     proxy (catches silent audit failures — enforcement works but logging
+#     is broken)
 # HOW TO FIX: These indicate fundamental sandbox security issues. Check
 #   policies/openclaw-sandbox.yaml and the SCC binding.
 step "Layer 4: Security Validation"
@@ -393,6 +393,31 @@ if command -v openshell &>/dev/null; then
     pass "No plaintext API keys in workspace config"
   else
     fail "SECURITY: API key present in /sandbox/workspace/.openclaw/: $(echo "$CRED_WS" | head -3 | tr '\n' ' ') (apiKey should be 'unused', never a real key)"
+  fi
+
+  # --- OCSF Audit Trail Assertions ---
+  # Validate that the proxy not only enforced policy but also recorded the
+  # corresponding OCSF events. Catches silent audit failures (enforcement
+  # works but logging is broken). The `openshell logs` call queries the
+  # gateway — no sandbox exec required, safe for both full and smoke.
+
+  OCSF_LOGS=$(openshell logs "$SANDBOX_NAME" --source sandbox 2>&1 || true)
+  if [[ -n "$OCSF_LOGS" ]] && ! echo "$OCSF_LOGS" | grep -qiE "error|not found|OIDC"; then
+    # Assert DENIED event for github.com (matches the egress-denied test above)
+    if echo "$OCSF_LOGS" | grep -qE "DENIED.*(github\.com|github)"; then
+      pass "OCSF audit: DENIED event recorded for github.com egress"
+    else
+      warn "OCSF audit: no DENIED event found for github.com (audit trail gap — enforcement passed but no log evidence)"
+    fi
+
+    # Assert ALLOWED event for inference.local (the one allowed LLM endpoint)
+    if echo "$OCSF_LOGS" | grep -qE "ALLOWED.*(inference|inference\.local)"; then
+      pass "OCSF audit: ALLOWED event recorded for inference.local"
+    else
+      warn "OCSF audit: no ALLOWED event found for inference.local (may not have been exercised yet)"
+    fi
+  else
+    warn "OCSF audit: could not query openshell logs (${OCSF_LOGS:0:100})"
   fi
 
   # Verify Landlock: /sandbox/.openclaw/ must be read-only
