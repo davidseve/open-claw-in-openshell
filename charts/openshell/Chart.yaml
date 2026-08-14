@@ -1,0 +1,23 @@
+# Wrapper chart for OpenClaw-in-OpenShell. A single Helm release renders this
+# chart's own OpenShift extras (privileged-SCC RoleBinding, gRPC Route) *and*
+# the upstream OpenShell gateway itself as a real Helm subchart dependency
+# (aliased `openshell` below) — no separate `oc apply` for the Route, no
+# imperative `oc adm policy add-scc-to-user` for the SCC binding, no second
+# `helm install`. The version pinned in `dependencies[].version` + Chart.lock
+# is the single source of truth for the deployed OpenShell version.
+#
+# Ported from agentops-example's deploy/helm/openshell chart (2026-08-05),
+# which found the correct OCI `repository:` path the hard way: it must be the
+# *parent* of the chart (`oci://ghcr.io/nvidia/openshell`), not
+# `.../helm-chart` — Helm appends `name` itself when resolving OCI refs.
+apiVersion: v2
+name: openclaw-openshell
+description: OpenShell gateway for OpenClaw-in-OpenShell, deployed on OpenShift
+type: application
+version: 0.1.0
+appVersion: "0.0.83"
+dependencies:
+  - name: helm-chart
+    alias: openshell
+    version: "0.0.83"
+    repository: "oci://ghcr.io/nvidia/openshell"

@@ -1,0 +1,22 @@
+namespace: observability
+
+tempo:
+  image: docker.io/grafana/tempo:2.7.2
+  storageSize: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+otelCollector:
+  image: docker.io/otel/opentelemetry-collector-contrib:0.121.0
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

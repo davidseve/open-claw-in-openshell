@@ -1,0 +1,10 @@
+rhoai:
+  enabled: true
+  namespace: redhat-ods-operator
+  channel: stable-3.4
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  # Manual approval required: AGENTS.md security guideline —
+  # "Use installPlanApproval: Manual for OLM operators to prevent unreviewed
+  # upgrades." (agentops-example uses Automatic; we deliberately don't.)
+  installPlanApproval: Manual

@@ -1,0 +1,16 @@
+{{- if .Values.agentSandbox.enabled }}
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: agent-sandbox-operator
+  namespace: {{ .Values.agentSandbox.namespace }}
+spec:
+  name: agent-sandbox-operator
+  channel: {{ .Values.agentSandbox.channel }}
+  source: {{ .Values.agentSandbox.source }}
+  sourceNamespace: {{ .Values.agentSandbox.sourceNamespace }}
+  installPlanApproval: {{ .Values.agentSandbox.installPlanApproval | default "Manual" }}
+  {{- if .Values.agentSandbox.startingCSV }}
+  startingCSV: {{ .Values.agentSandbox.startingCSV }}
+  {{- end }}
+{{- end }}

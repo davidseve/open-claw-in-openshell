@@ -1,0 +1,6 @@
+apiVersion: v2
+name: agent-sandbox-operators
+description: "Red Hat build of Agent Sandbox Operator subscription (OLM, OSC 1.13 Technology Preview) — see docs/adrs/ADR-0004-agent-sandbox-redhat.md"
+type: application
+version: 0.1.0
+appVersion: "0.9"

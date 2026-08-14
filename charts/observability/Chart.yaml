@@ -1,0 +1,6 @@
+apiVersion: v2
+name: observability
+description: "Infrastructure observability: Grafana Tempo (trace storage) + OpenTelemetry Collector — logs/metrics only, not agent traces (see ADR-0018)"
+type: application
+version: 0.1.0
+appVersion: "2.7.2"

@@ -1,0 +1,28 @@
+# AWS OCP overlay: enables the RHOAI Dashboard + Gen AI Studio nav for the
+# Prompt Registry / Traces UI. A human browsing the UI on a real cluster
+# doesn't compete with Cursor/desktop apps for the same laptop's RAM, unlike
+# CRC (see values-crc.yaml) — see ADR-0018's 2026-07-27 amendment.
+#
+# llamastackoperator: Managed is required on top of dashboardConfig.genAiStudio
+# below — the "Gen AI studio" nav item (Playground / AI asset endpoints /
+# Prompts) is a module-federation extension gated on
+# requiredComponents:[LLAMA_STACK_OPERATOR] (confirmed by grepping the
+# deployed gen-ai-ui container's extension bundle); genAiStudio alone is
+# necessary but not sufficient. See docs/constraints.md #23.
+#
+# charts/rhoai/Makefile's deploy-platform target additionally sequences
+# llamastackoperator's own enablement BEFORE dashboard's on a fresh enable
+# (a one-line --set-string override of dashboard.managementState, layered
+# on top of this file, back to Removed for that one bootstrap step only) —
+# see docs/constraints.md #23's "root-caused instead of just reacted-to"
+# follow-up for why that one imperative step can't be expressed declaratively
+# here (it depends on a runtime wait for LlamaStackOperatorReady, which has
+# no pure-YAML equivalent).
+datasciencecluster:
+  components:
+    dashboard:
+      managementState: Managed
+    llamastackoperator:
+      managementState: Managed
+dashboardConfig:
+  genAiStudio: true

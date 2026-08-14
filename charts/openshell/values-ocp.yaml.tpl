@@ -1,45 +1,24 @@
-# OpenShell Helm chart overrides for OpenShift Container Platform
-# Based on: https://docs.nvidia.com/openshell/latest/kubernetes/setup
-# Reference: https://github.com/rcarrata/agent-harness-in-a-box (commit 76aca3b)
+# OIDC overlay: OpenShell gateway auth via Keycloak (browser/headless OIDC
+# login for the CLI/gRPC path — see scripts/configure-oidc.sh and
+# docs/adrs/ADR-0012-trusted-proxy-auth.md for why the *UI* uses trusted-proxy
+# instead, a separate path).
 #
-# Template: __APPS_DOMAIN__ is replaced at deploy time by scripts/common.sh render_template().
+# Template: __APPS_DOMAIN__ is replaced at deploy time by scripts/common.sh
+# render_template(). Keep this file's non-oidc/auth sections in sync with
+# values-ocp-no-oidc.yaml.tpl by hand if you change one — see that file's
+# header comment for why they're two explicit files instead of one generated
+# from the other by stripping the `oidc:` block.
 
-replicaCount: 1
+openshell:
+  server:
+    auth:
+      allowUnauthenticatedUsers: false
 
-workload:
-  kind: statefulset
-
-image:
-  tag: "0.0.83"
-
-supervisor:
-  image:
-    tag: "0.0.83"
-
-# Let OpenShift SCC admission assign UIDs and fsGroup
-podSecurityContext:
-  fsGroup: null
-
-securityContext:
-  runAsUser: null
-
-# PKI init job creates openshell-server-tls, openshell-client-tls,
-# and openshell-jwt-keys secrets automatically on first install.
-# mTLS is required for SSH relay, sandbox exec, and credential injection.
-pkiInitJob:
-  serverDnsNames:
-    - "openshell-gw-openshell.__APPS_DOMAIN__"
-    - "*.__APPS_DOMAIN__"
-
-server:
-  auth:
-    allowUnauthenticatedUsers: false
-
-  oidc:
-    issuer: "https://keycloak-openshell-keycloak.__APPS_DOMAIN__/realms/openshell"
-    audience: "openshell-cli"
-    jwksTtl: 60
-    rolesClaim: "realm_access.roles"
-    adminRole: "openshell-admin"
-    userRole: "openshell-user"
-    caConfigMapName: "openshell-oidc-ca"
+    oidc:
+      issuer: "https://keycloak-openshell-keycloak.__APPS_DOMAIN__/realms/openshell"
+      audience: "openshell-cli"
+      jwksTtl: 60
+      rolesClaim: "realm_access.roles"
+      adminRole: "openshell-admin"
+      userRole: "openshell-user"
+      caConfigMapName: "openshell-oidc-ca"

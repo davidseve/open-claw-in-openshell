@@ -1,14 +1,14 @@
 {
   "models": {
     "providers": {
-      "maas": {
-        "baseUrl": "https://maas-rhdp.apps.maas.redhatworkshops.io/v1",
-        "apiKey": "openshell:resolve:env:LITELLM_API_KEY",
+      "inference": {
+        "baseUrl": "https://inference.local/v1",
+        "apiKey": "unused",
         "api": "openai-completions",
         "models": [
           {
-            "id": "claude-sonnet-4-6",
-            "name": "Claude Sonnet 4.6",
+            "id": "router",
+            "name": "Router",
             "reasoning": true,
             "input": ["text", "image"],
             "contextWindow": 200000,
@@ -21,13 +21,51 @@
   },
   "agents": {
     "defaults": {
-      "model": { "primary": "maas/claude-sonnet-4-6" },
+      "model": {
+        "primary": "inference/router",
+        "fallbacks": []
+      },
+      "models": {
+        "inference/router": { "alias": "Router" }
+      },
       "workspace": "/sandbox/workspace"
     }
   },
   "tools": {
-    "deny": ["gateway", "cron", "openclaw"],
+    "deny": ["gateway", "cron", "openclaw", "browser", "nodes"],
     "fs": { "workspaceOnly": true }
+  },
+  "plugins": {
+    "deny": ["workboard", "admin-http-rpc"],
+    "entries": {
+      "diagnostics-otel": {
+        "enabled": false
+      },
+      "mlflow-openclaw": {
+        "enabled": true,
+        "config": {
+          "trackingUri": "https://mlflow.redhat-ods-applications.svc:8443",
+          "experimentId": "0"
+        },
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  },
+  "diagnostics": {
+    "enabled": true,
+    "otel": {
+      "enabled": true,
+      "endpoint": "http://otel-collector.observability.svc:4318",
+      "protocol": "http/protobuf",
+      "serviceName": "openclaw-agent",
+      "traces": false,
+      "metrics": true,
+      "logs": false,
+      "sampleRate": 1.0,
+      "captureContent": true
+    }
   },
   "gateway": {
     "mode": "local",
@@ -36,15 +74,26 @@
     "auth": {
       "mode": "trusted-proxy",
       "trustedProxy": {
-        "userHeader": "x-forwarded-user"
+        "userHeader": "x-forwarded-email",
+        "requiredHeaders": ["x-forwarded-proto", "x-forwarded-host"],
+        "allowLoopback": true
       }
     },
-    "trustedProxies": ["127.0.0.1", "::1"],
+    "trustedProxies": ["127.0.0.1", "::1", "10.217.0.0/22", "10.217.4.0/23", "192.168.0.0/16"],
     "controlUi": {
       "allowedOrigins": [
-        "https://openclaw-ui.__APPS_DOMAIN__",
-        "https://openclaw-gw--openclaw-ui.__APPS_DOMAIN__"
-      ]
+        "https://__SANDBOX_NAME__--openclaw-ui.__APPS_DOMAIN__"
+      ],
+      "dangerouslyDisableDeviceAuth": true
+    },
+    "terminal": {
+      "enabled": false
+    },
+    "reload": {
+      "mode": "off"
+    },
+    "nodes": {
+      "denyCommands": ["system.run", "canvas.navigate"]
     },
     "http": {
       "endpoints": {

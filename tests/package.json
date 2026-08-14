@@ -5,7 +5,8 @@
   "description": "Playwright tests for OpenClaw-in-OpenShell",
   "scripts": {
     "test": "npx playwright test",
-    "test:ui": "npx playwright test --ui"
+    "test:ui": "npx playwright test --ui",
+    "test:security": "npx playwright test --project=security-tests"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1"

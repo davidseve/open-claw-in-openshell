@@ -1,0 +1,15 @@
+# OCP OAuthClient that allows Keycloak to act as an identity broker.
+# Keycloak redirects users to OCP login, then OCP sends the auth code
+# back to Keycloak's broker endpoint.
+#
+# The secret is generated at deploy time (scripts/deploy-keycloak.sh, via
+# common.sh's ensure_secret_var) and injected into the Keycloak realm config
+# below as the identity provider client secret.
+apiVersion: oauth.openshift.io/v1
+kind: OAuthClient
+metadata:
+  name: keycloak-broker
+grantMethod: auto
+secret: {{ .Values.brokerSecret | required "brokerSecret is required — scripts/deploy-keycloak.sh sets it via ensure_secret_var" | quote }}
+redirectURIs:
+  - "https://keycloak-{{ .Values.namespace }}.{{ .Values.appsDomain }}/realms/openshell/broker/openshift/endpoint"

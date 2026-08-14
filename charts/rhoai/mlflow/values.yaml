@@ -1,0 +1,32 @@
+postgresql:
+  host: mlflow-db.redhat-ods-applications.svc
+  port: 5432
+  user: mlflow
+  # Never commit secrets to git (AGENTS.md). Left blank here on purpose —
+  # scripts/deploy-rhoai-mlflow.sh generates/loads this from
+  # secrets/secrets.env and injects it via `helm --set-string`. Must match
+  # ../database's database.password (same generated value).
+  password: ""
+  database: mlflow
+
+mlflow:
+  enabled: true
+  name: mlflow
+  replicas: 1
+  serveArtifacts: true
+  artifactsDestination: "file:///mlflow/artifacts"
+  storage:
+    size: 10Gi
+  route:
+    enabled: true
+
+# RBAC + SA token + experiment provisioning for wiring the mlflow-openclaw
+# plugin's tracing at this MLflow instance used to live here
+# (openclawIntegration.*), coupled to this chart's own `helm upgrade
+# --install rhoai-mlflow` — which silently reset it to disabled on every
+# plain redeploy (no --reuse-values), and couldn't support a second,
+# differently-namespaced consumer sharing this same MLflow instance without
+# clobbering the first one's RBAC. Extracted 2026-08-05 into its own
+# standalone release: charts/rhoai/openclaw-integration/ (see
+# scripts/wire-rhoai-mlflow-tracing.sh and
+# docs/adrs/ADR-0020-shared-cluster-coexistence.md).

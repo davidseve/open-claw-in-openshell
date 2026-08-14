@@ -27,3 +27,21 @@ This allows OpenShift SCC admission to assign UIDs from the namespace's allocate
 - Risk: a compromised sandbox supervisor process has elevated host access via the privileged SCC.
 - Mitigation: the SCC binding is scoped to a single ServiceAccount in a single namespace. Inside the sandbox, OpenShell's own enforcement layers (L7 proxy, Landlock, nftables) limit what agent processes can do regardless of the pod's SCC.
 - The gateway pod is unaffected — it continues to run under `restricted-v2` with no elevated privileges.
+
+## Addendum (2026-08-05): declarative binding via the wrapper chart
+
+The binding described above was originally applied imperatively —
+`scripts/common.sh`'s `grant_privileged_scc()` ran `oc adm policy
+add-scc-to-user privileged -z openshell-sandbox -n "$ns"` from
+`bootstrap-ocp.sh`, with the matching `oc adm policy remove-scc-from-user`
+in `teardown.sh`.
+
+This is now a declarative `RoleBinding` template
+(`charts/openshell/templates/scc-rolebinding.yaml`, gated by
+`openshift.scc.privilegedSandbox`), rendered as part of the same Helm
+release as the gateway and the `openshell-sandbox` ServiceAccount itself
+(see ADR-0019). `helm uninstall` now removes the binding too — no separate
+imperative cleanup step in `teardown.sh`. The decision, scope, and
+security rationale above are unchanged; only the mechanism moved from an
+imperative `oc adm policy` command to a Helm-managed resource, following the
+pattern already validated in the sibling `agentops-example` project.

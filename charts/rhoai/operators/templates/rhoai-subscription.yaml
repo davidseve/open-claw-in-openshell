@@ -1,0 +1,16 @@
+{{- if .Values.rhoai.enabled }}
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: rhods-operator
+  namespace: {{ .Values.rhoai.namespace }}
+spec:
+  name: rhods-operator
+  channel: {{ .Values.rhoai.channel }}
+  source: {{ .Values.rhoai.source }}
+  sourceNamespace: {{ .Values.rhoai.sourceNamespace }}
+  installPlanApproval: {{ .Values.rhoai.installPlanApproval | default "Manual" }}
+  {{- if .Values.rhoai.startingCSV }}
+  startingCSV: {{ .Values.rhoai.startingCSV }}
+  {{- end }}
+{{- end }}

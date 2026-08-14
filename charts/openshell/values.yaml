@@ -1,0 +1,71 @@
+# Default values for openclaw-openshell.
+# Upstream chart values are nested under the `openshell` alias (see Chart.yaml
+# `dependencies[].alias`) and passed straight through to the real OpenShell
+# subchart dependency rendered as part of this same release.
+#
+# OIDC vs. no-OIDC and the OIDC issuer URL (which needs the live apps domain
+# interpolated) still come from values-ocp.yaml.tpl / values-ocp-no-oidc.yaml.tpl
+# (rendered by scripts/common.sh render_template()) layered on top of this
+# file with `-f`. `pkiInitJob.serverDnsNames` is NOT set here — it depends on
+# both the namespace and the apps domain at deploy time (so a second,
+# differently-namespaced deploy of this chart gets its own correct SAN
+# instead of a hardcoded "openshell" literal) and is passed via `--set` from
+# scripts/deploy-openshell.sh / scripts/configure-oidc.sh instead.
+
+# --- Wrapper-level settings ---
+
+openshift:
+  scc:
+    # Always true here (unlike agentops-example, which defaults this to
+    # false and opts in via an overlay): every environment this project
+    # deploys to (CRC, AWS OCP sandbox) needs the sandbox SA to run
+    # privileged (docs/adrs/ADR-0006-scc-privileged-sandbox.md).
+    privilegedSandbox: true
+    # Left unset: the `openclaw-openshell.sandboxSA` helper
+    # (templates/_helpers.tpl) already defaults to "<release name>-sandbox",
+    # and this chart is always installed with release name "openshell" (see
+    # scripts/deploy-openshell.sh), so it resolves to "openshell-sandbox"
+    # automatically — matching the sandbox ServiceAccount the subchart
+    # itself creates, and every other script/chart in this repo that already
+    # hardcodes "openshell-sandbox" (RBAC, MLflow wiring). Only set this to
+    # override if the release is ever installed under a different name.
+    serviceAccount: ""
+
+# --- Upstream subchart overrides (alias: openshell) ---
+
+openshell:
+  image:
+    tag: "0.0.83"
+
+  supervisor:
+    image:
+      tag: "0.0.83"
+
+  replicaCount: 1
+  workload:
+    kind: statefulset
+
+  # Let OpenShift SCC admission assign UID and fsGroup.
+  podSecurityContext:
+    fsGroup: null
+  securityContext:
+    runAsUser: null
+
+  # PKI init job creates openshell-server-tls, openshell-client-tls, and
+  # openshell-jwt-keys secrets automatically on first install. mTLS is
+  # required for the SSH relay, sandbox exec, and credential injection.
+  pkiInitJob:
+    enabled: true
+
+# Route (gRPC endpoint for the openshell CLI). Uses .Release.Namespace, so a
+# release installed into a different namespace (coexistence with another
+# project on the same cluster) gets a correctly-scoped, non-colliding Route
+# and public hostname automatically — no template placeholder needed here.
+route:
+  enabled: true
+  name: openshell-gw
+  targetPort: grpc
+  tlsTermination: passthrough
+
+global:
+  appsDomain: ""

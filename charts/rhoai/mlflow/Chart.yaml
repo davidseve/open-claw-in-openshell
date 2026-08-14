@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mlflow
+description: "RHOAI-managed MLflow Tracking Server (Phase 12 — replaces standalone MLflow on AWS, see ADR-0017)"
+type: application
+version: 0.1.0
+appVersion: "3.4"

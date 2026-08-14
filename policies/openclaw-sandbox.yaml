@@ -13,21 +13,14 @@ process:
   run_as_group: sandbox
 
 network_policies:
-  maas_inference:
-    name: red-hat-maas-litellm
-    endpoints:
-      - host: "maas-rhdp.apps.maas.redhatworkshops.io"
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: read-write
-        request_body_credential_rewrite: true
-    binaries:
-      - { path: /usr/bin/node }
-      - { path: /usr/bin/curl }
+  # LLM inference: handled by OpenShell's inference router (inference.local).
+  # No explicit network policy needed — inference.local traffic is internal
+  # to the OpenShell proxy and never egresses as external network traffic.
+  # The provider credential is injected by the privacy router at the gateway
+  # layer. See docs/adrs/ADR-0021-inference-router-migration.md.
 
   observability:
-    name: otel-collector-traces
+    name: observability-stack
     endpoints:
       - host: "otel-collector.observability.svc"
         port: 4318
@@ -39,11 +32,49 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-write
-      - host: "mlflow.observability.svc"
-        port: 5000
+    binaries:
+      - { path: /usr/bin/node }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/curl }
+
+  # RHOAI-managed MLflow (charts/rhoai/) is the sole tracing backend — see
+  # docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md. The standalone
+  # ghcr.io/mlflow/mlflow deployment this endpoint originally pointed at
+  # (mlflow.observability.svc:5000, plain HTTP, no auth) was removed entirely.
+  #
+  # tls: skip — REQUIRED for this endpoint. RHOAI's MLflow Service certificate
+  # is signed by OpenShift's internal `service-ca`, which OpenShell's L7 proxy
+  # does not trust for its own MITM/upstream leg (confirmed live: `curl` from
+  # the sandbox got "Recv failure: Connection reset by peer", and
+  # `openshell logs` showed the proxy failing its upstream TLS handshake —
+  # see ADR-0017's addendum). `tls: skip` disables proxy-side TLS
+  # termination/inspection for this endpoint only: encrypted bytes pass
+  # through untouched, and the real TLS handshake happens directly between
+  # the mlflow-openclaw plugin's Node process and MLflow, validated against
+  # the CA bundle supplied via MLFLOW_TRACKING_SERVER_CERT_PATH (see
+  # scripts/wire-rhoai-mlflow-tracing.sh, which extracts
+  # openshift-service-ca.crt for exactly this purpose). This is a documented,
+  # per-endpoint field in OpenShell's full policy YAML schema (distinct from
+  # the `--add-endpoint` CLI shorthand, which does not expose it). Accepted
+  # trade-off: L7 credential-rewrite/inspection is skipped for this one
+  # endpoint — irrelevant here because the Bearer token is injected via the
+  # MLFLOW_TRACKING_TOKEN env var, not OpenShell's credential-rewrite
+  # mechanism.
+  #
+  # Host is keyed on the short 3-label Service DNS form (mlflow.<ns>.svc), NOT
+  # the FQDN (.svc.cluster.local) — the proxy's CONNECT-tunnel policy match is
+  # an exact string comparison with no suffix/DNS-equivalence matching. See
+  # scripts/wire-rhoai-mlflow-tracing.sh's RHOAI_MLFLOW_SVC_URL comment.
+  mlflow_direct:
+    name: rhoai-mlflow-direct-traces
+    endpoints:
+      - host: "mlflow.redhat-ods-applications.svc"
+        port: 8443
         protocol: rest
         enforcement: enforce
         access: read-write
+        tls: skip
     binaries:
       - { path: /usr/bin/node }
+      - { path: /usr/local/bin/node }
       - { path: /usr/bin/curl }

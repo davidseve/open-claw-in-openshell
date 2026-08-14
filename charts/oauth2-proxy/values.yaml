@@ -1,0 +1,39 @@
+# AGENTS.md: use __APPS_DOMAIN__-style placeholders, never hardcode cluster
+# domains. This chart takes it as a values-driven input instead —
+# scripts/deploy-oauth2-proxy.sh passes it with --set at deploy time.
+appsDomain: ""
+
+# OpenShell sandbox name this project's OpenClaw runs in — the public UI
+# hostname must equal OpenShell's `{sandbox}--{service}` service-routing
+# pattern (see route.yaml/deployment.yaml). Parametrized (not hardcoded to
+# "openclaw-gw") so a second, differently-named deploy of this project can
+# coexist with another project's OpenShell/OpenClaw stack on the same
+# cluster without an OpenShift Route hostname collision — see
+# docs/adrs/ADR-0020-shared-cluster-coexistence.md.
+sandboxName: openclaw-gw
+
+# Same namespace as the OpenShell gateway Deployment/Service this chart's
+# hostAlias resolves via Helm's `lookup` function (see templates/deployment.yaml)
+# — oauth-proxy is co-located with OpenShell, not a separate namespace.
+namespace: openshell
+
+# Name of the OpenShell gateway Service this chart's hostAlias resolves via
+# `lookup` (templates/deployment.yaml). The subchart names its Service after
+# the Helm *release* name (charts/openshell's OPENSHELL_RELEASE_NAME, default
+# "openshell") — NOT a fixed literal. A coexisting deploy using a different
+# OPENSHELL_RELEASE_NAME (e.g. "openshell2", ADR-0020) must pass this value
+# too, or the `lookup` finds nothing and the chart fails to render. Found
+# live: `Error: execution error ... Service 'openshell' not found in
+# namespace 'openshell2'` even though the gateway Service existed as
+# "openshell2".
+openshellServiceName: openshell
+
+# The `openshift/oauth-proxy` fork (not community quay.io/oauth2-proxy/oauth2-proxy)
+# — only this fork implements `-provider=openshift` + SA-based OAuth clients.
+image: registry.redhat.io/openshift4/ose-oauth-proxy:latest
+
+# Session secret Kubernetes Secret is created separately by
+# scripts/deploy-oauth2-proxy.sh via common.sh's ensure_secret_var() (not a
+# Helm-templated Secret) so it survives `helm uninstall` — matches how
+# OAUTH_PROXY_SESSION_SECRET is meant to be a long-lived, idempotent secret
+# (secrets/secrets.env), not release-scoped chart state.

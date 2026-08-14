@@ -2,6 +2,26 @@
 
 ## Status
 
+**Superseded by [ADR-0016](ADR-0016-openshift-native-oauth-spike.md) for the
+browser UI path (2026-07-23).** The community `oauth2-proxy` + Keycloak
+stack described below was fully replaced in production by `oauth-proxy`
+(OpenShift fork) + OpenShift-native OAuth — zero Keycloak involvement in the
+browser UI path today. Notably, "Alternative 4" below ("OpenShift OAuth
+Proxy sidecar") is exactly the approach ADR-0016 ended up adopting; it was
+rejected at the time for supporting only OCP OAuth (not arbitrary Keycloak
+realms) — which is precisely why it later became the answer once Keycloak
+itself was the thing being removed from this path.
+
+The `trusted-proxy` auth mode decision, the `requiredHeaders` header
+contract, and the underlying security model below are **not** superseded —
+they still govern the browser UI today with a different identity provider
+in front of them (see [ADR-0012](ADR-0012-trusted-proxy-auth.md)'s
+addendum). Only the choice of *which proxy/IdP sits in front of
+`trusted-proxy`* changed. The rest of this document is kept as-is for
+historical context.
+
+## Original status (superseded)
+
 Accepted
 
 ## Context

@@ -7,9 +7,9 @@ This document defines the roles, skills, and responsibilities for the OpenClaw-i
 Cybersecurity is a first-class concern in this project, not an afterthought. Every role carries explicit security responsibilities. The baseline security posture is defined by OpenShell's sandbox model:
 
 - **Sandbox isolation**: all agent workloads run inside OpenShell sandboxes with nftables, Landlock LSM, and network namespace enforcement.
-- **Credential injection without filesystem exposure**: API keys are injected as environment variables by the OpenShell provider system. Child processes see opaque placeholders; real secrets are resolved by the proxy at request time. Credentials never touch the sandbox filesystem.
+- **Credential injection without filesystem exposure**: LLM credentials are managed by the OpenShell inference router (`inference.local`). The real API key lives in the gateway's provider record; the sandbox process uses `apiKey: "unused"` and never sees or needs the real credential. See [ADR-0021](docs/adrs/ADR-0021-inference-router-migration.md).
 - **Default-deny networking**: all outbound traffic from sandboxes is blocked unless explicitly allowed by a network policy with L7 inspection.
-- **OIDC authentication**: browser access to the Control UI goes through oauth2-proxy → Keycloak OIDC. The OpenClaw gateway uses `auth.mode: trusted-proxy` — no static tokens (ADR-0012).
+- **OIDC authentication**: browser access to the Control UI goes through oauth-proxy → OpenShift's native OAuth server (ADR-0016; no Keycloak in this path). Keycloak remains the OIDC issuer for the separate CLI/gRPC gateway auth path only. The OpenClaw gateway uses `auth.mode: trusted-proxy` — no static tokens (ADR-0012).
 - **Supply chain awareness**: all images, charts, and operators are version-pinned. No `latest` tags in production configurations.
 
 ### Security Guidelines (all roles)
@@ -21,8 +21,9 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 - Use `installPlanApproval: Manual` for OLM operators to prevent unreviewed upgrades.
 - Rotate credentials periodically. Document rotation procedures.
 - Review deny logs from the sandbox proxy (`openshell logs`) for unauthorized access attempts.
-- Never use `gateway.auth.mode: "none"` or `"token"` in sandbox environments. Use `trusted-proxy` with oauth2-proxy OIDC (ADR-0012).
+- Never use `gateway.auth.mode: "none"` or `"token"` in sandbox environments. Use `trusted-proxy` with oauth-proxy (ADR-0012, ADR-0016).
 - Use `__APPS_DOMAIN__` template placeholders in all manifests and configs. Never hardcode cluster-specific domains.
+- Parametrize namespace and `SANDBOX_NAME` (`__SANDBOX_NAME__` placeholder) in every Route hostname and CORS origin, so this stack can coexist with other OpenShell/OpenClaw deployments (e.g. `agentops-example`) on the same cluster without hostname collisions — see [ADR-0020](docs/adrs/ADR-0020-shared-cluster-coexistence.md).
 
 ---
 
@@ -37,7 +38,7 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 **Tools**: `helm`, `oc`, `kubectl`, `helm-diff`.
 
 **Responsibilities**:
-- Maintain `charts/openshell/values-ocp.yaml` with version-pinned overrides.
+- Maintain the declarative `charts/openshell/` wrapper chart (SCC RoleBinding, Route, and OpenShell subchart values in `values.yaml`/`values-ocp*.yaml.tpl` — see [ADR-0019](docs/adrs/ADR-0019-declarative-openshell-wrapper-chart.md)) with version-pinned overrides.
 - Validate chart upgrades against OpenShift SCC admission before applying.
 - Ensure no hardcoded secrets in values files (use `${ENV_VAR}` references or external secrets).
 - Review Helm release diffs before upgrade to detect unintended permission escalations.
@@ -48,10 +49,10 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 
 **Skills**: OpenShift SCCs, RBAC, NetworkPolicy, OLM operators, certificate management, audit logging.
 
-**Tools**: `oc`, `oc adm policy`, `oc adm inspect`, OpenShift web console.
+**Tools**: `oc`, `oc adm inspect`, `helm`, OpenShift web console.
 
 **Responsibilities**:
-- Manage SCC bindings (privileged scope limited to `openshell-sandbox` SA only).
+- Manage SCC bindings declaratively via the `charts/openshell` wrapper chart's `RoleBinding` to `system:openshift:scc:privileged` (privileged scope limited to `openshell-sandbox` SA only). No imperative `oc adm policy add-scc-to-user` — see [ADR-0006](docs/adrs/ADR-0006-scc-privileged-sandbox.md) addendum.
 - Review and approve OLM operator InstallPlans before upgrades.
 - Maintain JWT signing secrets (Ed25519 keypair rotation).
 - Audit namespace RBAC to ensure no over-privileged ServiceAccounts.
@@ -67,8 +68,8 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 **Tools**: `openclaw`, `curl`, `jq`, browser (Control UI).
 
 **Responsibilities**:
-- Maintain `config/openclaw.json.tpl` with the MaaS provider definition and `__APPS_DOMAIN__` placeholders.
-- Validate model routing: `maas/claude-sonnet-4-6` resolves correctly.
+- Maintain `config/openclaw.json.tpl` with the inference router provider definition (`inference.local`) and `__APPS_DOMAIN__` placeholders.
+- Validate model routing: `inference/router` is primary (resolved to the real model by the OpenShell inference router). After changing the inference route (`openshell inference set`), re-run `./scripts/launch-openclaw.sh`.
 - Test Control UI chat functionality (WebSocket). Keep `gateway.http.endpoints.chatCompletions.enabled` false unless a deliberate HTTP API is required.
 - Run `openclaw doctor --lint` after configuration changes.
 - Verify `auth.mode: trusted-proxy` is correctly configured (no static tokens — see ADR-0012).
@@ -83,9 +84,10 @@ Cybersecurity is a first-class concern in this project, not an afterthought. Eve
 
 **Responsibilities**:
 - Deploy and maintain the OpenShell gateway on OCP via Helm.
-- Create and manage credential providers (`generic` type for MaaS API key).
+- Create and manage credential providers (`openai` type for MaaS via inference router).
+- Configure inference routing (`openshell inference set`) and manage `providers_v2_enabled`.
 - Author and refine sandbox network policies (`policies/openclaw-sandbox.yaml`).
 - Expose sandbox services and manage service URL routing through the gateway.
 - Monitor sandbox deny logs for policy violations and adjust rules accordingly.
-- Ensure the sandbox proxy performs L7 credential injection correctly (no plaintext secrets in sandbox).
+- Verify the inference router injects credentials correctly (no plaintext secrets in sandbox).
 - Coordinate with OCP Security Specialist on SCC and namespace prerequisites.

@@ -1,0 +1,13 @@
+{{- if .Values.agentSandbox.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.agentSandbox.namespace }}
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: agent-sandbox-operator
+  namespace: {{ .Values.agentSandbox.namespace }}
+spec: {}
+{{- end }}

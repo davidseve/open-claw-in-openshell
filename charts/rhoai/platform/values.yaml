@@ -1,0 +1,70 @@
+# Minimal DataScienceCluster for Phase 12 (RHOAI-managed MLflow only).
+# Unlike agentops-example's platform chart (dashboard, llamastackoperator/OGX,
+# trustyai, kserve, modelsAsService all Managed), this repo only needs
+# mlflowoperator — everything else is Removed to keep the footprint as small
+# as possible on a resource-constrained cluster. See ADR-0017.
+#
+# This file holds the settings that are IDENTICAL on every environment.
+# dashboard / llamastackoperator / dashboardConfig.genAiStudio are the one
+# part of the DataScienceCluster spec that legitimately differs between CRC
+# and AWS OCP — those live entirely in values-crc.yaml / values-aws.yaml
+# instead (one declarative overlay file per environment, layered on top of
+# this one via `helm upgrade -f values.yaml -f values-<env>.yaml`, chosen by
+# scripts/deploy-rhoai-mlflow.sh — see charts/rhoai/Makefile's
+# PLATFORM_ENV_VALUES). The defaults below match values-crc.yaml exactly and
+# exist only as a safety net for `helm template`/`helm lint`/a bare
+# `helm upgrade` run without any overlay — always pass one of the two
+# overlay files for a real deploy. See ADR-0018's 2026-07-27 amendment and
+# docs/constraints.md #20/#23.
+datasciencecluster:
+  name: default-dsc
+  components:
+    dashboard:
+      managementState: Removed
+    kserve:
+      managementState: Removed
+      rawDeploymentServiceConfig: Headed
+      wva:
+        managementState: Removed
+    modelsAsService:
+      managementState: Removed
+    llamastackoperator:
+      managementState: Removed
+    mlflowoperator:
+      managementState: Managed
+    trustyai:
+      managementState: Removed
+      eval:
+        lmeval:
+          permitCodeExecution: deny
+          permitOnline: deny
+    aipipelines:
+      managementState: Removed
+    feastoperator:
+      managementState: Removed
+    kueue:
+      managementState: Removed
+    modelregistry:
+      managementState: Removed
+      registriesNamespace: rhoai-model-registries
+    ray:
+      managementState: Removed
+    trainer:
+      managementState: Removed
+    trainingoperator:
+      managementState: Removed
+    sparkoperator:
+      managementState: Removed
+    workbenches:
+      managementState: Removed
+
+# Only takes effect when dashboard is Managed (AWS — see values-aws.yaml):
+# patches the OdhDashboardConfig singleton the dashboard component
+# auto-creates (name/namespace are fixed by RHOAI, not configurable).
+# genAiStudio surfaces the GenAI hub nav (Experiments, Prompts, Traces) the
+# Prompt Registry (ADR-0015/ADR-0018) needs for UI visibility. Defaults to
+# false here (matches values-crc.yaml) since the template it feeds is
+# itself skipped while dashboard is Removed — see values-aws.yaml for the
+# override.
+dashboardConfig:
+  genAiStudio: false

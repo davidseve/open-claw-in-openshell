@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Test the observability pipeline: send a realistic agent trace, verify in Tempo.
+# Diagnostic tool (not part of the standard verify.sh flow): send a
+# realistic synthetic agent trace straight to the OTel Collector and confirm
+# it lands in Tempo. Useful for debugging the OTel/Tempo pipeline in
+# isolation. RHOAI MLflow health/API checks are NOT duplicated here — see
+# scripts/verify.sh Layer 8 for those.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
@@ -165,29 +169,10 @@ else
   warn "Trace contains ${SPAN_COUNT} spans (expected 4)"
 fi
 
-# Check MLflow
-step "Verifying MLflow accessibility"
-MLFLOW_HOST=$(oc get route mlflow -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null)
-MLFLOW_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://${MLFLOW_HOST}/health" 2>/dev/null || echo "000")
-
-if [[ "$MLFLOW_CODE" == "200" ]]; then
-  pass "MLflow health OK at https://${MLFLOW_HOST}"
-else
-  fail "MLflow returned HTTP ${MLFLOW_CODE}"
-fi
-
-# Check MLflow experiments API
-EXPERIMENTS_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://${MLFLOW_HOST}/api/2.0/mlflow/experiments/search?max_results=1" 2>/dev/null || echo "000")
-if [[ "$EXPERIMENTS_CODE" == "200" ]]; then
-  pass "MLflow API accessible (experiments endpoint)"
-else
-  warn "MLflow API returned HTTP ${EXPERIMENTS_CODE}"
-fi
-
 step "Observability pipeline test complete"
 echo ""
 info "Summary:"
 info "  Tempo traces: ${TRACE_COUNT} trace(s) found"
 info "  Span count: ${SPAN_COUNT}/4 spans verified"
-info "  MLflow: https://${MLFLOW_HOST}"
 info "  Tempo query: oc -n ${OBS_NAMESPACE} exec deployment/tempo -- wget -qO- 'http://localhost:3200/api/search?limit=5'"
+info "  RHOAI MLflow health/API checks live in scripts/verify.sh (Layer 8), not here"

@@ -1,0 +1,38 @@
+{{- if .Values.route.enabled }}
+{{- if not .Values.global.appsDomain }}
+{{- fail "global.appsDomain is required (e.g., apps.ocp.sandbox701.opentlc.com)" }}
+{{- end }}
+# Declarative replacement for `oc apply -f manifests/openshell-route.yaml`.
+# Uses .Release.Namespace (not a hardcoded "openshell") so a release
+# installed into a different namespace — e.g. to coexist with another
+# project's OpenShell/OpenClaw stack on the same cluster — gets its own
+# correctly-scoped, non-colliding Route and public hostname automatically
+# (OpenShift's default host pattern: <name>-<namespace>.<apps-domain>). See
+# docs/adrs/ADR-0009-external-service-routing.md.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ .Values.route.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openclaw-openshell.labels" . | nindent 4 }}
+spec:
+  to:
+    kind: Service
+    # Must match the subchart's own Service name, which is release-name-derived
+    # (openshell.fullname / openclaw-openshell.fullname resolve identically —
+    # both ultimately return .Release.Name), NOT a fixed "openshell" literal.
+    # A second, differently-named release (e.g. OPENSHELL_RELEASE_NAME=openshell2
+    # for coexistence, ADR-0020) gets its own correctly-named Service
+    # ("openshell2"), and this Route must follow it or the Route silently
+    # points at a nonexistent Service — found live: Route showed Admitted:
+    # True (hostname claim alone), but every TLS connection through it failed
+    # with "unexpected eof while reading" immediately after ClientHello
+    # (haproxy backend has zero endpoints), with zero corresponding log lines
+    # on the gateway pod itself.
+    name: {{ include "openclaw-openshell.fullname" . }}
+  port:
+    targetPort: {{ .Values.route.targetPort }}
+  tls:
+    termination: {{ .Values.route.tlsTermination }}
+{{- end }}

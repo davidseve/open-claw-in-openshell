@@ -9,32 +9,18 @@ KC_NAMESPACE="openshell-keycloak"
 KC_ROUTE_HOST="keycloak-${KC_NAMESPACE}.${APPS_DOMAIN}"
 OCP_OAUTH_HOST="oauth-openshift.${APPS_DOMAIN}"
 
-step "Generating OAuthClient secret for Keycloak broker"
-KC_BROKER_SECRET=$(openssl rand -hex 32)
-info "Secret generated (will be injected into OAuthClient and realm config)"
+step "Ensuring OAuthClient secret for Keycloak broker exists"
+ensure_secret_var KC_BROKER_SECRET -hex 32
 
-step "Creating namespace ${KC_NAMESPACE}"
-oc apply -f "${PROJECT_DIR}/manifests/keycloak/namespace.yaml"
-
-step "Creating OAuthClient for Keycloak identity brokering"
-sed "s|PLACEHOLDER_GENERATED_AT_DEPLOY_TIME|${KC_BROKER_SECRET}|" \
-  "${PROJECT_DIR}/manifests/keycloak/oauthclient.yaml" | oc apply -f -
-
-step "Patching realm config with broker secret and cluster domain"
-REALM_CM="${PROJECT_DIR}/manifests/keycloak/realm-configmap.yaml"
-sed \
-  -e "s|PLACEHOLDER_REPLACED_BY_DEPLOY_SCRIPT|${KC_BROKER_SECRET}|" \
-  -e "s|apps.ocp.sandbox315.opentlc.com|${APPS_DOMAIN}|g" \
-  "$REALM_CM" | oc apply -f -
-
-step "Deploying Keycloak"
-for manifest in deployment service route; do
-  sed "s|apps.ocp.sandbox315.opentlc.com|${APPS_DOMAIN}|g" \
-    "${PROJECT_DIR}/manifests/keycloak/${manifest}.yaml" | oc apply -f -
-done
-
-step "Waiting for Keycloak pod to be ready"
-oc -n "$KC_NAMESPACE" rollout status deployment/keycloak --timeout=300s
+# --wait blocks until the Deployment's pods are Ready (Helm's own readiness
+# gate), so no separate `oc wait`/`rollout status` step is needed here.
+step "Deploying Keycloak (Helm)"
+helm upgrade --install keycloak "${PROJECT_DIR}/charts/keycloak" \
+  --namespace "$KC_NAMESPACE" --create-namespace \
+  --set appsDomain="${APPS_DOMAIN}" \
+  --set-string brokerSecret="${KC_BROKER_SECRET}" \
+  --wait --timeout 300s
+pass "Keycloak pod ready"
 
 step "Verifying Keycloak OIDC discovery"
 retries=0
@@ -51,12 +37,6 @@ if [[ $retries -ge 30 ]]; then
   fail "Keycloak OIDC discovery not available after 150s"
   exit 1
 fi
-
-step "Saving broker secret for reference"
-SECRET_FILE="${PROJECT_DIR}/secrets/.keycloak-broker-secret"
-echo "$KC_BROKER_SECRET" > "$SECRET_FILE"
-chmod 600 "$SECRET_FILE"
-info "Broker secret saved to $SECRET_FILE"
 
 step "Keycloak deployment complete"
 echo ""
