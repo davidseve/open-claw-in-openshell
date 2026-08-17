@@ -59,7 +59,7 @@ Run: `./scripts/bootstrap-ocp.sh`
 - [x] Grant `privileged` SCC to `openshell-sandbox` SA
 - [x] Generate Ed25519 JWT signing secret
 - [x] Verify `sandboxes.agents.x-k8s.io` CRD is available
-- [ ] **Validate whether the CRC raw-manifest fallback can also be dropped** — try installing `agent-sandbox-operator` via OLM on CRC (or another catalog source available there). If it works, delete `manifests/agent-sandbox-v0.5.1.yaml` and the CRC branch in `scripts/bootstrap-ocp.sh`, and update [ADR-0004](docs/adrs/ADR-0004-agent-sandbox-redhat.md). If OLM/`redhat-operators` is unavailable on CRC, keep the fallback and document the constraint.
+- [x] **Validate whether the CRC raw-manifest fallback can also be dropped** — deferred to [Phase 18.2](#182-agent-sandbox-operator--drop-raw-manifest-fallback-on-crc) (CRC-only follow-up; OLM path works on full OCP clusters today)
 
 ## Phase 3: Deploy OpenShell
 
@@ -512,7 +512,9 @@ inference router migration (ADR-0021). Historical detail: constraints #3, #25, #
 - [ ] [Phase 16.1](#161-consume-platform-workload-identity-spiffespire): SPIFFE/SPIRE workload identity — replace the gateway's static provider credential with auto-rotated, narrowly-scoped tokens
 - [ ] Upstream redaction of free-form assistant text, not just tool payloads (deprioritized — not an observed failure mode with the primary model)
 
-### 13.5 Re-audit `OPENSHELL_GATEWAY_INSECURE` scoping when AWS OCP gets real certs
+### 13.5 Re-audit `OPENSHELL_GATEWAY_INSECURE` scoping when AWS OCP gets real certs (resolved)
+
+**Status: COMPLETE** — CRC workaround scoped; AWS validated as no-op. CRC-only polish tracked in [Phase 18](#phase-18-future-crc-local-dev-improvements).
 
 **Context**: `scripts/common.sh`'s `detect_environment()` used to export
 `OPENSHELL_GATEWAY_INSECURE=true` (skip TLS server-cert verification for the
@@ -525,17 +527,17 @@ sent no certificates") — the blanket global export was scoped down to a new
 `enable_openshell_oidc_insecure()` helper, called only from the OIDC-specific
 code paths (`configure-oidc.sh`'s gateway re-registration,
 `ensure_oidc_token()`'s refresh calls), and explicitly `unset` before mTLS
-operations in `deploy-openshell.sh`. **Decision (2026-07-27): keep this
-CRC-only scoped fix as-is for now** — revisit the open items below
-specifically when preparing the AWS OCP deployment (real, cluster-issued
-certs).
+operations in `deploy-openshell.sh`.
+
+**Solution applied**
+
+1. **OIDC-only scoping (2026-07-27)** — `enable_openshell_oidc_insecure()` exports `OPENSHELL_GATEWAY_INSECURE=true` only when `CRC_MODE=true` and only from OIDC refresh paths; `deploy-openshell.sh` explicitly `unset`s it before mTLS gateway registration.
+2. **AWS re-audit (2026-08-03)** — on a real AWS OCP cluster (`sandbox659.opentlc.com`, Let's Encrypt router wildcard cert), `OPENSHELL_GATEWAY_INSECURE` was never set during a full `cluster-lifecycle.sh deploy --with-oidc --with-obs` + `verify.sh` run. mTLS registration, `openshell status`, OIDC token refresh, and oauth-proxy OAuth login all passed with zero TLS trust issues. No AWS-side changes needed.
 
 - [x] Scope `OPENSHELL_GATEWAY_INSECURE` to OIDC-only flows, unset it before mTLS gateway registration (`scripts/common.sh`, `scripts/deploy-openshell.sh`, `scripts/configure-oidc.sh`) — done 2026-07-27, still `CRC_MODE`-gated, never set on AWS
-- [ ] **Root cause not fully confirmed**: the working hypothesis (insecure-mode short-circuits the client-cert identity resolver, not just server-cert verification) is plausible but based on a ~1-minute A/B test that overlaps with constraint #19's own documented time-based recovery window (10s–8min, attributed there to host memory pressure, not to this flag). Re-validate with a cleaner, longer, repeated-trial experiment (or find/read the `openshell` CLI's TLS client source) before treating this as fully proven — the *practical* fix (unset before mTLS) is safe to keep either way, since it can only narrow, never widen, where verification is skipped
-- [ ] **Known gap introduced by this fix**: `cmd_verify()` in `scripts/cluster-lifecycle.sh` (and any other caller of `verify.sh`/`smoke-test-e2e.sh` that doesn't first call `ensure_oidc_token`) no longer benefits from the old global export, so a standalone `./scripts/cluster-lifecycle.sh verify` run long after the last `configure-oidc.sh` (OIDC access token expired, refresh-token call needed) could hit constraint #18 again on CRC. Not fixed yet — call `ensure_oidc_token` at the top of `cmd_verify()` (matching the pattern the `monitor-deployment` skill already uses manually) before this bites in practice
-- [ ] `docs/constraints.md` #18/#19 need a new/updated entry documenting this interaction — the code comments in `common.sh`/`deploy-openshell.sh` currently reference "constraints.md #18/#19" as if already covering this, but the doc text itself is stale
-- [x] **AWS follow-up — confirmed 2026-08-03 on a real AWS OCP cluster (`sandbox659.opentlc.com`, Let's Encrypt-issued router wildcard cert)**: `enable_openshell_oidc_insecure()` is strictly gated on `CRC_MODE=true` (`scripts/common.sh`), so `OPENSHELL_GATEWAY_INSECURE` was never exported anywhere during a full `cluster-lifecycle.sh deploy --with-oidc --with-obs` + `verify.sh` (full profile) run — confirmed via `env | grep OPENSHELL_GATEWAY_INSECURE` (empty) throughout. This entire workaround was indeed a complete no-op on AWS, exactly as predicted: mTLS gateway registration, `openshell status`, OIDC token refresh against Keycloak, and the oauth-proxy OAuth login flow (real `redhat` HTPasswd user) all passed with zero TLS trust issues — Let's Encrypt's publicly-trusted chain needs no special handling, unlike CRC's self-signed router cert (constraint #18). No AWS-side gap found; no code changes needed for this item.
-- [ ] Stronger long-term fix (CRC-only, optional): replace the insecure-skip approach entirely by importing CRC's actual router CA into the CLI's trust store (or passing it explicitly, if the `openshell` CLI supports a custom CA flag), so CRC never needs `OPENSHELL_GATEWAY_INSECURE` either — would close the residual OIDC-path exposure window without needing an insecure flag at all
+- [x] AWS follow-up — confirmed 2026-08-03: workaround is a complete no-op on AWS (Let's Encrypt chain needs no special handling)
+
+**CRC-only follow-ups** — moved to [Phase 18.1](#181-tls-trust--replace-openshell_gateway_insecure-with-router-ca-import)
 
 ### 13.6 Prompt file "read-only" protection (`chmod 444`) is bypassable — needs a directory-level fix
 
@@ -732,6 +734,31 @@ Source: [Architect an open blueprint for cloud-native AI agents](https://develop
 - [ ] Document the integration in `docs/constraints.md` and create an ADR for the chosen approach
 
 **Blocked on**: Evaluating upstream OpenShell OCSF export capabilities and deciding between Loki (RHOL) vs OTel Collector log pipeline for the cluster.
+
+## Phase 18 (future): CRC Local Dev Improvements
+
+**Status**: Not started — CRC-only polish. AWS OCP needs none of these (validated 2026-08-03 in [13.5](#135-re-audit-openshell_gateway_insecure-scoping-when-aws-ocp-gets-real-certs-resolved)).
+
+**Context**: CRC (`APPS_DOMAIN=apps-crc.testing`) uses a self-signed ingress-operator router wildcard cert that is not in the host system trust store, and may lack the `redhat-operators` OLM catalog available on full OCP clusters. Core deploy/verify paths work on CRC today via targeted workarounds (`CURL_OPTS="-k"`, scoped `OPENSHELL_GATEWAY_INSECURE`); this phase tracks hardening and cleanup items that only apply when `CRC_MODE=true`.
+
+Run: `./scripts/cluster-lifecycle.sh` on a local CRC VM (see `crc-local-dev` skill).
+
+### 18.1 TLS trust — replace `OPENSHELL_GATEWAY_INSECURE` with router CA import
+
+**Context**: [13.5](#135-re-audit-openshell_gateway_insecure-scoping-when-aws-ocp-gets-real-certs-resolved) scoped the insecure-skip workaround to OIDC-only flows. The practical fix is in place; this section tracks deeper CRC hardening and documentation.
+
+- [ ] **Root cause not fully confirmed**: the working hypothesis (insecure-mode short-circuits the client-cert identity resolver, not just server-cert verification) is plausible but based on a ~1-minute A/B test that overlaps with constraint #19's own documented time-based recovery window (10s–8min, attributed there to host memory pressure, not to this flag). Re-validate with a cleaner, longer, repeated-trial experiment (or read the `openshell` CLI TLS client source in `OpenShell/crates/openshell-cli/`) before treating this as fully proven — the *practical* fix (unset before mTLS) is safe to keep either way, since it can only narrow, never widen, where verification is skipped
+- [ ] **Audit OIDC refresh callers on CRC**: `verify.sh` already calls `ensure_oidc_token()` (which invokes `enable_openshell_oidc_insecure()`) before any `openshell` auth probes, but audit other entry points (`cluster-lifecycle.sh` subcommands, ad-hoc `source scripts/common.sh` sessions, `monitor-deployment` skill patterns) for callers that refresh OIDC against Keycloak without going through `ensure_oidc_token()` — those can still hit constraint #18 on CRC when the access token has expired
+- [ ] Update `docs/constraints.md` #18/#19 to document the scoped `enable_openshell_oidc_insecure()` interaction and the mTLS vs OIDC split — code comments in `common.sh`/`deploy-openshell.sh` already reference these entries but the doc text is stale (still describes the old global export)
+- [ ] **Stronger fix (optional)**: replace the insecure-skip approach entirely by importing CRC's actual router CA into the CLI's trust store (or passing it explicitly, if the `openshell` CLI supports a custom CA flag), so CRC never needs `OPENSHELL_GATEWAY_INSECURE` — would close the residual OIDC-path exposure window without skipping TLS verification
+
+### 18.2 Agent Sandbox operator — drop raw-manifest fallback on CRC
+
+**Context**: On full OCP/RHPDS clusters, the Agent Sandbox operator installs via OLM (`charts/agent-sandbox/operators/`). On CRC, `scripts/bootstrap-ocp.sh` still applies the pinned upstream manifest `manifests/agent-sandbox-v0.5.1.yaml` when the `redhat-operators` catalog is unavailable ([ADR-0004](docs/adrs/ADR-0004-agent-sandbox-redhat.md)).
+
+- [ ] Try installing `agent-sandbox-operator` via OLM on CRC (or another catalog source available there)
+- [ ] If it works: delete `manifests/agent-sandbox-v0.5.1.yaml`, remove the CRC branch in `scripts/bootstrap-ocp.sh`, and update [ADR-0004](docs/adrs/ADR-0004-agent-sandbox-redhat.md)
+- [ ] If OLM/`redhat-operators` is unavailable on CRC: keep the fallback and document the constraint in `docs/constraints.md`
 
 ## References
 
