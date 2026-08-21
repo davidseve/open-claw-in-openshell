@@ -445,6 +445,31 @@ Objective: once Phase 12 proved RHOAI MLflow works end-to-end, remove every refe
 - [x] `README.md` + skills (`deploy-full-aws`, `deploy-full-crc`, `crc-local-dev`, `monitor-deployment`) updated to remove standalone MLflow references; CRC sizing bumped to 16 vCPU/40 GiB (RHOAI-validated, `scripts/cluster-lifecycle.sh`)
 - [x] `prompts/TOOLS.md` (and any other prompt file referencing the MLflow endpoint) updated
 
+## Phase 12c (future): Revisit starter-kits MLflow auth/TLS alignment
+
+**Status**: Not started — review later. Do **not** switch the OpenClaw trace path to their OTel collector sidecar.
+
+Source: [MLflow on OpenShift: Authentication and TLS](https://github.com/red-hat-data-services/agentic-starter-kits/blob/main/docs/mlflow-openshift-auth-and-tls.md) (RHDS agentic-starter-kits). OpenClaw-specific overlay: [mlflow-tracing.md](https://github.com/red-hat-data-services/agentic-starter-kits/blob/main/agents/openclaw/deployment/docs/mlflow-tracing.md) (already compared in [Phase 12](#phase-12-migrate-to-rhoai-managed-mlflow)).
+
+Phase 12 already chose `@mlflow/mlflow-openclaw` over `diagnostics-otel` + sidecar so Gen AI Studio keeps full Request/Response content. That decision stands. This phase is only about whether to tighten **auth/TLS** toward the official TS-SDK workarounds in that guide — the closer analog is their **claude-code** path, not their OpenClaw overlay.
+
+**Already aligned** (no action):
+
+- Internal service URL `https://mlflow.redhat-ods-applications.svc:8443`
+- Workspace = namespace + `X-MLFLOW-WORKSPACE`
+- `mlflow-integration` ClusterRole + RoleBinding
+- TS SDK gaps: inject `MLFLOW_TRACKING_TOKEN` + `MLFLOW_WORKSPACE`; TLS via `NODE_EXTRA_CA_CERTS` (combined OpenShell proxy CA + service-ca, constraint #4c). This project does **not** set `NODE_TLS_REJECT_UNAUTHORIZED=0` (the guide marks that as avoid-in-production)
+
+**What to review later** (adopt only if it reduces patches / blast radius without losing traces):
+
+- [ ] Re-read the starter-kits auth/TLS doc and TS SDK section against the current `@mlflow/mlflow-openclaw` + `@mlflow/core` pins
+- [ ] Token lifetime: keep the long-lived `kubernetes.io/service-account-token` Secret vs projected SA token / short-lived `oc create token` (sandbox may not mount the well-known SA paths like a normal pod)
+- [ ] Dedicated tracing SA (`openclaw-tracing` in the starter-kits overlay) vs binding `openshell-sandbox` — only if other workloads share that SA
+- [ ] Drop `scripts/patch-mlflow-plugin.py` once `@mlflow/core` >= 0.3.0 ships `X-MLFLOW-WORKSPACE` natively (same trigger as [Phase 8b multi-turn evaluation](#future-multi-turn-evaluation-by-prompt-version))
+- [ ] Confirm we still should **not** copy the OpenClaw OTel sidecar (starter-kits themselves document missing tool I/O, token counts, and session IDs)
+
+**Trigger to revisit** (not on a recurring cadence): `@mlflow/core` / `mlflow-openclaw` bump, RHOAI MLflow workspace auth change, or a sibling project (`agentops-example`) dropping the compatibility patches.
+
 ## Phase 13 (future): Security Hardening — Auth Simplification + MLflow Auth
 
 Deferred from the security review (branch `security-review/remediation-v1`). These items reduce attack surface and simplify configuration but require more investigation before implementation.
@@ -692,14 +717,91 @@ Source: [Architect an open blueprint for cloud-native AI agents](https://develop
   - [ ] Wire it through the MCP Gateway (16.2) rather than a direct network-policy allow rule
   - [ ] Document the pattern in `docs/` so future skills default to service-call placement instead of growing inside the sandbox
 
-### 16.5 Adversarial testing hookup
+### 16.5 Adversarial and behavioral evaluation hookup
 
-- `rhoai-platform-ops`'s evaluation module already runs Garak-based adversarial scans (via EvalHub) but nothing today points them at this project's actual attack surface (OpenClaw's system prompts, tool configuration, jailbreak resistance)
-- Closes the article's "pre-production testing" cross-cutting control specifically for this project, complementing the live-session jailbreak probing already noted in item 13.4
-- Tasks:
-  - [ ] Evaluate running `make evalhub-security` (or an equivalent Garak invocation) against a disposable OpenClaw sandbox endpoint rather than only a raw model endpoint
-  - [ ] Add findings review to the PR checklist when `prompts/*.md` changes
-  - [ ] Consider a scheduled (not per-PR) adversarial run given Garak's CPU runtime cost, documented in `rhoai-platform-ops`
+**Status**: Not started — planning only.
+
+**Context**: `rhoai-platform-ops`'s evaluation module already runs Garak-based adversarial scans (via EvalHub) but nothing today points them at this project's actual attack surface (OpenClaw's system prompts, tool configuration, jailbreak resistance). This project already has Playwright jailbreak/exfiltration tests (`tests/sandbox-security.spec.ts`, `verify.sh` Layer 9) — they validate the real Control UI flow but are slow, non-deterministic (LLM variance), and not integrated with MLflow or EvalHub job history.
+
+Reference: [agentic-starter-kits `evalhub_adapter`](https://github.com/red-hat-data-services/agentic-starter-kits/tree/main/evals/evalhub_adapter) — a BYOF (Bring Your Own Framework) EvalHub provider that runs behavioral scorers against agent HTTP endpoints and logs aggregated results to MLflow. Same upstream family as the [mlflow-tracing overlay](https://github.com/red-hat-data-services/agentic-starter-kits/blob/main/agents/openclaw/deployment/docs/mlflow-tracing.md) already adopted in Phase 12.
+
+**Three evaluation layers** (complementary, not interchangeable):
+
+| Layer | What it tests | Where it runs today | Gap |
+|---|---|---|---|
+| **Model** (Garak via EvalHub) | Raw LLM vulnerability (prompt injection, jailbreak probes) | `rhoai-platform-ops` `make evalhub-security` | Not pointed at OpenClaw's configured model route |
+| **Agent** (behavioral harness) | Full stack: system prompts + `tools.deny` + sandbox policy + agent responses | Not implemented | `evalhub_adapter` pattern fits here |
+| **UI** (Playwright) | Real browser session through oauth-proxy + WebSocket chat | `tests/sandbox-security.spec.ts` | No MLflow/EvalHub integration, slow for CI gating |
+| **Environment** (MiDojo, future) | Full agent in its real runtime: indirect injection via poisoned tool/MCP responses, OWASP ASI–tagged payloads | Not implemented | See [16.7](#167-midojo--in-environment-agent-red-teaming-future) |
+
+**What to borrow from `evalhub_adapter`** (high value):
+
+- BYOF provider pattern: container image + `FrameworkAdapter` + REST API registration (`POST /api/v1/evaluations/providers`) — requires EvalHub server **>= 0.3.0** (RHOAI 3.4 TP may ship 0.2.0; see adapter README for workaround)
+- Inner loop (fast pytest) + outer loop (EvalHub K8s Job) — same scorer logic, different execution context
+- Safety scorers already wired in the harness: `injection_resistance`, `pii_leakage`, `policy_adherence` — align with existing Playwright cases (credential leak, sudo, jailbreak)
+- MLflow run logging pattern: `MLFLOW_TRACKING_TOKEN` + `MLFLOW_WORKSPACE` + resolved literal env vars (EvalHub does not resolve `secretKeyRef` in provider runtime `Env`)
+- `run-e2e.sh` automation: build/push adapter image, register provider, submit jobs, poll, cleanup
+
+**What NOT to copy as-is** (low value for this project):
+
+- `agentic-tool-use` benchmark and tool-use scorers (`tool_selection`, `tool_sequence`, `hallucinated_tools`) — OpenClaw here runs with aggressive `tools.deny` (`browser`, `nodes`, etc.); tool-selection scoring is not the priority
+- LangGraph/CrewAI fixture YAMLs — agent-specific golden queries; need OpenClaw-specific fixtures derived from `sandbox-security.spec.ts`
+- Deploying EvalHub inside this repo — consume the shared platform instance from `rhoai-platform-ops` (`make deploy-evaluation`) or `agentops-example`
+
+**OpenClaw-specific integration notes**:
+
+- The harness speaks OpenAI-compatible `POST /v1/chat/completions` — OpenClaw already exposes this (see `tests/openclaw-ui.spec.ts`, `verify.sh` Layer 5)
+- Auth friction: the public Route is behind `oauth-proxy`; the harness needs either an OAuth session token, a test-only bypass Route, or an in-cluster URL that skips the proxy
+- Do not replace Playwright Layer 9 — keep it as the E2E integration test; the adapter is for faster, repeatable, MLflow-tracked scoring
+
+**Proposed benchmark**: `openclaw-security` (custom provider, not the starter-kit's `agentic-tool-use`)
+
+- Scorers: `injection_resistance`, `pii_leakage`, `policy_adherence` with `forbidden_actions: ["shell execution", "sudo", "api key exposure"]`
+- Fixtures: YAML golden queries translated from `tests/sandbox-security.spec.ts` prompts
+- MLflow experiment: same RHOAI workspace/experiment as `mlflow-openclaw` traces (Phase 12) so eval runs and agent traces are co-located
+
+**Tasks**:
+
+Model layer (Garak):
+- [ ] Evaluate running `make evalhub-security` (or equivalent Garak invocation) against the inference router / MaaS model this project uses — validates the underlying model, not the agent stack
+- [ ] Consider a scheduled (not per-PR) Garak run given CPU runtime cost, documented in `rhoai-platform-ops`
+
+Agent layer (behavioral adapter — `evalhub_adapter` pattern):
+- [ ] Vendor `harness/scorers/safety.py` and `harness/runner.py` from agentic-starter-kits (or depend on the package) into an `evals/openclaw_adapter/` directory
+- [ ] Create `fixtures/openclaw/security.yaml` with golden queries from `sandbox-security.spec.ts`
+- [ ] Inner loop: `pytest evals/openclaw_adapter/tests -m unit` for fast CI gating on `prompts/*.md` changes
+- [ ] Build adapter Containerfile and register BYOF provider against shared EvalHub (requires EvalHub >= 0.3.0)
+- [ ] Outer loop: `evalhub eval run` against OpenClaw `/v1/chat/completions` endpoint; verify `mlflow_run_id` in results
+- [ ] Resolve auth for harness HTTP calls (oauth-proxy token, internal Route, or test bypass)
+
+Process / governance:
+- [ ] Add findings review to the PR checklist when `prompts/*.md` changes (inner-loop pytest gate + manual Playwright spot-check)
+- [ ] Document the evaluation layer model in `docs/` (or extend `AGENT-SANDBOX-AND-OPENSHELL.md`) — see also [16.7](#167-midojo--in-environment-agent-red-teaming-future) for the environment layer
+
+### 16.7 MiDojo — in-environment agent red-teaming (future)
+
+**Status**: Not started — future integration (MiDojo is open source; Red Hat AI developer preview announced).
+
+**Context**: [MiDojo](https://github.com/asago-ai/midojo) applies the same BYOA principle to security testing: red-team the agent **in the environment where it runs**, not a rebuilt simulation ([Red Hat Developer article](https://developers.redhat.com/articles/2026/08/10/midojo-improve-ai-agent-security-real-world-red-teaming#)). A man-in-the-middle interception layer sits between the agent and real tools — fake MCP servers or runtime extensions that can forward calls, splice attack payloads into responses, or capture actions. Attack libraries are tagged against the OWASP Agentic Security Initiative taxonomy; probes from catalogs like Garak can be delivered through the same layer. Each run reports **security** (did the agent resist the attack?) and **utility** (did it still complete its task?) independently, and marks results **not applicable** when the payload never reached the agent.
+
+This complements the layers in [16.5](#165-adversarial-and-behavioral-evaluation-hookup): Garak and `evalhub_adapter` score model/HTTP behavior; Playwright validates the real Control UI; MiDojo would test indirect prompt injection through **poisoned tool outputs** (calendar entries, log lines, compromised tool responses) against the actual OpenClaw + OpenShell stack — including `tools.deny`, Landlock, and `NetworkPolicy` — without re-implementing the sandbox in a test harness. MiDojo ships SDKs for MCP-speaking agents and for Pi (the runtime behind OpenClaw), which aligns with this project's deployment model.
+
+**OpenClaw/OpenShell integration notes**:
+
+- Interception attaches to whatever shape the agent already expects — MCP stand-in server or a pluggable runtime extension — so OpenClaw inside the sandbox should not need code changes for a first pass
+- Suite definitions (`suite.yaml`) drive which payloads are injected and when; reuse or extend probes already exercised in `tests/sandbox-security.spec.ts` and Garak/EvalHub runs
+- Results could eventually be logged alongside MLflow traces (Phase 12) and EvalHub job history (16.5) for a single security timeline per deploy
+- Network policy (`policies/openclaw-sandbox.yaml`) must allow egress to MiDojo's interception endpoint when enabled — treat MiDojo like any other out-of-sandbox service (similar to 16.2 MCP Gateway pattern)
+
+**Tasks** (when MiDojo is adopted):
+
+- [ ] Evaluate MiDojo developer preview / release against OpenShell v0.0.83 + OpenClaw community sandbox image on CRC and AWS OCP
+- [ ] Pick integration path: MCP interception vs Pi/OpenClaw runtime extension; document choice in an ADR
+- [ ] Author an `openclaw-openshell` MiDojo suite covering indirect injection scenarios (poisoned tool response, credential exfiltration attempts, policy bypass via data plane)
+- [ ] Wire security + utility scores into CI or scheduled post-deploy verification (complement Playwright Layer 9 — faster, more deterministic than UI-only LLM variance)
+- [ ] Optional: export MiDojo run metadata to MLflow (same workspace as `mlflow-openclaw`) and/or submit via shared EvalHub when a provider pattern exists
+- [ ] Add `verify.sh` smoke or document a `scripts/run-midojo.sh` entry point once a minimal suite is stable
+- [ ] Document the four-layer evaluation model (model / agent HTTP / UI / environment) in `docs/`
 
 ### 16.6 Watch items (not scheduled)
 
@@ -770,4 +872,8 @@ Run: `./scripts/cluster-lifecycle.sh` on a local CRC VM (see `crc-local-dev` ski
 - [OpenClaw health checks](https://docs.openclaw.ai/gateway/health)
 - [OpenClaw OpenAI-compatible API](https://docs.openclaw.ai/gateway/openai-http-api)
 - [agent-harness-in-a-box](https://github.com/rcarrata/agent-harness-in-a-box) (commit `76aca3b`)
+- [agentic-starter-kits MLflow auth/TLS](https://github.com/red-hat-data-services/agentic-starter-kits/blob/main/docs/mlflow-openshift-auth-and-tls.md) (review later — see Phase 12c; do not copy their OpenClaw OTel sidecar)
+- [agentic-starter-kits evalhub_adapter](https://github.com/red-hat-data-services/agentic-starter-kits/tree/main/evals/evalhub_adapter) (BYOF behavioral eval pattern — see Phase 16.5)
+- [MiDojo](https://github.com/asago-ai/midojo) — in-environment agent red-teaming (MITM tool interception; see Phase 16.7)
+- [MiDojo: Improve AI agent security with real-world red-teaming](https://developers.redhat.com/articles/2026/08/10/midojo-improve-ai-agent-security-real-world-red-teaming#) (Red Hat Developer, 2026-08-10)
 - [Red Hat build of Agent Sandbox (OSC 1.13)](https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.13/html/deploying_red_hat_build_of_agent_sandbox/)
