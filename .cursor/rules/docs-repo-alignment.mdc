@@ -1,0 +1,59 @@
+---
+description: >-
+  Keep README, AGENTS.md, ROADMAP, and index docs aligned with the actual
+  repository layout, scripts, skills, and cluster-lifecycle phases.
+alwaysApply: true
+---
+
+# Documentation–Repository Alignment
+
+Project index docs (`README.md`, `AGENTS.md`, `ROADMAP.md`) must reflect
+**what exists in the repo today**, not planned or retired paths.
+
+## Canonical sources of truth
+
+| Concern | Source of truth | Index docs (summarize + link) |
+|---|---|---|
+| Directory layout | Filesystem (`ls`, `glob`) | `AGENTS.md` § Project Structure, `README.md` § Project Structure |
+| Scripts | `scripts/` | `AGENTS.md` § Project Structure (`scripts/` list) |
+| Cursor skills | `.cursor/skills/*/SKILL.md` | `AGENTS.md` § Cursor Skills |
+| Cursor rules | `.cursor/rules/*.mdc` | Mention in `AGENTS.md` § Constraints when user-facing |
+| ADRs | `docs/adrs/ADR-*.md` | `README.md` ADR index section |
+| Helm charts | `charts/*/` | `AGENTS.md` § Helm Charts, `README.md` component guides |
+| Constraints | `docs/constraints.md` | Link from `AGENTS.md`; do not duplicate inline |
+
+## When this rule fires
+
+Run the checks below in the **same session** when you:
+
+| Trigger | Examples |
+|---|---|
+| User asks to audit or align documentation | "revisa la documentación", "align docs with repo" |
+| Add, remove, or rename top-level paths | New `scripts/*.sh`, new Helm chart, retired chart |
+| Add or remove a Cursor skill | New `.cursor/skills/<name>/` |
+| Change cluster-lifecycle.sh phases | New deploy/verify phase, renamed target |
+| ROADMAP task completes with wrong link | Checked item points to a path that does not exist |
+
+**Also** run `document-feature` (per `technology-usage-docs` rule) when stack
+technology behavior changes — that skill covers component guides; this rule
+covers **index and structure** docs.
+
+## Required checks (audit checklist)
+
+1. **Paths** — Every path in `AGENTS.md` / `README.md` trees exists; no retired paths.
+2. **Skills** — Every folder under `.cursor/skills/` appears in `AGENTS.md` § Cursor Skills; no entries for deleted skills.
+3. **Scripts** — Deploy-critical scripts under `scripts/` are listed in `AGENTS.md` or linked from a guide.
+4. **ROADMAP links** — Completed `[x]` items link to real files; fix stale paths immediately.
+5. **Cross-links** — `README.md` § Documentation lists primary guides; broken relative links are fixed.
+6. **ADR index** — New ADR files appear in `README.md` ADR index and in `docs/adrs/` (see `adr-alignment` rule).
+
+## Do not
+
+- List planned Phase N paths as if they already exist
+- Duplicate long procedures in `README.md` / `AGENTS.md` — link to `docs/`
+- Leave ROADMAP items pointing at non-existent files
+
+## Exceptions
+
+- Typo-only fixes with no structural impact
+- Session notes under `docs/sessions/` (not indexed in README)

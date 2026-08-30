@@ -472,24 +472,26 @@ step "Starting OpenClaw gateway and trace linker"
 # Verify empty afterward instead of trusting a silent no-op; retry once,
 # then hard-fail rather than silently starting a second gateway that will
 # fail to bind the port and leave the stale one as the sole survivor.
+KILL_PATTERN="openclaw gateway|openclaw-gateway|/openclaw| openclaw$|node.*openclaw|prompt-trace-linker"
 kill_stale_openclaw_processes() {
   openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 15 -- bash -c '
-    for p in $(pgrep -f "openclaw-gateway|prompt-trace-linker" 2>/dev/null); do
+    for p in $(pgrep -f "'"$KILL_PATTERN"'" 2>/dev/null); do
       kill -9 "$p" 2>/dev/null
     done
     sleep 2
-    pgrep -af "openclaw-gateway|prompt-trace-linker" 2>/dev/null
+    rm -f /sandbox/workspace/.openclaw/state/*.lock /sandbox/workspace/.openclaw/*.lock /tmp/openclaw/*.lock /tmp/openclaw-*/*.lock 2>/dev/null
+    pgrep -af "'"$KILL_PATTERN"'" 2>/dev/null
     true
   ' 2>&1
   return 0
 }
 STALE_CHECK="$(kill_stale_openclaw_processes)"
-if echo "$STALE_CHECK" | grep -qE "openclaw-gateway|prompt-trace-linker"; then
+if echo "$STALE_CHECK" | grep -qE "$KILL_PATTERN"; then
   warn "Stale gateway/linker process(es) survived first kill attempt — retrying:"
   echo "$STALE_CHECK" | while IFS= read -r line; do info "  $line"; done
   STALE_CHECK="$(kill_stale_openclaw_processes)"
 fi
-if echo "$STALE_CHECK" | grep -qE "openclaw-gateway|prompt-trace-linker"; then
+if echo "$STALE_CHECK" | grep -qE "$KILL_PATTERN"; then
   error "Could not kill stale OpenClaw process(es) after 2 attempts — refusing to start a second gateway on top of a live one:"
   echo "$STALE_CHECK" | while IFS= read -r line; do error "  $line"; done
   error "Fix: openshell sandbox connect ${SANDBOX_NAME}, then manually 'kill -9 <pid>' for each, then re-run this script."
@@ -515,49 +517,38 @@ echo "CLEANUP_DONE"
 ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 
 # Step 9b: Start gateway (openshell sandbox exec --no-tty = sandbox namespace)
-# RHOAI MLflow needs the Bearer token / workspace header / CA path the
-# mlflow-openclaw plugin's transport requires (see constraint list at top of
-# this file and docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md). These are
-# set at initial gateway start, not hot-patched into a running process
-# afterwards.
+# Write all gateway env vars to a single file inside the sandbox — cleaner
+# than passing N --env flags and easier to debug (inspect the file to see
+# exactly what the gateway was started with). The gateway `source`s this
+# file at start. chmod 600 because it contains the MLflow bearer token.
 #
 # NODE_EXTRA_CA_CERTS points at the COMBINED bundle built above (OpenShell's
-# own proxy CA + RHOAI's service-ca), not just RHOAI's alone — see the
-# comment above RHOAI_MLFLOW_COMBINED_CA for why the combined form is
-# required (validated live 2026-07-25). MLFLOW_TRACKING_SERVER_CERT_PATH is
-# passed too for the exporters that DO read it (none currently in
-# @mlflow/core@0.2.0 — kept for forward compat and parity with the linker's
-# env below, harmless no-op either way).
-#
-# No LITELLM_API_KEY injection: inference uses the inference router
-# (inference.local), which injects credentials from the gateway's provider
-# record. The sandbox process never sees the real API key. See constraint #3
-# and docs/adrs/ADR-0021-inference-router-migration.md.
-RHOAI_MLFLOW_GW_ENV=(
-  --env "MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}"
-  --env "MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}"
-  --env "NODE_EXTRA_CA_CERTS=${RHOAI_MLFLOW_COMBINED_CA}"
-  --env "MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}"
-)
-# The prompt-trace-linker sidecar reaches RHOAI MLflow via /usr/bin/curl
-# (constraint #8), not Node fetch — curl's --cacert has no effect on the
-# gateway's MaaS calls, so this side of the wiring is NOT subject to the
-# limitation above. prompt-trace-linker.js sends Authorization/
-# X-MLFLOW-WORKSPACE headers and --cacert whenever these env vars are present.
+# own proxy CA + RHOAI's service-ca). MLFLOW_TRACKING_SERVER_CERT_PATH kept
+# for forward compat. OTEL exporters disabled — mlflow-openclaw handles traces.
+# No LITELLM_API_KEY: inference router (inference.local) injects credentials.
+GATEWAY_ENV_PATH="/sandbox/workspace/.openclaw/gateway.env"
 LINKER_MLFLOW_URL="${RHOAI_MLFLOW_TRACKING_URI}"
-RHOAI_MLFLOW_LINKER_ENV=(
-  --env "MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}"
-  --env "MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}"
-  --env "MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}"
-)
+
+step "Writing gateway.env inside sandbox"
+oc -n "$NAMESPACE" exec "$SANDBOX_NAME" -c agent -- bash -c "
+  cat > '${GATEWAY_ENV_PATH}' <<'ENVEOF'
+MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}
+MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}
+NODE_EXTRA_CA_CERTS=${RHOAI_MLFLOW_COMBINED_CA}
+MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}
+OTEL_TRACES_EXPORTER=none
+OTEL_LOGS_EXPORTER=none
+OTEL_METRICS_EXPORTER=none
+ENVEOF
+  chown ${SANDBOX_UID}:${SANDBOX_GID} '${GATEWAY_ENV_PATH}'
+  chmod 600 '${GATEWAY_ENV_PATH}'
+"
+info "gateway.env written at ${GATEWAY_ENV_PATH}"
 
 openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 25 \
   --env HOME=/sandbox/workspace \
-  --env OTEL_TRACES_EXPORTER=none \
-  --env OTEL_LOGS_EXPORTER=none \
-  --env OTEL_METRICS_EXPORTER=none \
-  "${RHOAI_MLFLOW_GW_ENV[@]}" \
   -- bash -c '
+    set -a; source '"${GATEWAY_ENV_PATH}"'; set +a
     nohup openclaw gateway run > /sandbox/workspace/openclaw.log 2>&1 &
     disown
     echo "GW_PID=$!"
@@ -566,11 +557,15 @@ openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 25 \
   ' 2>&1 | while IFS= read -r line; do info "  $line"; done
 
 # Step 9c: Start trace linker (openshell sandbox exec --no-tty = sandbox namespace)
+# The linker reaches RHOAI MLflow via /usr/bin/curl (constraint #8), not Node
+# fetch. It reads its own env vars from the same gateway.env where applicable.
 openshell sandbox exec -n "$SANDBOX_NAME" --no-tty --timeout 15 \
   --env MLFLOW_EXPERIMENT_ID="${MLFLOW_EXP_ID}" \
   --env MLFLOW_URL="${LINKER_MLFLOW_URL}" \
   --env OPENCLAW_WORKSPACE_DIR=/sandbox/workspace \
-  "${RHOAI_MLFLOW_LINKER_ENV[@]}" \
+  --env "MLFLOW_TRACKING_TOKEN=${RHOAI_MLFLOW_SA_TOKEN}" \
+  --env "MLFLOW_WORKSPACE=${RHOAI_MLFLOW_WORKSPACE}" \
+  --env "MLFLOW_TRACKING_SERVER_CERT_PATH=${RHOAI_MLFLOW_SANDBOX_CA}" \
   -- bash -c '
     nohup node /tmp/prompt-trace-linker.js > /sandbox/workspace/linker.log 2>&1 &
     disown

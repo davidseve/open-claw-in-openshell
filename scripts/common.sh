@@ -42,6 +42,8 @@ OPENSHELL_RELEASE_NAME="${OPENSHELL_RELEASE_NAME:-openshell2}"
 # differs from the "openshell" default. Consumed by wire-rhoai-mlflow-tracing.sh
 # (RBAC subject) and verify.sh.
 SANDBOX_SA_NAME="${SANDBOX_SA_NAME:-${OPENSHELL_RELEASE_NAME}-sandbox}"
+RHOAI_NS="${RHOAI_NS:-redhat-ods-applications}"
+MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-openclaw-tracing}"
 
 CRC_BIN="${CRC_BIN:-$(command -v crc || echo crc)}"
 CRC_MODE="${CRC_MODE:-false}"
@@ -138,10 +140,17 @@ pass()  { echo "    [PASS] $*"; PASS_COUNT=$((PASS_COUNT + 1)); condition pass "
 fail()  { echo "    [FAIL] $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); condition fail "$CURRENT_LAYER"; }
 
 detect_environment() {
+  local detected
+  detected=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || true)
   if [[ -n "$APPS_DOMAIN" ]]; then
-    info "APPS_DOMAIN already set: $APPS_DOMAIN"
+    if [[ -n "$detected" && "$APPS_DOMAIN" != "$detected" ]]; then
+      warn "APPS_DOMAIN=$APPS_DOMAIN does not match cluster ingress $detected — using cluster domain"
+      APPS_DOMAIN="$detected"
+    else
+      info "APPS_DOMAIN already set: $APPS_DOMAIN"
+    fi
   else
-    APPS_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || true)
+    APPS_DOMAIN="$detected"
     if [[ -z "$APPS_DOMAIN" ]]; then
       error "Could not detect apps domain from cluster. Set APPS_DOMAIN manually."
       exit 1
@@ -564,4 +573,101 @@ get_apps_domain() {
 get_service_url() {
   local sandbox="$1" service="$2"
   echo "https://${sandbox}--${service}.$(get_apps_domain)"
+}
+
+# ─── MLflow cluster helpers ──────────────────────────────────────────────────
+# Pick a pod that can reach mlflow.<rhoai-ns>.svc from inside the cluster.
+# Prefers sandbox pod (has curl), falls back to gateway pod.
+_mlflow_exec_target() {
+  if oc -n "$NAMESPACE" get pod "$SANDBOX_NAME" &>/dev/null 2>&1; then
+    _MLFLOW_EXEC_POD="$SANDBOX_NAME"
+    _MLFLOW_EXEC_CONTAINER="agent"
+    return 0
+  fi
+  local gw_pod
+  gw_pod="$(oc -n "$NAMESPACE" get pods -l app.kubernetes.io/name=openshell \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -n "$gw_pod" ]]; then
+    _MLFLOW_EXEC_POD="$gw_pod"
+    _MLFLOW_EXEC_CONTAINER=""
+    return 0
+  fi
+  return 1
+}
+
+# Execute a curl command against MLflow from inside the cluster.
+_mlflow_cluster_curl() {
+  local curl_cmd="$1"
+  if ! _mlflow_exec_target; then
+    warn "No sandbox or OpenShell pod in ${NAMESPACE} for MLflow API calls"
+    return 1
+  fi
+  if [[ -n "$_MLFLOW_EXEC_CONTAINER" ]]; then
+    oc -n "$NAMESPACE" exec "$_MLFLOW_EXEC_POD" -c "$_MLFLOW_EXEC_CONTAINER" -- \
+      bash -c "$curl_cmd" 2>/dev/null || true
+  else
+    oc -n "$NAMESPACE" exec "$_MLFLOW_EXEC_POD" -- \
+      bash -c "$curl_cmd" 2>/dev/null || true
+  fi
+}
+
+# Read the SA bearer token for MLflow API calls (cached in MLFLOW_TOKEN).
+read_mlflow_sa_token() {
+  if [[ -n "${MLFLOW_TOKEN:-}" ]]; then
+    return 0
+  fi
+  if ! oc -n "$NAMESPACE" get secret "${SANDBOX_SA_NAME}-mlflow-token" &>/dev/null; then
+    warn "Secret ${SANDBOX_SA_NAME}-mlflow-token not found"
+    return 1
+  fi
+  MLFLOW_TOKEN="$(oc -n "$NAMESPACE" get secret "${SANDBOX_SA_NAME}-mlflow-token" \
+    -o jsonpath='{.data.token}' | base64 -d)"
+  export MLFLOW_TOKEN
+  return 0
+}
+
+# Get-or-create the MLflow experiment in the target workspace (idempotent).
+ensure_mlflow_experiment() {
+  local experiment_name="${MLFLOW_EXPERIMENT_NAME:-openclaw-tracing}"
+  local workspace="${MLFLOW_WORKSPACE:-$NAMESPACE}"
+  local mlflow_url="https://mlflow.${RHOAI_NS}.svc:8443"
+  local exp_json exp_id token
+
+  if [[ -n "${MLFLOW_EXPERIMENT_ID:-}" && "${MLFLOW_EXPERIMENT_ID}" != "__RESOLVE__" ]]; then
+    info "MLFLOW_EXPERIMENT_ID=${MLFLOW_EXPERIMENT_ID}"
+    return 0
+  fi
+
+  if ! read_mlflow_sa_token; then
+    return 1
+  fi
+  token="$MLFLOW_TOKEN"
+
+  exp_json="$(_mlflow_cluster_curl \
+    "curl -sk '${mlflow_url}/api/2.0/mlflow/experiments/get-by-name?experiment_name=${experiment_name}' \
+      -H 'Authorization: Bearer ${token}' \
+      -H 'X-MLFLOW-WORKSPACE: ${workspace}'")"
+  exp_id="$(echo "$exp_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('experiment',{}).get('experiment_id',''))" 2>/dev/null || true)"
+
+  if [[ -z "$exp_id" ]]; then
+    info "Creating MLflow experiment '${experiment_name}' in workspace ${workspace}"
+    exp_json="$(_mlflow_cluster_curl \
+      "curl -sk -X POST \
+        -H 'Authorization: Bearer ${token}' \
+        -H 'X-MLFLOW-WORKSPACE: ${workspace}' \
+        -H 'Content-Type: application/json' \
+        -d '{\"name\": \"${experiment_name}\"}' \
+        '${mlflow_url}/api/2.0/mlflow/experiments/create'")"
+    exp_id="$(echo "$exp_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('experiment',{}).get('experiment_id',''))" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$exp_id" ]]; then
+    warn "Could not get or create experiment '${experiment_name}' in workspace ${workspace}"
+    warn "Last MLflow response: ${exp_json:-<empty>}"
+    return 1
+  fi
+
+  export MLFLOW_EXPERIMENT_ID="$exp_id"
+  info "MLflow experiment ${experiment_name} → id=${MLFLOW_EXPERIMENT_ID} (workspace=${workspace})"
+  return 0
 }

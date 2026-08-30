@@ -1,4 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
+import { loadLocalSecretsEnv } from './load-secrets-env';
+
+loadLocalSecretsEnv();
 
 const baseURL = process.env.OPENCLAW_BASE_URL || 'https://openclaw-gw--openclaw-ui.apps-crc.testing';
 const mlflowBaseURL = (process.env.MLFLOW_BASE_URL || 'https://mlflow-redhat-ods-applications.apps-crc.testing/mlflow').replace(/\/?$/, '/');

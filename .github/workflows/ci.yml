@@ -1,0 +1,35 @@
+# PR/push checks — no cluster or secrets required.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/*
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan tracked files for secret patterns
+        run: bash scripts/ci-secret-scan.sh
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Helm lint all charts
+        run: make lint
+
+      - name: Helm template all charts
+        run: make template
