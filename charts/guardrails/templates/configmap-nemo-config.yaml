@@ -1,0 +1,35 @@
+{{- if .Values.guardrails.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.guardrails.configMapName }}
+  namespace: {{ include "guardrails.namespace" . }}
+  labels:
+    {{- include "guardrails.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    models:
+      - type: main
+        engine: openai
+        parameters:
+          openai_api_base: {{ .Values.guardrails.maasBaseUrl | quote }}
+          model_name: {{ .Values.guardrails.modelName | quote }}
+    rails:
+      input:
+        flows:
+{{- range .Values.guardrails.rails.inputFlows }}
+          - {{ . }}
+{{- end }}
+      output:
+        flows:
+{{- range .Values.guardrails.rails.outputFlows }}
+          - {{ . }}
+{{- end }}
+        streaming:
+          enabled: {{ .Values.guardrails.rails.outputStreaming.enabled }}
+          stream_first: {{ .Values.guardrails.rails.outputStreaming.streamFirst }}
+  prompts.yml: |
+{{ .Files.Get "files/prompts.yml" | indent 4 }}
+  rails.co: |
+{{ .Files.Get "files/rails.co" | indent 4 }}
+{{- end }}

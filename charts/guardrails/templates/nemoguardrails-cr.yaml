@@ -1,0 +1,27 @@
+{{- if .Values.guardrails.enabled }}
+apiVersion: trustyai.opendatahub.io/v1alpha1
+kind: NemoGuardrails
+metadata:
+  name: {{ include "guardrails.name" . }}
+  namespace: {{ include "guardrails.namespace" . }}
+  labels:
+    {{- include "guardrails.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    {{- if .Values.guardrails.enableAuth }}
+    security.opendatahub.io/enable-auth: "true"
+    {{- end }}
+spec:
+  replicas: {{ .Values.guardrails.replicas }}
+  nemoConfigs:
+    - name: {{ .Values.guardrails.nemoConfigName }}
+      configMaps:
+        - {{ .Values.guardrails.configMapName }}
+      default: true
+  env:
+    - name: OPENAI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: maas-api-key
+          key: token
+{{- end }}

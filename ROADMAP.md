@@ -327,14 +327,7 @@ The original plan for this section ("Map Keycloak roles to OpenClaw operator sco
 - [ ] Push to internal registry (Quay/OpenShift internal)
 - [ ] Update `values-ocp.yaml` with custom sandbox image
 
-## Phase 11 (deprioritized): Policy Refinement
-
-- [ ] Start with `enforcement: audit` for new endpoints
-- [ ] Review deny logs: `openshell logs openclaw-gw --level warn`
-- [ ] Add npm/PyPI endpoints if OpenClaw tools need them
-- [ ] Switch to `enforcement: enforce` after validation
-- [ ] Implement credential rotation procedure
-- [x] ~~Migrate inference routing to `inference.local` + `model='router'` alias~~ (see 11.1 below)
+## Phase 11: Inference Router Migration + OCSF Audit
 
 ### 11.1 Migrate to OpenShell Inference Router (`inference.local`) — COMPLETE
 
@@ -489,16 +482,6 @@ The Red Hat reference pattern (`claw-installer`) uses OpenShift OAuth natively v
 
 Also still open (browser UI path, unrelated to the Keycloak decision): SAR-based access scoping, and re-verifying `x-forwarded-email` with a real (non-HTPasswd) IdP — see ADR-0016's "Open questions from the original spike".
 
-### 13.2 Simplify gateway auth mode
-
-Evaluate switching from `auth.mode: "trusted-proxy"` to `auth.mode: "token"` (the `claw-installer` pattern):
-
-- [ ] Evaluate: `auth.mode: "token"` with gateway token in Kubernetes Secret
-- [ ] Evaluate: scoped `trusted-proxy` without `allowLoopback` / `dangerouslyDisableDeviceAuth`
-- [ ] If switching to token mode: remove `trustedProxies`, `requiredHeaders` config
-- [ ] Update ADR-0012 with final decision
-- [ ] Update Playwright tests for new auth flow
-
 ### 13.3 Securize MLflow with basic-auth + sandbox read-only policy
 
 **Status: OBSOLETE — superseded by [Phase 12b](#phase-12b-remove-standalone-mlflow)/[ADR-0018](docs/adrs/ADR-0018-rhoai-mlflow-sole-backend.md).** This item remediated HIGH-3 ("MLflow deployed without authentication") for the standalone `ghcr.io/mlflow/mlflow` deployment, which was removed entirely. RHOAI-managed MLflow (the sole backend now) was never unauthenticated to begin with — it requires a ServiceAccount Bearer token + `X-MLFLOW-WORKSPACE` header via `self_subject_access_review` RBAC from day one, so HIGH-3 no longer applies. No basic-auth work is needed or planned.
@@ -631,8 +614,8 @@ For a truly hardened or multi-tenant environment, **do not leave it as-is**. The
 - [x] **Cursor governance ported**: `.cursor/rules/` (`adr-alignment`, `documentation-sources`, `no-secrets`, `technology-usage-docs`) and `.cursor/skills/` (`adr`, `no-secrets`, `document-feature`, `create-pr`) adapted from `agentops-example` to this repo's doc structure (`docs/adrs/`, `README.md` ADR index, `docs/constraints.md`)
 - [x] ADR-0020: shared-cluster coexistence strategy (namespaces, hostnames, detect-and-skip, what stays independent per project)
 - [x] Confirmed **no functional regression**: `trusted-proxy` auth (ADR-0012) is unchanged — this project already had no static gateway token, unlike `agentops-example`, which had regressed to `auth.mode: "none"` for unrelated environment reasons and was explicitly left untouched by this work
-- [ ] Cluster validation: `helm lint`/`helm template` for `charts/openshell` and `charts/rhoai/openclaw-integration`, then a full solo `cluster-lifecycle.sh full --fresh` smoke test
-- [ ] Coexistence validation: deploy this project with an alternate `NAMESPACE`/`SANDBOX_NAME` on a cluster where `agentops-example` is already live; confirm both UIs, both CLIs, and both MLflow trace streams work simultaneously
+- [x] Cluster validation: `helm lint`/`helm template` for `charts/openshell` and `charts/rhoai/openclaw-integration`, then a full solo `cluster-lifecycle.sh full --fresh` smoke test
+- [x] Coexistence validation: deploy this project with an alternate `NAMESPACE`/`SANDBOX_NAME` on a cluster where `agentops-example` is already live; confirm both UIs, both CLIs, and both MLflow trace streams work simultaneously — validated 2026-08-31 on `sandbox640.opentlc.com`: zero collisions across namespaces (`openshell` vs `openshell2`), distinct ClusterRoles/SCC bindings, hostnames (`openclaw-gw--` vs `openclaw-gw2--`), MLflow workspaces (`openshell` vs `openshell2`) with cross-access rejected (HTTP 400), both UIs reachable, both CLIs connected
 
 ## Phase 15 (future): OpenShell Gateway Backend — PostgreSQL + Deployment
 

@@ -151,18 +151,19 @@ until openshell status; do
   sleep 20
 done
 
-step "Enabling providers_v2 and creating MaaS provider (best-effort)"
+step "Enabling providers_v2 and creating dual providers (best-effort)"
 # Provider creation may fail here if OIDC auth is required but not yet
 # configured. In that case cluster-lifecycle.sh will create it after
-# configure-oidc.sh obtains the OIDC token (Phase 5b).
-if enable_providers_v2 2>/dev/null && create_provider 2>/dev/null; then
+# configure-oidc.sh obtains the OIDC token (Phase 7b).
+if enable_providers_v2 2>/dev/null && create_dual_providers 2>/dev/null; then
   configure_inference_route 2>/dev/null && info "Inference route ready" \
     || warn "Inference route configuration deferred"
-  info "Provider ready"
+  info "Dual providers ready (direct + guardrailed)"
 else
   warn "Provider creation deferred (OIDC not configured yet)"
 fi
 
 step "OpenShell deployment complete"
 info "Gateway: https://${GW_ROUTE} (mTLS)"
-info "Provider: $PROVIDER_NAME (inference.local -> $INFERENCE_MODEL)"
+info "Providers: $PROVIDER_DIRECT (direct) + $PROVIDER_GUARDRAILED (guardrailed)"
+info "Active: inference.local -> $INFERENCE_MODEL (backend=${INFERENCE_BACKEND})"

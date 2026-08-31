@@ -1,8 +1,7 @@
-# Minimal DataScienceCluster for Phase 12 (RHOAI-managed MLflow only).
-# Unlike agentops-example's platform chart (dashboard, llamastackoperator/OGX,
-# trustyai, kserve, modelsAsService all Managed), this repo only needs
-# mlflowoperator — everything else is Removed to keep the footprint as small
-# as possible on a resource-constrained cluster. See ADR-0017.
+# DataScienceCluster for Phase 12 (RHOAI-managed MLflow) + NeMo Guardrails.
+# mlflowoperator: Managed — sole tracing/prompt-registry backend (ADR-0017/0018).
+# trustyai: Managed — NeMo Guardrails via TrustyAI NemoGuardrails CR (ADR-0022).
+# Everything else is Removed to keep the footprint small. See ADR-0017.
 #
 # This file holds the settings that are IDENTICAL on every environment.
 # dashboard / llamastackoperator / dashboardConfig.genAiStudio are the one
@@ -33,7 +32,7 @@ datasciencecluster:
     mlflowoperator:
       managementState: Managed
     trustyai:
-      managementState: Removed
+      managementState: Managed
       eval:
         lmeval:
           permitCodeExecution: deny

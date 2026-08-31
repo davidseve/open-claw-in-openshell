@@ -136,8 +136,9 @@ cmd_start() {
 cmd_deploy() {
   # Deploy order is critical — see docs/constraints.md #10:
   #   1. bootstrap  2. keycloak  3. observability (Tempo/OTel)
-  #   4. RHOAI + MLflow  5. openshell (install)  6. wire RHOAI MLflow tracing
-  #   7. configure-oidc (helm upgrade + token)  8. provider (needs token)
+  #   4. RHOAI + MLflow  4b. guardrails (needs TrustyAI CRD from RHOAI)
+  #   5. openshell (install)  6. wire RHOAI MLflow tracing
+  #   7. configure-oidc (helm upgrade + token)  8. providers (needs token)
   #   9. oauth2-proxy  10. launch-openclaw
   #
   # RHOAI + MLflow (Phase 4) MUST run BEFORE OpenShell (Phase 5) so the
@@ -171,6 +172,9 @@ cmd_deploy() {
   step "Phase 4: Deploy RHOAI + MLflow (sole tracing/prompt-registry backend)"
   "${SCRIPT_DIR}/deploy-rhoai-mlflow.sh"
 
+  step "Phase 4b: Deploy NeMo Guardrails (TrustyAI CR, ADR-0022)"
+  "${SCRIPT_DIR}/deploy-guardrails.sh"
+
   # Phase 5: Install OpenShell WITHOUT OIDC. The pod needs the oidc-ca
   # ConfigMap which doesn't exist yet. configure-oidc.sh (Phase 7) will
   # create it and helm upgrade to enable OIDC.
@@ -185,14 +189,14 @@ cmd_deploy() {
     OPENSHELL_HEADLESS=1 KC_USER="${KC_USER:-admin}" KC_PASS="${KC_PASS:-admin}" \
       "${SCRIPT_DIR}/configure-oidc.sh"
 
-    step "Phase 7b: Enable providers_v2, create MaaS provider, configure inference route (needs OIDC token)"
+    step "Phase 7b: Enable providers_v2, create dual providers (direct + guardrailed), configure inference route"
     enable_providers_v2 2>/dev/null || true
     # Gateway may still be stabilizing after helm upgrade; retry up to 30s
     retries=0
-    while ! create_provider 2>/dev/null; do
+    while ! create_dual_providers 2>/dev/null; do
       retries=$((retries + 1))
       if [[ $retries -ge 6 ]]; then
-        create_provider  # final attempt — let it fail loudly
+        create_dual_providers  # final attempt — let it fail loudly
         break
       fi
       info "Waiting for gateway to accept requests (attempt $retries/6)..."
@@ -200,7 +204,7 @@ cmd_deploy() {
     done
     configure_inference_route 2>/dev/null \
       && info "Inference route ready" \
-      || warn "Inference route configuration failed — run manually: openshell inference set --provider $PROVIDER_NAME --model $INFERENCE_MODEL --no-verify"
+      || warn "Inference route configuration failed — run manually: openshell inference set --provider $PROVIDER_DIRECT --model $INFERENCE_MODEL --no-verify"
 
     step "Phase 8: Deploy oauth-proxy (OpenShift-native OAuth UI auth, ADR-0016)"
     "${SCRIPT_DIR}/deploy-oauth2-proxy.sh"

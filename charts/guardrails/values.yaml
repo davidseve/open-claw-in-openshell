@@ -1,0 +1,26 @@
+# NeMo Guardrails — TrustyAI NemoGuardrails CR.
+# At deploy time, scripts/deploy-guardrails.sh overrides maasApiKey and model
+# settings from secrets/secrets.env (never commit real API keys).
+guardrails:
+  enabled: true
+  name: nemo-guardrails
+  # Namespace defaults to NAMESPACE env var at deploy time (openshell2).
+  namespace: openshell2
+  # TrustyAI NemoGuardrails Service exposes port 80 → container targetPort 8000.
+  servicePort: 80
+  replicas: 1
+  enableAuth: false
+  maasBaseUrl: "https://maas-rhdp.apps.maas.redhatworkshops.io/v1"
+  modelName: claude-sonnet-4-6
+  maasApiKey: ""
+  configMapName: nemo-guardrails-config
+  nemoConfigName: openclaw-config
+  rails:
+    inputFlows:
+      - self check input
+    outputFlows:
+      - self check output
+    # OpenClaw Control UI uses streaming chat completions; required with output rails.
+    outputStreaming:
+      enabled: true
+      streamFirst: true

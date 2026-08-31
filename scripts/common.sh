@@ -9,6 +9,14 @@ SANDBOX_NAME="${SANDBOX_NAME:-openclaw-gw2}"
 PROVIDER_NAME="${PROVIDER_NAME:-maas-litellm}"
 INFERENCE_MODEL="${INFERENCE_MODEL:-claude-sonnet-4-6}"
 MAAS_BASE_URL="${MAAS_BASE_URL:-https://maas-rhdp.apps.maas.redhatworkshops.io/v1}"
+# Dual-provider inference routing (ADR-0022: NeMo Guardrails).
+# maas-direct goes straight to MaaS; maas-guardrailed routes via NeMo first.
+PROVIDER_DIRECT="${PROVIDER_DIRECT:-maas-direct}"
+PROVIDER_GUARDRAILED="${PROVIDER_GUARDRAILED:-maas-guardrailed}"
+INFERENCE_BACKEND="${INFERENCE_BACKEND:-guardrailed}"
+NEMO_GUARDRAILS_SERVICE="${NEMO_GUARDRAILS_SERVICE:-nemo-guardrails}"
+NEMO_GUARDRAILS_PORT="${NEMO_GUARDRAILS_PORT:-80}"
+NEMO_GUARDRAILS_URL="${NEMO_GUARDRAILS_URL:-http://${NEMO_GUARDRAILS_SERVICE}.${NAMESPACE}.svc.cluster.local:${NEMO_GUARDRAILS_PORT}/v1}"
 # CLI-local (per-machine) gateway alias name — deliberately separate from
 # NAMESPACE/SANDBOX_NAME. `openshell gateway add/remove/select` and the mTLS
 # cert cache under ~/.config/openshell/gateways/<name>/ are keyed by this
@@ -559,11 +567,40 @@ create_provider() {
   info "Provider '$PROVIDER_NAME' created (type=openai, base=${MAAS_BASE_URL})"
 }
 
+# Create a named OpenAI-compatible provider. Idempotent — skips if exists.
+# Usage: ensure_inference_provider <name> <base_url>
+ensure_inference_provider() {
+  local name="$1" base_url="$2"
+  if [[ -z "${MAAS_API_KEY:-}" ]]; then load_secrets; fi
+  if openshell provider list 2>/dev/null | grep -q "$name"; then
+    info "Provider '$name' already exists"
+  else
+    openshell provider create \
+      --name "$name" \
+      --type openai \
+      --credential "OPENAI_API_KEY=${MAAS_API_KEY}" \
+      --config "OPENAI_BASE_URL=${base_url}"
+    info "Provider '$name' created (type=openai, base=${base_url})"
+  fi
+}
+
+# Register both direct and guardrailed providers (ADR-0022).
+# Called after providers_v2 is enabled and OIDC token is available.
+create_dual_providers() {
+  ensure_inference_provider "$PROVIDER_DIRECT" "$MAAS_BASE_URL"
+  ensure_inference_provider "$PROVIDER_GUARDRAILED" "$NEMO_GUARDRAILS_URL"
+}
+
 # Configure the inference route: inference.local -> provider/model.
 # All sandboxes on this gateway will use this route. Idempotent.
+# Supports INFERENCE_BACKEND=direct|guardrailed to pick the active provider.
 configure_inference_route() {
-  openshell inference set --provider "$PROVIDER_NAME" --model "$INFERENCE_MODEL" --no-verify 2>/dev/null
-  info "Inference route: $PROVIDER_NAME / $INFERENCE_MODEL"
+  local active_provider="$PROVIDER_DIRECT"
+  if [[ "${INFERENCE_BACKEND}" == "guardrailed" ]]; then
+    active_provider="$PROVIDER_GUARDRAILED"
+  fi
+  openshell inference set --provider "$active_provider" --model "$INFERENCE_MODEL" --no-verify 2>/dev/null
+  info "Inference route: $active_provider / $INFERENCE_MODEL (backend=${INFERENCE_BACKEND})"
 }
 
 get_apps_domain() {
